@@ -1,0 +1,42 @@
+[workspace]
+members = [
+    "crates/ledger-core",
+    "crates/ledger-store",
+    "crates/ledger-ingest",
+    "crates/ledger-book",
+    "crates/ledger-replay",
+    "crates/ledger-runtime",
+    "crates/ledger-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "internal"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
+hex = "0.4"
+indexmap = { version = "2", features = ["serde"] }
+time = { version = "0.3", features = ["macros", "formatting", "parsing"] }
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+aws-config = "1"
+aws-sdk-s3 = "1"
+aws-credential-types = "1"
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+tempfile = "3"
+tracing = "0.1"
+databento = { version = "0.48", features = ["historical"] }
+dbn = "0.55"
+rusqlite = { version = "0.32", features = ["bundled"] }

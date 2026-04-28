@@ -1,0 +1,12 @@
+[package]
+name = "ledger-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+ledger-core = { path = "../ledger-core" }
+ledger-store = { path = "../ledger-store" }
+serde.workspace = true
+serde_json.workspace = true
