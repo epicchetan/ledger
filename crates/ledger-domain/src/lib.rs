@@ -1,7 +1,7 @@
 //! Shared domain types and pure helpers for Ledger.
 //!
-//! `ledger-core` defines the common types used across ingestion, storage,
-//! order-book, replay, runtime, and CLI layers. It owns market-day resolution,
+//! `ledger-domain` defines the common types used across ingestion, storage,
+//! order-book, replay, application, and CLI layers. It owns market-day resolution,
 //! normalized MBO events, replay artifact codecs, storage object kind names, and
 //! simulator request/profile/result types.
 //!

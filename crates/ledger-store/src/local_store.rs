@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use ledger_core::{now_ns, MarketDay, StorageKind};
+use ledger_domain::{now_ns, MarketDay, StorageKind};
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 

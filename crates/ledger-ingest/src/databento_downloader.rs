@@ -4,7 +4,7 @@ use databento::{
     historical::timeseries::GetRangeToFileParams,
     HistoricalClient,
 };
-use ledger_core::{ns_to_utc_datetime, MarketDay};
+use ledger_domain::{ns_to_utc_datetime, MarketDay};
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 

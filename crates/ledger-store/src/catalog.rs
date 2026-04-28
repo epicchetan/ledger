@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::NaiveDate;
-use ledger_core::{now_ns, MarketDay, MarketDayStatus, StorageKind};
+use ledger_domain::{now_ns, MarketDay, MarketDayStatus, StorageKind};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};

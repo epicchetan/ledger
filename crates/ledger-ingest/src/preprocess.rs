@@ -4,7 +4,7 @@ use dbn::{
     decode::{DbnDecoder, DecodeRecord},
     MboMsg, UNDEF_PRICE,
 };
-use ledger_core::{
+use ledger_domain::{
     build_batches, build_trade_index, dbn_fixed_price_to_es_ticks, encode_batches, encode_events,
     encode_trades, BatchSpan, BookAction, BookSide, EventStore, MboEvent, TradeRecord,
 };
@@ -108,7 +108,7 @@ fn normalize_mbo(msg: &MboMsg) -> Result<MboEvent> {
     let price_ticks = if msg.price == UNDEF_PRICE {
         None
     } else {
-        if msg.price % ledger_core::ES_TICK_SIZE_FIXED_PRICE != 0 {
+        if msg.price % ledger_domain::ES_TICK_SIZE_FIXED_PRICE != 0 {
             return Err(anyhow!(
                 "ES price {} is not aligned to 0.25 tick",
                 msg.price

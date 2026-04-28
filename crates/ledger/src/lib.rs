@@ -1,4 +1,4 @@
-//! Runtime-facing session preparation.
+//! Ledger-facing session preparation.
 //!
 //! This crate is the boundary a UI, API, or command adapter should use when it
 //! needs to inspect or load replay inputs. It delegates persistence and cache
@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 use chrono::NaiveDate;
-use ledger_core::MarketDay;
+use ledger_domain::MarketDay;
 use ledger_store::{
     LedgerStore, LoadedSession, MarketDayFilter, MarketDayRecord, ObjectStore, R2LedgerStore,
     SessionStatus,
@@ -17,12 +17,12 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Clone)]
-pub struct Runtime<S: ObjectStore + 'static> {
+pub struct Ledger<S: ObjectStore + 'static> {
     pub store: LedgerStore<S>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReplayInputs {
+pub struct LedgerSession {
     pub market_day: MarketDay,
     pub events_path: PathBuf,
     pub batches_path: PathBuf,
@@ -30,7 +30,7 @@ pub struct ReplayInputs {
     pub book_check_path: PathBuf,
 }
 
-impl Runtime<ledger_store::R2ObjectStore> {
+impl Ledger<ledger_store::R2ObjectStore> {
     pub async fn from_env(
         data_dir: impl Into<PathBuf>,
         r2_prefix: impl Into<String>,
@@ -41,7 +41,7 @@ impl Runtime<ledger_store::R2ObjectStore> {
     }
 }
 
-impl<S: ObjectStore + 'static> Runtime<S> {
+impl<S: ObjectStore + 'static> Ledger<S> {
     pub fn new(store: LedgerStore<S>) -> Self {
         Self { store }
     }
@@ -54,9 +54,9 @@ impl<S: ObjectStore + 'static> Runtime<S> {
         self.store.list_market_days(filter)
     }
 
-    pub async fn load_session(&self, symbol: &str, date: NaiveDate) -> Result<ReplayInputs> {
+    pub async fn load_session(&self, symbol: &str, date: NaiveDate) -> Result<LedgerSession> {
         let session: LoadedSession = self.store.load_session(symbol, date).await?;
-        Ok(ReplayInputs {
+        Ok(LedgerSession {
             market_day: session.market_day,
             events_path: session.events_path,
             batches_path: session.batches_path,

@@ -6,6 +6,6 @@ edition.workspace = true
 [dependencies]
 anyhow.workspace = true
 ledger-book = { path = "../ledger-book" }
-ledger-core = { path = "../ledger-core" }
+ledger-domain = { path = "../ledger-domain" }
 serde.workspace = true
 serde_json.workspace = true

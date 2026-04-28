@@ -1941,12 +1941,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
+name = "ledger"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "ledger-domain",
+ "ledger-store",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ledger-book"
 version = "0.1.0"
 dependencies = [
  "hex",
  "indexmap",
- "ledger-core",
+ "ledger-domain",
  "serde",
  "sha2 0.10.9",
  "thiserror",
@@ -1960,16 +1972,16 @@ dependencies = [
  "chrono",
  "clap",
  "dotenvy",
- "ledger-core",
+ "ledger",
+ "ledger-domain",
  "ledger-ingest",
- "ledger-runtime",
  "ledger-store",
  "serde_json",
  "tokio",
 ]
 
 [[package]]
-name = "ledger-core"
+name = "ledger-domain"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1990,7 +2002,7 @@ dependencies = [
  "databento",
  "dbn",
  "ledger-book",
- "ledger-core",
+ "ledger-domain",
  "ledger-store",
  "serde",
  "serde_json",
@@ -2005,19 +2017,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ledger-book",
- "ledger-core",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "ledger-runtime"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "ledger-core",
- "ledger-store",
+ "ledger-domain",
  "serde",
  "serde_json",
 ]
@@ -2033,7 +2033,7 @@ dependencies = [
  "aws-sdk-s3",
  "chrono",
  "hex",
- "ledger-core",
+ "ledger-domain",
  "rusqlite",
  "serde",
  "serde_json",

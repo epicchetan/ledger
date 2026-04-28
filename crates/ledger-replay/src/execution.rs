@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use ledger_book::OrderBook;
-use ledger_core::{
+use ledger_domain::{
     ExecutionProfile, PriceTicks, SameTimestampPolicy, SimFill, SimLiquidity, SimOrderAccepted,
     SimOrderId, SimOrderKind, SimOrderRequest, SimOrderSide, SimOrderStatus, TradeRecord,
 };

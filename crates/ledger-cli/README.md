@@ -6,7 +6,7 @@
 
 - CLI argument parsing with `clap`.
 - `.env` loading with `dotenvy`.
-- Construction of `ledger-store`, `ledger-ingest`, and `ledger-runtime`.
+- Construction of `ledger-store`, `ledger-ingest`, and `ledger`.
 - JSON output for command results.
 
 ## Does Not Own

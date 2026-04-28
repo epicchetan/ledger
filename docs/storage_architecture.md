@@ -9,7 +9,7 @@ Ledger separates durable storage, local catalog queries, replay session loading,
 ```text
 R2              durable immutable blobs
 SQLite          local operational catalog
-session cache   replay artifacts used by runtime/replay
+session cache   replay artifacts used by Ledger/replay
 tmp/staging     incomplete ingest work
 ```
 
@@ -54,7 +54,7 @@ session_cache_entries    local replay artifact files only
 ingest_runs              local ingest attempts
 ```
 
-The catalog is the query surface for CLI and runtime usage. Commands like `ledger list` and `ledger status` read SQLite.
+The catalog is the query surface for CLI and application usage. Commands like `ledger list` and `ledger status` read SQLite.
 
 ## R2 Objects
 
@@ -92,7 +92,7 @@ Only complete, verified replay artifacts are committed to `data/sessions/`.
 
 ## Session Loading
 
-Runtime loads a session through `ledger-store`.
+`Ledger` loads a session through `ledger-store`.
 
 ```text
 load session

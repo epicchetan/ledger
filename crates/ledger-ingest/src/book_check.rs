@@ -1,6 +1,6 @@
 use anyhow::Result;
 use ledger_book::OrderBook;
-use ledger_core::EventStore;
+use ledger_domain::EventStore;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -37,7 +37,7 @@ pub fn run_book_check(store: &EventStore) -> Result<BookCheckReport> {
         warning_count,
         final_book_checksum: book.checksum(),
         final_order_count: book.order_count(),
-        final_bid_levels: book.level_count(ledger_core::BookSide::Bid),
-        final_ask_levels: book.level_count(ledger_core::BookSide::Ask),
+        final_bid_levels: book.level_count(ledger_domain::BookSide::Bid),
+        final_ask_levels: book.level_count(ledger_domain::BookSide::Ask),
     })
 }

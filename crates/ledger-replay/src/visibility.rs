@@ -1,4 +1,4 @@
-use ledger_core::{Bbo, Depth, TradeRecord, VisibilityProfile};
+use ledger_domain::{Bbo, Depth, TradeRecord, VisibilityProfile};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

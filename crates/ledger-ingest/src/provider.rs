@@ -1,6 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use ledger_core::MarketDay;
+use ledger_domain::MarketDay;
 use std::path::Path;
 
 use crate::databento_downloader::{DatabentoDownloader, DatabentoRangeRequest};

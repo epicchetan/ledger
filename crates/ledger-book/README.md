@@ -3,9 +3,9 @@
 `ledger-book` owns the pure L3 order book used for deterministic book checks and
 replay truth.
 
-This crate applies normalized `ledger-core::MboEvent` values to an in-memory
+This crate applies normalized `ledger-domain::MboEvent` values to an in-memory
 book. It should remain deterministic and independent from storage, ingestion,
-runtime, and CLI concerns.
+application, and CLI concerns.
 
 ## Owns
 

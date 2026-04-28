@@ -2,13 +2,13 @@
 //!
 //! This crate owns the ingest pipeline that turns a requested market day into
 //! replay-ready artifacts. It integrates with Databento, stages raw DBN input
-//! through `ledger-store`, normalizes MBO records into `ledger-core` events,
+//! through `ledger-store`, normalizes MBO records into `ledger-domain` events,
 //! writes replay artifacts, runs the order-book check, and returns an ingest
 //! report.
 //!
 //! Persistence policy belongs to `ledger-store`; this crate calls store APIs
-//! for staging, durable object registration, and replay session commits. Runtime
-//! and replay loading APIs belong to `ledger-runtime` and `ledger-replay`.
+//! for staging, durable object registration, and replay session commits.
+//! Application and replay loading APIs belong to `ledger` and `ledger-replay`.
 
 pub mod book_check;
 pub mod databento_downloader;

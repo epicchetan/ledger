@@ -1,11 +1,11 @@
 [workspace]
 members = [
-    "crates/ledger-core",
+    "crates/ledger-domain",
     "crates/ledger-store",
     "crates/ledger-ingest",
     "crates/ledger-book",
     "crates/ledger-replay",
-    "crates/ledger-runtime",
+    "crates/ledger",
     "crates/ledger-cli",
 ]
 resolver = "2"

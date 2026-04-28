@@ -10,24 +10,24 @@ ledger-cli ingest
   -> ledger-store uploads durable blobs to R2
   -> ledger-store records catalog rows in SQLite
   -> ledger-store commits replay artifacts into the session cache
-  -> ledger-runtime loads replay sessions from store
+  -> ledger loads replay sessions from store
 ```
 
 ## Crate Boundaries
 
-`ledger-core` owns shared types and codecs. It has no Databento, R2, SQLite, CLI, or runtime dependency. It defines market-day resolution, normalized MBO events, batch/trade indexes, artifact binary codecs, and shared replay types.
+`ledger-domain` owns shared types and codecs. It has no Databento, R2, SQLite, CLI, or application dependency. It defines market-day resolution, normalized MBO events, batch/trade indexes, artifact binary codecs, and shared replay types.
 
 `ledger-store` owns persistence. It manages the SQLite catalog, R2 object operations, content-addressed object keys, ingest staging directories, replay session cache, session loading, and session cache pruning.
 
 `ledger-ingest` owns historical data preparation. It downloads Databento MBO data, preprocesses DBN into Ledger artifacts, runs book-check, and asks `ledger-store` to persist raw/artifact objects.
 
-`ledger-book` owns the pure L3 order book. It applies normalized MBO events and produces deterministic book state/check outputs without knowing about Databento, R2, SQLite, CLI, or replay runtime.
+`ledger-book` owns the pure L3 order book. It applies normalized MBO events and produces deterministic book state/check outputs without knowing about Databento, R2, SQLite, CLI, or replay orchestration.
 
 `ledger-replay` owns replay simulation. It handles replay timing, delayed visibility, execution latency, queue-ahead, fills, and conservative same-timestamp ordering.
 
-`ledger-runtime` owns replay readiness and session loading. It asks `ledger-store` for ready replay artifact paths and returns those paths to callers.
+`ledger` owns replay readiness and session loading. It asks `ledger-store` for ready replay artifact paths and returns those paths to callers.
 
-`ledger-cli` is a thin command adapter. It parses terminal arguments, loads `.env`, constructs store/ingest/runtime services, and prints JSON.
+`ledger-cli` is a thin command adapter. It parses terminal arguments, loads `.env`, constructs store/ingest/Ledger services, and prints JSON.
 
 ## Ingest Output
 

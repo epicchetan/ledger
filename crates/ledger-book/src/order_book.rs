@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use indexmap::IndexMap;
-use ledger_core::{
+use ledger_domain::{
     Bbo, BookAction, BookSide, Depth, DepthLevel, MboEvent, PriceTicks, SimOrderSide, TradeRecord,
 };
 use serde::{Deserialize, Serialize};
@@ -409,7 +409,7 @@ impl OrderBook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ledger_core::{BookAction, BookSide, MboEvent, PriceTicks};
+    use ledger_domain::{BookAction, BookSide, MboEvent, PriceTicks};
 
     fn add(order_id: u64, side: BookSide, price: i64, size: u32) -> MboEvent {
         MboEvent::synthetic(

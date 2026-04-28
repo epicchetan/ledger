@@ -44,4 +44,4 @@ Raw DBN files are not replay session cache entries. They are downloaded or hydra
 
 ## Boundaries
 
-This crate does not decode Databento DBN, normalize MBO records, run the order book, simulate fills, or format CLI output. It provides storage primitives and session loading semantics for `ledger-ingest`, `ledger-runtime`, and `ledger-cli`.
+This crate does not decode Databento DBN, normalize MBO records, run the order book, simulate fills, or format CLI output. It provides storage primitives and session loading semantics for `ledger-ingest`, `ledger`, and `ledger-cli`.

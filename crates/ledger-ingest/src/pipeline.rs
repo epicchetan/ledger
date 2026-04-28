@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::NaiveDate;
-use ledger_core::{MarketDay, MarketDayStatus, StorageKind};
+use ledger_domain::{MarketDay, MarketDayStatus, StorageKind};
 use ledger_store::{
     IngestStaging, LedgerStore, LoadedSession, ObjectStore, PutFileRequest, StoredObject,
 };
@@ -333,7 +333,7 @@ fn object_of(objects: &[StoredObject], kind: StorageKind) -> Result<StoredObject
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use ledger_core::{BookAction, BookSide, MboEvent, PriceTicks};
+    use ledger_domain::{BookAction, BookSide, MboEvent, PriceTicks};
     use ledger_store::{LocalStore, MemoryObjectStore, ObjectKeyBuilder};
     use std::path::Path;
     use std::sync::{Arc, Mutex};

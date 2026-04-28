@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 use ledger_book::OrderBook;
-use ledger_core::{
+use ledger_domain::{
     EventStore, ExecutionProfile, SameTimestampPolicy, SimFill, SimOrderAccepted, SimOrderRequest,
     VisibilityProfile,
 };
@@ -175,7 +175,7 @@ impl ReplaySimulator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ledger_core::{
+    use ledger_domain::{
         build_batches, build_trade_index, BookAction, BookSide, EventStore, LatencyModel, MboEvent,
         PriceTicks, SimOrderKind, SimOrderRequest, SimOrderSide, SimOrderStatus,
     };

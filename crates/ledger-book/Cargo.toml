@@ -5,7 +5,7 @@ edition.workspace = true
 
 [dependencies]
 indexmap.workspace = true
-ledger-core = { path = "../ledger-core" }
+ledger-domain = { path = "../ledger-domain" }
 serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true

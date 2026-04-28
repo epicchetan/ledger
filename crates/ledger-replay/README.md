@@ -1,7 +1,7 @@
 # ledger-replay
 
 `ledger-replay` owns headless replay and simulated execution over a prepared
-`ledger-core::EventStore`.
+`ledger-domain::EventStore`.
 
 The crate separates exchange truth from trader visibility and simulated order
 arrival. It consumes already-prepared artifacts; it does not find, download, or

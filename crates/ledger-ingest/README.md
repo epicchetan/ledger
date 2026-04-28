@@ -11,10 +11,10 @@ market day into the replay artifacts that the rest of Ledger can load.
   - `events.v1.bin`
   - `batches.v1.bin`
   - `trades.v1.bin`
-- Normalize Databento MBO records into `ledger-core::MboEvent`.
-- Build batch and trade indexes through `ledger-core`.
+- Normalize Databento MBO records into `ledger-domain::MboEvent`.
+- Build batch and trade indexes through `ledger-domain`.
 - Run book-check through `ledger-book`.
-- Produce `IngestReport` values for CLI/runtime callers.
+- Produce `IngestReport` values for CLI/application callers.
 
 ## Boundaries
 
@@ -22,8 +22,8 @@ This crate should not own persistence policy. R2 uploads, SQLite catalog state,
 session-cache paths, temp directory layout, and cache pruning belong to
 `ledger-store`.
 
-This crate should not expose runtime or replay APIs. Loading a ready session for
-replay belongs to `ledger-runtime`, and execution simulation belongs to
+This crate should not expose application or replay APIs. Loading a ready session for
+replay belongs to `ledger`, and execution simulation belongs to
 `ledger-replay`.
 
 ## Main Modules

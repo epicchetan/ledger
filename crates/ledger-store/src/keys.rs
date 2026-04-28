@@ -1,4 +1,4 @@
-use ledger_core::MarketDay;
+use ledger_domain::MarketDay;
 
 #[derive(Clone, Debug)]
 pub struct ObjectKeyBuilder {

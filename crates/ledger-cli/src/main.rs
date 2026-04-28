@@ -2,14 +2,14 @@
 //!
 //! This binary owns argument parsing, `.env` loading, service construction, and
 //! JSON output. Business logic belongs in the library crates: ingest work in
-//! `ledger-ingest`, session readiness/loading in `ledger-runtime`, and
+//! `ledger-ingest`, session readiness/loading in `ledger`, and
 //! persistence in `ledger-store`.
 
 use anyhow::Result;
 use chrono::NaiveDate;
 use clap::{Args, Parser, Subcommand};
+use ledger::Ledger;
 use ledger_ingest::{DatabentoProvider, DbnPreprocessor, IngestConfig, IngestPipeline};
-use ledger_runtime::Runtime;
 use ledger_store::{CachePrunePolicy, MarketDayFilter, R2LedgerStore};
 use std::path::PathBuf;
 
@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Resolve(args) => {
-            let md = ledger_core::MarketDay::resolve_es(args.symbol, parse_date(&args.date)?)?;
+            let md = ledger_domain::MarketDay::resolve_es(args.symbol, parse_date(&args.date)?)?;
             println!("{}", serde_json::to_string_pretty(&md)?);
         }
         Command::Ingest(args) | Command::Download(args) => {
@@ -109,15 +109,13 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Status(args) => {
-            let runtime = Runtime::from_env(&cli.data_dir, &cli.r2_prefix).await?;
-            let status = runtime
-                .status(&args.symbol, parse_date(&args.date)?)
-                .await?;
+            let ledger = Ledger::from_env(&cli.data_dir, &cli.r2_prefix).await?;
+            let status = ledger.status(&args.symbol, parse_date(&args.date)?).await?;
             println!("{}", serde_json::to_string_pretty(&status)?);
         }
         Command::List(args) => {
-            let runtime = Runtime::from_env(&cli.data_dir, &cli.r2_prefix).await?;
-            let rows = runtime.list(MarketDayFilter {
+            let ledger = Ledger::from_env(&cli.data_dir, &cli.r2_prefix).await?;
+            let rows = ledger.list(MarketDayFilter {
                 root: args.root,
                 symbol: args.symbol,
                 ready: args.ready.then_some(true),
@@ -126,8 +124,8 @@ async fn main() -> Result<()> {
         }
         Command::Session(session) => match session.command {
             SessionSubcommand::Load(args) => {
-                let runtime = Runtime::from_env(&cli.data_dir, &cli.r2_prefix).await?;
-                let inputs = runtime
+                let ledger = Ledger::from_env(&cli.data_dir, &cli.r2_prefix).await?;
+                let inputs = ledger
                     .load_session(&args.symbol, parse_date(&args.date)?)
                     .await?;
                 println!("{}", serde_json::to_string_pretty(&inputs)?);

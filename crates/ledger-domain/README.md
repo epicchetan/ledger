@@ -1,9 +1,9 @@
-# ledger-core
+# ledger-domain
 
-`ledger-core` owns Ledger's shared domain types and small pure helpers.
+`ledger-domain` owns Ledger's shared domain types and small pure helpers.
 
 This crate is the common language used by the rest of the workspace. It should
-stay free of provider, storage, CLI, runtime, and replay orchestration logic.
+stay free of provider, storage, CLI, application, and replay orchestration logic.
 
 ## Owns
 
@@ -13,7 +13,7 @@ stay free of provider, storage, CLI, runtime, and replay orchestration logic.
 - Event-store indexes: batch spans and trade records.
 - Artifact codecs for Ledger's private replay artifact files.
 - Shared simulation request/profile/result types.
-- Durable object kind names shared by store, ingest, and runtime.
+- Durable object kind names shared by store, ingest, and application layers.
 
 ## Must Not Own
 

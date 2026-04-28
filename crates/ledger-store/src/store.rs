@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::NaiveDate;
-use ledger_core::{MarketDay, MarketDayStatus, StorageKind};
+use ledger_domain::{MarketDay, MarketDayStatus, StorageKind};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
