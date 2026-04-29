@@ -1,3 +1,4 @@
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::UnixNanos;
@@ -95,6 +96,28 @@ pub struct EventStore {
 impl EventStore {
     pub fn batch_events(&self, span: BatchSpan) -> &[MboEvent] {
         &self.events[span.start_idx..span.end_idx]
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let expected_batches = build_batches(&self.events);
+        if self.batches != expected_batches {
+            bail!(
+                "event store batch index mismatch: decoded {} batches, rebuilt {} batches",
+                self.batches.len(),
+                expected_batches.len()
+            );
+        }
+
+        let expected_trades = build_trade_index(&self.events);
+        if self.trades != expected_trades {
+            bail!(
+                "event store trade index mismatch: decoded {} trades, rebuilt {} trades",
+                self.trades.len(),
+                expected_trades.len()
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -264,5 +287,84 @@ mod tests {
         let trades = build_trade_index(&events);
         assert_eq!(trades.len(), 2);
         assert_eq!(trades[1].size, 3);
+    }
+
+    #[test]
+    fn event_store_validate_accepts_matching_indexes() {
+        let events = vec![
+            MboEvent::synthetic(
+                100,
+                1,
+                BookAction::Add,
+                Some(BookSide::Bid),
+                Some(PriceTicks(1)),
+                1,
+                1,
+                true,
+            ),
+            MboEvent::synthetic(
+                101,
+                2,
+                BookAction::Trade,
+                Some(BookSide::Ask),
+                Some(PriceTicks(1)),
+                2,
+                0,
+                true,
+            ),
+        ];
+        let store = EventStore {
+            batches: build_batches(&events),
+            trades: build_trade_index(&events),
+            events,
+        };
+
+        store.validate().unwrap();
+    }
+
+    #[test]
+    fn event_store_validate_rejects_mismatched_batches() {
+        let events = vec![MboEvent::synthetic(
+            100,
+            1,
+            BookAction::Add,
+            Some(BookSide::Bid),
+            Some(PriceTicks(1)),
+            1,
+            1,
+            true,
+        )];
+        let mut store = EventStore {
+            batches: build_batches(&events),
+            trades: build_trade_index(&events),
+            events,
+        };
+        store.batches[0].end_idx = 0;
+
+        let err = store.validate().unwrap_err().to_string();
+        assert!(err.contains("batch index mismatch"));
+    }
+
+    #[test]
+    fn event_store_validate_rejects_mismatched_trades() {
+        let events = vec![MboEvent::synthetic(
+            100,
+            1,
+            BookAction::Trade,
+            Some(BookSide::Ask),
+            Some(PriceTicks(1)),
+            2,
+            0,
+            true,
+        )];
+        let mut store = EventStore {
+            batches: build_batches(&events),
+            trades: build_trade_index(&events),
+            events,
+        };
+        store.trades.clear();
+
+        let err = store.validate().unwrap_err().to_string();
+        assert!(err.contains("trade index mismatch"));
     }
 }

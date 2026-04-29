@@ -10,3 +10,8 @@ ledger-domain = { path = "../ledger-domain" }
 ledger-store = { path = "../ledger-store" }
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+ledger-replay = { path = "../ledger-replay" }
+tempfile.workspace = true

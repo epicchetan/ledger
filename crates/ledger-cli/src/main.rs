@@ -126,7 +126,7 @@ async fn main() -> Result<()> {
             SessionSubcommand::Load(args) => {
                 let ledger = Ledger::from_env(&cli.data_dir, &cli.r2_prefix).await?;
                 let inputs = ledger
-                    .load_session(&args.symbol, parse_date(&args.date)?)
+                    .load_replay_session(&args.symbol, parse_date(&args.date)?)
                     .await?;
                 println!("{}", serde_json::to_string_pretty(&inputs)?);
             }

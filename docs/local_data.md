@@ -47,7 +47,7 @@ data/sessions/ES/ESH6/2026-03-12/
   book_check.v1.json
 ```
 
-These files are local speed-ups for replay and Ledger session loading. They can
+These files are local speed-ups for replay and replay session loading. They can
 be removed and later hydrated again from R2 by running:
 
 ```bash

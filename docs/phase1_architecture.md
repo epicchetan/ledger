@@ -10,7 +10,7 @@ ledger-cli ingest
   -> ledger-store uploads durable blobs to R2
   -> ledger-store records catalog rows in SQLite
   -> ledger-store commits replay artifacts into the session cache
-  -> ledger loads replay sessions from store
+  -> ledger loads replay sessions from store artifacts
 ```
 
 ## Crate Boundaries
@@ -25,7 +25,7 @@ ledger-cli ingest
 
 `ledger-replay` owns replay simulation. It handles replay timing, delayed visibility, execution latency, queue-ahead, fills, and conservative same-timestamp ordering.
 
-`ledger` owns replay readiness and session loading. It asks `ledger-store` for ready replay artifact paths and returns those paths to callers.
+`ledger` owns replay readiness and replay session loading. It asks `ledger-store` for ready replay artifact paths, returns `ReplaySession`, and can hydrate those artifacts into `ledger-domain::EventStore`.
 
 `ledger-cli` is a thin command adapter. It parses terminal arguments, loads `.env`, constructs store/ingest/Ledger services, and prints JSON.
 

@@ -1947,9 +1947,12 @@ dependencies = [
  "anyhow",
  "chrono",
  "ledger-domain",
+ "ledger-replay",
  "ledger-store",
  "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

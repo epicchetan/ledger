@@ -7,7 +7,9 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::OnceCell;
 
 use crate::object_store::{ObjectMetadata, ObjectStore, RemoteObject};
 
@@ -60,14 +62,32 @@ impl R2Config {
 
 #[derive(Clone)]
 pub struct R2ObjectStore {
-    client: Client,
-    bucket: String,
-    multipart_threshold_bytes: u64,
-    multipart_part_size_bytes: usize,
+    inner: Arc<R2ObjectStoreInner>,
+}
+
+struct R2ObjectStoreInner {
+    config: R2Config,
+    client: OnceCell<Client>,
 }
 
 impl R2ObjectStore {
     pub async fn new(config: R2Config) -> Result<Self> {
+        Ok(Self {
+            inner: Arc::new(R2ObjectStoreInner {
+                config,
+                client: OnceCell::new(),
+            }),
+        })
+    }
+
+    async fn client(&self) -> Result<&Client> {
+        self.inner
+            .client
+            .get_or_try_init(|| async { Self::build_client(&self.inner.config).await })
+            .await
+    }
+
+    async fn build_client(config: &R2Config) -> Result<Client> {
         let creds = Credentials::new(
             config.access_key_id.clone(),
             config.secret_access_key.clone(),
@@ -81,13 +101,7 @@ impl R2ObjectStore {
             .credentials_provider(creds)
             .load()
             .await;
-        let client = Client::new(&sdk_config);
-        Ok(Self {
-            client,
-            bucket: config.bucket,
-            multipart_threshold_bytes: config.multipart_threshold_bytes,
-            multipart_part_size_bytes: config.multipart_part_size_bytes,
-        })
+        Ok(Client::new(&sdk_config))
     }
 
     fn metadata_map(metadata: &ObjectMetadata) -> HashMap<String, String> {
@@ -107,13 +121,13 @@ impl R2ObjectStore {
         path: &Path,
         metadata: &ObjectMetadata,
     ) -> Result<RemoteObject> {
+        let client = self.client().await?.clone();
         let body = ByteStream::from_path(path)
             .await
             .with_context(|| format!("opening {} for upload", path.display()))?;
-        let mut req = self
-            .client
+        let mut req = client
             .put_object()
-            .bucket(&self.bucket)
+            .bucket(self.bucket())
             .key(key)
             .body(body)
             .set_metadata(Some(Self::metadata_map(metadata)));
@@ -123,9 +137,9 @@ impl R2ObjectStore {
         let out = req
             .send()
             .await
-            .with_context(|| format!("uploading s3://{}/{}", self.bucket, key))?;
+            .with_context(|| format!("uploading s3://{}/{}", self.bucket(), key))?;
         Ok(RemoteObject {
-            bucket: self.bucket.clone(),
+            bucket: self.bucket().to_string(),
             key: key.to_string(),
             size_bytes: metadata.size_bytes,
             sha256: Some(metadata.sha256.clone()),
@@ -142,17 +156,17 @@ impl R2ObjectStore {
     ) -> Result<RemoteObject> {
         use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 
-        let create = self
-            .client
+        let client = self.client().await?.clone();
+        let bucket = self.bucket().to_string();
+
+        let create = client
             .create_multipart_upload()
-            .bucket(&self.bucket)
+            .bucket(&bucket)
             .key(key)
             .set_metadata(Some(Self::metadata_map(metadata)))
             .send()
             .await
-            .with_context(|| {
-                format!("creating multipart upload for s3://{}/{}", self.bucket, key)
-            })?;
+            .with_context(|| format!("creating multipart upload for s3://{}/{}", bucket, key))?;
         let upload_id = create
             .upload_id()
             .ok_or_else(|| anyhow!("R2 did not return upload id"))?
@@ -161,7 +175,7 @@ impl R2ObjectStore {
         let mut file = tokio::fs::File::open(path).await?;
         let mut part_number = 1;
         let mut completed = Vec::new();
-        let mut buf = vec![0_u8; self.multipart_part_size_bytes];
+        let mut buf = vec![0_u8; self.inner.config.multipart_part_size_bytes];
 
         loop {
             let n = file.read(&mut buf).await?;
@@ -169,10 +183,9 @@ impl R2ObjectStore {
                 break;
             }
             let body = ByteStream::from(buf[..n].to_vec());
-            let part = self
-                .client
+            let part = client
                 .upload_part()
-                .bucket(&self.bucket)
+                .bucket(&bucket)
                 .key(key)
                 .upload_id(&upload_id)
                 .part_number(part_number)
@@ -189,10 +202,9 @@ impl R2ObjectStore {
                     );
                 }
                 Err(err) => {
-                    let _ = self
-                        .client
+                    let _ = client
                         .abort_multipart_upload()
-                        .bucket(&self.bucket)
+                        .bucket(&bucket)
                         .key(key)
                         .upload_id(&upload_id)
                         .send()
@@ -207,24 +219,18 @@ impl R2ObjectStore {
         let completed_upload = CompletedMultipartUpload::builder()
             .set_parts(Some(completed))
             .build();
-        let out = self
-            .client
+        let out = client
             .complete_multipart_upload()
-            .bucket(&self.bucket)
+            .bucket(&bucket)
             .key(key)
             .upload_id(&upload_id)
             .multipart_upload(completed_upload)
             .send()
             .await
-            .with_context(|| {
-                format!(
-                    "completing multipart upload for s3://{}/{}",
-                    self.bucket, key
-                )
-            })?;
+            .with_context(|| format!("completing multipart upload for s3://{}/{}", bucket, key))?;
 
         Ok(RemoteObject {
-            bucket: self.bucket.clone(),
+            bucket,
             key: key.to_string(),
             size_bytes: metadata.size_bytes,
             sha256: Some(metadata.sha256.clone()),
@@ -242,7 +248,7 @@ impl ObjectStore for R2ObjectStore {
         path: &Path,
         metadata: &ObjectMetadata,
     ) -> Result<RemoteObject> {
-        if metadata.size_bytes as u64 >= self.multipart_threshold_bytes {
+        if metadata.size_bytes as u64 >= self.inner.config.multipart_threshold_bytes {
             self.put_path_multipart(key, path, metadata).await
         } else {
             self.put_path_single(key, path, metadata).await
@@ -255,10 +261,10 @@ impl ObjectStore for R2ObjectStore {
         bytes: &[u8],
         metadata: &ObjectMetadata,
     ) -> Result<RemoteObject> {
-        let mut req = self
-            .client
+        let client = self.client().await?.clone();
+        let mut req = client
             .put_object()
-            .bucket(&self.bucket)
+            .bucket(self.bucket())
             .key(key)
             .body(ByteStream::from(bytes.to_vec()))
             .set_metadata(Some(Self::metadata_map(metadata)));
@@ -268,9 +274,9 @@ impl ObjectStore for R2ObjectStore {
         let out = req
             .send()
             .await
-            .with_context(|| format!("uploading s3://{}/{}", self.bucket, key))?;
+            .with_context(|| format!("uploading s3://{}/{}", self.bucket(), key))?;
         Ok(RemoteObject {
-            bucket: self.bucket.clone(),
+            bucket: self.bucket().to_string(),
             key: key.to_string(),
             size_bytes: bytes.len() as i64,
             sha256: Some(metadata.sha256.clone()),
@@ -280,14 +286,14 @@ impl ObjectStore for R2ObjectStore {
     }
 
     async fn get_to_path(&self, key: &str, dest: &Path) -> Result<RemoteObject> {
+        let client = self.client().await?.clone();
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
         let tmp = crate::local_store::tmp_path(dest);
-        let out = self
-            .client
+        let out = client
             .get_object()
-            .bucket(&self.bucket)
+            .bucket(self.bucket())
             .key(key)
             .send()
             .await?;
@@ -302,7 +308,7 @@ impl ObjectStore for R2ObjectStore {
         tokio::fs::rename(&tmp, dest).await?;
         let size = tokio::fs::metadata(dest).await?.len() as i64;
         Ok(RemoteObject {
-            bucket: self.bucket.clone(),
+            bucket: self.bucket().to_string(),
             key: key.to_string(),
             size_bytes: size,
             sha256,
@@ -312,10 +318,10 @@ impl ObjectStore for R2ObjectStore {
     }
 
     async fn head(&self, key: &str) -> Result<Option<RemoteObject>> {
-        let res = self
-            .client
+        let client = self.client().await?.clone();
+        let res = client
             .head_object()
-            .bucket(&self.bucket)
+            .bucket(self.bucket())
             .key(key)
             .send()
             .await;
@@ -323,7 +329,7 @@ impl ObjectStore for R2ObjectStore {
             Ok(out) => {
                 let metadata = out.metadata().cloned().unwrap_or_default();
                 Ok(Some(RemoteObject {
-                    bucket: self.bucket.clone(),
+                    bucket: self.bucket().to_string(),
                     key: key.to_string(),
                     size_bytes: out.content_length().unwrap_or_default(),
                     sha256: metadata.get("sha256").cloned(),
@@ -338,13 +344,38 @@ impl ObjectStore for R2ObjectStore {
                 {
                     Ok(None)
                 } else {
-                    Err(err).with_context(|| format!("HEAD s3://{}/{}", self.bucket, key))
+                    Err(err).with_context(|| format!("HEAD s3://{}/{}", self.bucket(), key))
                 }
             }
         }
     }
 
     fn bucket(&self) -> &str {
-        &self.bucket
+        &self.inner.config.bucket
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_config() -> R2Config {
+        R2Config {
+            account_id: "account".to_string(),
+            access_key_id: "access".to_string(),
+            secret_access_key: "secret".to_string(),
+            bucket: "bucket".to_string(),
+            endpoint_url: Some("https://example.invalid".to_string()),
+            region: "auto".to_string(),
+            multipart_threshold_bytes: 1024,
+            multipart_part_size_bytes: 1024,
+        }
+    }
+
+    #[tokio::test]
+    async fn r2_store_construction_is_lazy() {
+        let store = R2ObjectStore::new(dummy_config()).await.unwrap();
+
+        assert_eq!(store.bucket(), "bucket");
     }
 }

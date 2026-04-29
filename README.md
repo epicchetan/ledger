@@ -56,7 +56,7 @@ ledger-store    SQLite catalog, R2 object store, session cache, object keys
 ledger-ingest   Databento provider, DBN preprocessing, durable ingest pipeline
 ledger-book     pure L3 order book
 ledger-replay   replay clock, visibility delay, latency, queue-ahead, and fills
-ledger          application-facing Ledger and session loading boundary
+ledger          application-facing Ledger and replay session loading boundary
 ledger-cli      thin terminal adapter
 ```
 
@@ -69,7 +69,7 @@ session cache   replay artifacts only under data/sessions/
 tmp/staging     raw DBN and incomplete ingest work under data/tmp/
 ```
 
-Raw DBN files are cataloged and stored durably in R2, but they are not part of the replay session cache. Loading a session hydrates only replay artifacts:
+Raw DBN files are cataloged and stored durably in R2, but they are not part of the replay session cache. Loading a replay session hydrates only replay artifacts:
 
 ```text
 events.v1.bin

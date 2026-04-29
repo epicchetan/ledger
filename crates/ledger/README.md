@@ -1,19 +1,21 @@
 # ledger
 
-`ledger` is the application-facing layer for replay readiness and session
-loading. It is the crate that should grow toward the public `Ledger` and
-`LedgerSession` object model used by API, CLI, and future live-mode adapters.
+`ledger` is the application-facing layer for replay readiness and replay
+session loading. It is the crate that should grow toward the public `Ledger`
+and `ReplaySession` object model used by API, CLI, and future live-mode
+adapters.
 
 ## Owns
 
 - Status checks for cataloged market days.
 - Listing cataloged sessions through `ledger-store`.
-- Loading replay inputs for a ready session.
+- Loading replay sessions for a ready market day.
 - Returning local paths to replay artifacts:
   - `events.v1.bin`
   - `batches.v1.bin`
   - `trades.v1.bin`
   - `book_check.v1.json`
+- Hydrating local replay artifacts into `ledger-domain::EventStore`.
 
 ## Does Not Own
 
@@ -26,14 +28,16 @@ loading. It is the crate that should grow toward the public `Ledger` and
 ## Main Types
 
 - `Ledger<S>` wraps a `ledger-store::LedgerStore<S>`.
-- `LedgerSession` is the current session-loading output.
+- `ReplaySession` is the loaded replay-session context.
 
 ## Boundary
 
-Callers should ask `Ledger` to load a session, not hydrate individual files. The
-store decides whether artifacts are already local or need to be fetched from R2.
+Callers should ask `Ledger` to load a replay session, not hydrate individual
+files. The store decides whether artifacts are already local or need to be
+fetched from R2. `ReplaySession::event_store` decodes and validates the local
+artifacts before handing them to replay.
 
 ## Tests
 
-`ledger` is intentionally thin for now. Most behavior is covered by
-`ledger-store` and CLI/integration-style tests.
+`ledger` tests should cover replay artifact hydration and the bridge from a
+loaded `ReplaySession` into `ledger-replay`.

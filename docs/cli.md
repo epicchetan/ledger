@@ -62,7 +62,7 @@ session_cache_valid        local replay artifacts pass size/SHA validation
 last_accessed_ns           last session load/access time
 ```
 
-`status` does not hydrate files. Use `session load` to bring replay artifacts local.
+`status` does not hydrate files. Use `session load` to load the replay session artifacts locally.
 
 ## `list`
 
@@ -83,13 +83,13 @@ This reads SQLite only. It does not scan R2.
 
 ## `session load`
 
-Load replay artifacts for a ready session.
+Load replay artifacts for a ready replay session.
 
 ```bash
 cargo run -p ledger-cli -- session load --symbol ESH6 --date 2026-03-12
 ```
 
-This asks `ledger-store` for replay inputs. Store reuses valid files under `data/sessions/` or hydrates missing/corrupt replay artifacts from R2. Raw DBN is not loaded into the session cache.
+This asks Ledger to load a replay session. Store reuses valid files under `data/sessions/` or hydrates missing/corrupt replay artifacts from R2. Raw DBN is not loaded into the session cache.
 
 Returned paths point at:
 

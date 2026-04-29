@@ -456,6 +456,11 @@ impl<S: ObjectStore + 'static> LedgerStore<S> {
         }
 
         let dest = self.local.session_artifact_path(md, object.kind.clone())?;
+        if self.path_valid_for_object(&dest, object)? {
+            self.catalog.upsert_session_cache_entry(md, object, &dest)?;
+            return Ok(dest);
+        }
+
         self.hydrate_object_to_path(object, &dest).await?;
         self.catalog.upsert_session_cache_entry(md, object, &dest)?;
         Ok(dest)
@@ -623,6 +628,53 @@ mod tests {
             .unwrap();
         let cached = store.catalog.cache_path(&obj.remote_key).unwrap().unwrap();
         std::fs::remove_file(&cached).unwrap();
+        let session = store.load_session("ESH6", md.market_date).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(session.events_path).await.unwrap(),
+            b"events"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_session_reuses_valid_session_files_without_cache_rows() {
+        let (_dir, store, mut md) = sample_store().await;
+        store
+            .mark_market_day_status(&mut md, MarketDayStatus::Ready, true)
+            .unwrap();
+
+        for (kind, bytes) in [
+            (StorageKind::EventStore, b"events".as_slice()),
+            (StorageKind::BatchIndex, b"batches".as_slice()),
+            (StorageKind::TradeIndex, b"trades".as_slice()),
+            (StorageKind::BookCheck, b"book_check".as_slice()),
+        ] {
+            let path = store
+                .local
+                .session_artifact_path(&md, kind.clone())
+                .unwrap();
+            store.local.write_atomic(&path, bytes).await.unwrap();
+            let object = StoredObject {
+                kind: kind.clone(),
+                logical_key: store.keys.artifact_logical_key(&md, kind.as_str(), 1),
+                format: "bin".to_string(),
+                schema_version: 1,
+                content_sha256: sha256_file(&path).unwrap(),
+                size_bytes: bytes.len() as i64,
+                remote_bucket: store.remote.bucket().to_string(),
+                remote_key: format!("missing-remote/{}", kind.as_str()),
+                producer: Some("test".to_string()),
+                producer_version: Some("dev".to_string()),
+                source_provider: None,
+                source_dataset: None,
+                source_schema: None,
+                source_symbol: None,
+                metadata_json: serde_json::json!({}),
+            };
+            store.catalog.upsert_object(&md, &object).unwrap();
+        }
+
+        store.catalog.remove_session_cache_entries(&md.id).unwrap();
+
         let session = store.load_session("ESH6", md.market_date).await.unwrap();
         assert_eq!(
             tokio::fs::read(session.events_path).await.unwrap(),

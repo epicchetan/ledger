@@ -90,20 +90,20 @@ download or hydrate raw DBN into data/tmp/
 
 Only complete, verified replay artifacts are committed to `data/sessions/`.
 
-## Session Loading
+## Replay Session Loading
 
-`Ledger` loads a session through `ledger-store`.
+`Ledger` loads a replay session through `ledger-store`.
 
 ```text
-load session
+load replay session
   -> query SQLite for ready replay artifacts
   -> reuse valid data/sessions files when present
   -> hydrate missing/corrupt artifacts from R2
   -> validate size and SHA256
-  -> return local artifact paths
+  -> return ReplaySession with local artifact paths
 ```
 
-Callers should not request individual artifact hydration. Loading the session is the abstraction.
+Callers should not request individual artifact hydration. Loading the replay session is the abstraction, and `ReplaySession` can decode those local artifacts into an `EventStore`.
 
 ## Cache Pruning
 
