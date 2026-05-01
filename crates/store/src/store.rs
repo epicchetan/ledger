@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use crate::{
     is_replay_artifact, required_replay_kinds, sha256_file, CachePrunePolicy, CachePruneReport,
-    LoadedSession, LocalStore, MarketDayFilter, MarketDayRecord, ObjectKeyBuilder, ObjectMetadata,
-    ObjectStore, R2Config, R2ObjectStore, SessionObjectStatus, SessionStatus, SqliteCatalog,
-    StoredObject,
+    LoadedReplayDataset, LocalStore, MarketDayFilter, MarketDayRecord, ObjectKeyBuilder,
+    ObjectMetadata, ObjectStore, R2Config, R2ObjectStore, ReplayDatasetObjectStatus,
+    ReplayDatasetStatus, SqliteCatalog, StoredObject,
 };
 
 #[derive(Clone)]
@@ -91,17 +91,21 @@ impl<S: ObjectStore + 'static> LedgerStore<S> {
         self.catalog.list_market_days(&filter)
     }
 
-    pub async fn session_status(&self, symbol: &str, date: NaiveDate) -> Result<SessionStatus> {
+    pub async fn replay_dataset_status(
+        &self,
+        symbol: &str,
+        date: NaiveDate,
+    ) -> Result<ReplayDatasetStatus> {
         let md = MarketDay::resolve_es(symbol, date)?;
         let Some(record) = self.catalog.market_day(&md.id)? else {
-            return Ok(SessionStatus {
+            return Ok(ReplayDatasetStatus {
                 market_day: md,
                 catalog_found: false,
                 ready: false,
                 raw_available_remote: false,
                 artifacts_available_remote: false,
-                session_loaded_local: false,
-                session_cache_valid: false,
+                dataset_loaded_local: false,
+                dataset_cache_valid: false,
                 last_accessed_ns: None,
                 objects: Vec::new(),
             });
@@ -113,16 +117,16 @@ impl<S: ObjectStore + 'static> LedgerStore<S> {
             .is_some();
         let mut objects = Vec::new();
         let mut artifacts_available_remote = true;
-        let mut session_loaded_local = true;
-        let mut session_cache_valid = true;
+        let mut dataset_loaded_local = true;
+        let mut dataset_cache_valid = true;
 
         for kind in required_replay_kinds() {
             let object = self.catalog.object(&record.market_day.id, kind.clone())?;
             let Some(object) = object else {
                 artifacts_available_remote = false;
-                session_loaded_local = false;
-                session_cache_valid = false;
-                objects.push(SessionObjectStatus {
+                dataset_loaded_local = false;
+                dataset_cache_valid = false;
+                objects.push(ReplayDatasetObjectStatus {
                     kind,
                     remote_key: None,
                     local_path: None,
@@ -135,9 +139,9 @@ impl<S: ObjectStore + 'static> LedgerStore<S> {
                 Some(path) => self.path_valid_for_object(path, &object)?,
                 None => false,
             };
-            session_loaded_local &= local_path.is_some();
-            session_cache_valid &= local_valid;
-            objects.push(SessionObjectStatus {
+            dataset_loaded_local &= local_path.is_some();
+            dataset_cache_valid &= local_valid;
+            objects.push(ReplayDatasetObjectStatus {
                 kind,
                 remote_key: Some(object.remote_key),
                 local_path,
@@ -145,20 +149,24 @@ impl<S: ObjectStore + 'static> LedgerStore<S> {
             });
         }
 
-        Ok(SessionStatus {
+        Ok(ReplayDatasetStatus {
             market_day: record.market_day,
             catalog_found: true,
             ready: record.ready,
             raw_available_remote,
             artifacts_available_remote,
-            session_loaded_local,
-            session_cache_valid,
+            dataset_loaded_local,
+            dataset_cache_valid,
             last_accessed_ns: record.last_accessed_ns,
             objects,
         })
     }
 
-    pub async fn load_session(&self, symbol: &str, date: NaiveDate) -> Result<LoadedSession> {
+    pub async fn load_replay_dataset(
+        &self,
+        symbol: &str,
+        date: NaiveDate,
+    ) -> Result<LoadedReplayDataset> {
         let md = MarketDay::resolve_es(symbol, date)?;
         let record = self
             .catalog
@@ -182,22 +190,22 @@ impl<S: ObjectStore + 'static> LedgerStore<S> {
             .await?;
 
         let events_path = self
-            .load_session_artifact(&record.market_day, &events)
+            .load_replay_dataset_artifact(&record.market_day, &events)
             .await?;
         let batches_path = self
-            .load_session_artifact(&record.market_day, &batches)
+            .load_replay_dataset_artifact(&record.market_day, &batches)
             .await?;
         let trades_path = self
-            .load_session_artifact(&record.market_day, &trades)
+            .load_replay_dataset_artifact(&record.market_day, &trades)
             .await?;
         let book_check_path = self
-            .load_session_artifact(&record.market_day, &book_check)
+            .load_replay_dataset_artifact(&record.market_day, &book_check)
             .await?;
 
         self.catalog.touch_market_day(&record.market_day.id)?;
         self.prune_cache(self.cache_policy)?;
 
-        Ok(LoadedSession {
+        Ok(LoadedReplayDataset {
             market_day: record.market_day,
             events_path,
             batches_path,
@@ -271,12 +279,12 @@ impl<S: ObjectStore + 'static> LedgerStore<S> {
         let market_day = req.market_day;
         let path = req.path;
         let object = self.put_file(req).await?;
-        self.commit_replay_artifact_to_session(market_day, &object, path)
+        self.commit_replay_artifact_to_dataset(market_day, &object, path)
             .await?;
         Ok(object)
     }
 
-    pub async fn commit_replay_artifact_to_session(
+    pub async fn commit_replay_artifact_to_dataset(
         &self,
         md: &MarketDay,
         object: &StoredObject,
@@ -284,14 +292,14 @@ impl<S: ObjectStore + 'static> LedgerStore<S> {
     ) -> Result<PathBuf> {
         if !is_replay_artifact(&object.kind) {
             return Err(anyhow!(
-                "{} is not allowed in the replay session cache",
+                "{} is not allowed in the replay dataset cache",
                 object.kind.as_str()
             ));
         }
         let dest = self
             .local
-            .session_artifact_path(md, object.kind.clone())
-            .with_context(|| format!("session path for {}", object.kind.as_str()))?;
+            .replay_dataset_artifact_path(md, object.kind.clone())
+            .with_context(|| format!("replay dataset path for {}", object.kind.as_str()))?;
         self.local.commit_file_atomic(source_path, &dest).await?;
         if !self.path_valid_for_object(&dest, object)? {
             return Err(anyhow!(
@@ -299,7 +307,8 @@ impl<S: ObjectStore + 'static> LedgerStore<S> {
                 dest.display()
             ));
         }
-        self.catalog.upsert_session_cache_entry(md, object, &dest)?;
+        self.catalog
+            .upsert_replay_dataset_cache_entry(md, object, &dest)?;
         Ok(dest)
     }
 
@@ -416,18 +425,20 @@ impl<S: ObjectStore + 'static> LedgerStore<S> {
         let mut report = CachePruneReport::default();
         let to_delete = cached.len().saturating_sub(policy.max_sessions);
         for (market_day_id, sample_path, _) in cached.into_iter().take(to_delete) {
-            let session_dir = sample_path
+            let dataset_dir = sample_path
                 .parent()
                 .ok_or_else(|| anyhow!("cache path has no parent: {}", sample_path.display()))?
                 .to_path_buf();
-            let bytes = dir_size(&session_dir)?;
-            if session_dir.exists() {
-                std::fs::remove_dir_all(&session_dir)
-                    .with_context(|| format!("removing session cache {}", session_dir.display()))?;
+            let bytes = dir_size(&dataset_dir)?;
+            if dataset_dir.exists() {
+                std::fs::remove_dir_all(&dataset_dir).with_context(|| {
+                    format!("removing replay dataset cache {}", dataset_dir.display())
+                })?;
             }
-            self.catalog.remove_session_cache_entries(&market_day_id)?;
+            self.catalog
+                .remove_replay_dataset_cache_entries(&market_day_id)?;
             report.deleted_sessions.push(market_day_id);
-            report.deleted_dirs.push(session_dir);
+            report.deleted_dirs.push(dataset_dir);
             report.bytes_deleted = report.bytes_deleted.saturating_add(bytes);
         }
         Ok(report)
@@ -443,26 +454,31 @@ impl<S: ObjectStore + 'static> LedgerStore<S> {
             .ok_or_else(|| anyhow!("market day {} missing {}", md.id, kind.as_str()))
     }
 
-    async fn load_session_artifact(
+    async fn load_replay_dataset_artifact(
         &self,
         md: &MarketDay,
         object: &StoredObject,
     ) -> Result<PathBuf> {
         if let Some(path) = self.catalog.cache_path(&object.remote_key)? {
             if self.path_valid_for_object(&path, object)? {
-                self.catalog.upsert_session_cache_entry(md, object, &path)?;
+                self.catalog
+                    .upsert_replay_dataset_cache_entry(md, object, &path)?;
                 return Ok(path);
             }
         }
 
-        let dest = self.local.session_artifact_path(md, object.kind.clone())?;
+        let dest = self
+            .local
+            .replay_dataset_artifact_path(md, object.kind.clone())?;
         if self.path_valid_for_object(&dest, object)? {
-            self.catalog.upsert_session_cache_entry(md, object, &dest)?;
+            self.catalog
+                .upsert_replay_dataset_cache_entry(md, object, &dest)?;
             return Ok(dest);
         }
 
         self.hydrate_object_to_path(object, &dest).await?;
-        self.catalog.upsert_session_cache_entry(md, object, &dest)?;
+        self.catalog
+            .upsert_replay_dataset_cache_entry(md, object, &dest)?;
         Ok(dest)
     }
 
@@ -529,7 +545,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_objects_are_not_session_cache_entries() {
+    async fn raw_objects_are_not_replay_dataset_cache_entries() {
         let (_dir, store, mut md) = sample_store().await;
         store
             .mark_market_day_status(&mut md, MarketDayStatus::Downloading, false)
@@ -560,7 +576,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_session_hydrates_missing_artifacts() {
+    async fn load_replay_dataset_hydrates_missing_artifacts() {
         let (_dir, store, mut md) = sample_store().await;
         store
             .mark_market_day_status(&mut md, MarketDayStatus::Preprocessing, false)
@@ -628,15 +644,18 @@ mod tests {
             .unwrap();
         let cached = store.catalog.cache_path(&obj.remote_key).unwrap().unwrap();
         std::fs::remove_file(&cached).unwrap();
-        let session = store.load_session("ESH6", md.market_date).await.unwrap();
+        let dataset = store
+            .load_replay_dataset("ESH6", md.market_date)
+            .await
+            .unwrap();
         assert_eq!(
-            tokio::fs::read(session.events_path).await.unwrap(),
+            tokio::fs::read(dataset.events_path).await.unwrap(),
             b"events"
         );
     }
 
     #[tokio::test]
-    async fn load_session_reuses_valid_session_files_without_cache_rows() {
+    async fn load_replay_dataset_reuses_valid_files_without_cache_rows() {
         let (_dir, store, mut md) = sample_store().await;
         store
             .mark_market_day_status(&mut md, MarketDayStatus::Ready, true)
@@ -650,7 +669,7 @@ mod tests {
         ] {
             let path = store
                 .local
-                .session_artifact_path(&md, kind.clone())
+                .replay_dataset_artifact_path(&md, kind.clone())
                 .unwrap();
             store.local.write_atomic(&path, bytes).await.unwrap();
             let object = StoredObject {
@@ -673,11 +692,17 @@ mod tests {
             store.catalog.upsert_object(&md, &object).unwrap();
         }
 
-        store.catalog.remove_session_cache_entries(&md.id).unwrap();
+        store
+            .catalog
+            .remove_replay_dataset_cache_entries(&md.id)
+            .unwrap();
 
-        let session = store.load_session("ESH6", md.market_date).await.unwrap();
+        let dataset = store
+            .load_replay_dataset("ESH6", md.market_date)
+            .await
+            .unwrap();
         assert_eq!(
-            tokio::fs::read(session.events_path).await.unwrap(),
+            tokio::fs::read(dataset.events_path).await.unwrap(),
             b"events"
         );
     }

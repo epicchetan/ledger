@@ -52,7 +52,7 @@ pub struct MarketDayFilter {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SessionObjectStatus {
+pub struct ReplayDatasetObjectStatus {
     pub kind: StorageKind,
     pub remote_key: Option<String>,
     pub local_path: Option<PathBuf>,
@@ -60,20 +60,20 @@ pub struct SessionObjectStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SessionStatus {
+pub struct ReplayDatasetStatus {
     pub market_day: MarketDay,
     pub catalog_found: bool,
     pub ready: bool,
     pub raw_available_remote: bool,
     pub artifacts_available_remote: bool,
-    pub session_loaded_local: bool,
-    pub session_cache_valid: bool,
+    pub dataset_loaded_local: bool,
+    pub dataset_cache_valid: bool,
     pub last_accessed_ns: Option<u64>,
-    pub objects: Vec<SessionObjectStatus>,
+    pub objects: Vec<ReplayDatasetObjectStatus>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LoadedSession {
+pub struct LoadedReplayDataset {
     pub market_day: MarketDay,
     pub events_path: PathBuf,
     pub batches_path: PathBuf,
@@ -397,7 +397,7 @@ impl SqliteCatalog {
         Ok(())
     }
 
-    pub fn upsert_session_cache_entry(
+    pub fn upsert_replay_dataset_cache_entry(
         &self,
         md: &MarketDay,
         object: &StoredObject,
@@ -405,7 +405,7 @@ impl SqliteCatalog {
     ) -> Result<()> {
         if !is_replay_artifact(&object.kind) {
             return Err(anyhow!(
-                "only replay artifacts may be committed to the session cache, got {}",
+                "only replay artifacts may be committed to the replay dataset cache, got {}",
                 object.kind.as_str()
             ));
         }
@@ -488,7 +488,7 @@ impl SqliteCatalog {
             .map_err(Into::into)
     }
 
-    pub fn remove_session_cache_entries(&self, market_day_id: &str) -> Result<()> {
+    pub fn remove_replay_dataset_cache_entries(&self, market_day_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "DELETE FROM session_cache_entries WHERE market_day_id = ?1",

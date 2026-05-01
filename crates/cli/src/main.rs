@@ -2,7 +2,7 @@
 //!
 //! This binary owns argument parsing, `.env` loading, service construction, and
 //! JSON output. Business logic belongs in the library crates: ingest work in
-//! `ledger-ingest`, session readiness/loading in `ledger`, and
+//! `ledger-ingest`, replay dataset readiness/loading in `ledger`, and
 //! persistence in `ledger-store`.
 
 use anyhow::{bail, Context, Result};
@@ -152,7 +152,7 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&status)?);
         }
         Command::List(args) => {
-            progress.step("listing cataloged sessions");
+            progress.step("listing cataloged market days");
             let ledger = Ledger::from_env(&cli.data_dir, &cli.r2_prefix).await?;
             let rows = ledger.list(MarketDayFilter {
                 root: args.root,
@@ -164,7 +164,7 @@ async fn main() -> Result<()> {
         Command::Session(session) => match session.command {
             SessionSubcommand::Load(args) => {
                 progress.step(format!(
-                    "loading replay session {} {}",
+                    "loading replay dataset {} {}",
                     args.symbol,
                     parse_date(&args.date)?
                 ));
@@ -174,21 +174,21 @@ async fn main() -> Result<()> {
                 );
                 let started_at = Instant::now();
                 let inputs = ledger
-                    .load_replay_session(&args.symbol, parse_date(&args.date)?)
+                    .load_replay_dataset(&args.symbol, parse_date(&args.date)?)
                     .await?;
-                progress.done("replay session loaded", started_at);
+                progress.done("replay dataset loaded", started_at);
                 println!("{}", serde_json::to_string_pretty(&inputs)?);
             }
             SessionSubcommand::Validate(args) => {
                 let report =
-                    validate_replay_session(&cli.data_dir, &cli.r2_prefix, args, progress).await?;
+                    validate_replay_dataset(&cli.data_dir, &cli.r2_prefix, args, progress).await?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
         },
         Command::Cache(cache) => match cache.command {
             CacheSubcommand::Prune(args) => {
                 progress.step(format!(
-                    "pruning loaded replay sessions to {}",
+                    "pruning loaded replay datasets to {}",
                     args.max_sessions
                 ));
                 let store = R2LedgerStore::from_env(&cli.data_dir, &cli.r2_prefix).await?;
@@ -210,7 +210,7 @@ fn parse_date(date: &str) -> Result<NaiveDate> {
 }
 
 #[derive(Debug, Serialize)]
-struct ReplayValidationReport {
+struct ReplayDatasetValidationReport {
     market_day: MarketDay,
     events_path: PathBuf,
     batches_path: PathBuf,
@@ -269,15 +269,15 @@ impl Progress {
     }
 }
 
-async fn validate_replay_session(
+async fn validate_replay_dataset(
     data_dir: &PathBuf,
     r2_prefix: &str,
     args: ValidateArgs,
     progress: Progress,
-) -> Result<ReplayValidationReport> {
+) -> Result<ReplayDatasetValidationReport> {
     let date = parse_date(&args.market_day.date)?;
     progress.step(format!(
-        "validating replay session {} {}",
+        "validating replay dataset {} {}",
         args.market_day.symbol, date
     ));
 
@@ -285,14 +285,14 @@ async fn validate_replay_session(
 
     progress.step("checking catalog and local replay artifacts; large files are hash-verified");
     let load_started_at = Instant::now();
-    let session = ledger
-        .load_replay_session(&args.market_day.symbol, date)
+    let dataset = ledger
+        .load_replay_dataset(&args.market_day.symbol, date)
         .await?;
-    progress.done("replay session loaded", load_started_at);
+    progress.done("replay dataset loaded", load_started_at);
 
     progress.step("decoding and validating event, batch, and trade artifacts");
     let decode_started_at = Instant::now();
-    let event_store = session.event_store().await?;
+    let event_store = dataset.event_store().await?;
     progress.done(
         format!(
             "decoded {} events, {} batches, {} trades",
@@ -311,18 +311,18 @@ async fn validate_replay_session(
         progress.step("skipping book-check comparison");
         None
     } else {
-        Some(validate_book_check(&session.book_check_path, &event_store, progress).await?)
+        Some(validate_book_check(&dataset.book_check_path, &event_store, progress).await?)
     };
 
     let replay_probe =
         run_replay_probe(event_store, args.replay_batches, args.replay_all, progress)?;
 
-    Ok(ReplayValidationReport {
-        market_day: session.market_day,
-        events_path: session.events_path,
-        batches_path: session.batches_path,
-        trades_path: session.trades_path,
-        book_check_path: session.book_check_path,
+    Ok(ReplayDatasetValidationReport {
+        market_day: dataset.market_day,
+        events_path: dataset.events_path,
+        batches_path: dataset.batches_path,
+        trades_path: dataset.trades_path,
+        book_check_path: dataset.book_check_path,
         event_count,
         batch_count,
         trade_count,

@@ -15,7 +15,7 @@
 - Databento request logic.
 - DBN decoding or preprocessing.
 - SQLite schema and R2 persistence.
-- Replay session cache policy.
+- Replay dataset cache policy.
 - Order-book or replay simulation logic.
 
 ## Commands
@@ -34,12 +34,16 @@ cache prune
 
 `download` is kept as a hidden alias for `ingest`.
 
+The `session` command namespace is still the current CLI surface, but `session
+load` and `session validate` operate on immutable `ReplayDataset` artifacts.
+The active mutable `ReplaySession` controller is future work.
+
 ## Boundary
 
 Keep this crate thin. If a command needs meaningful behavior beyond parsing
 arguments and printing a result, that behavior belongs in one of the library
 crates. `session validate` is intentionally a local validation adapter that
-composes replay session hydration, book-check comparison, and a small replay
+composes replay dataset hydration, book-check comparison, and a small replay
 simulator probe before API/server work begins.
 
 ## Tests

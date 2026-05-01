@@ -7,7 +7,7 @@
 //! report.
 //!
 //! Persistence policy belongs to `ledger-store`; this crate calls store APIs
-//! for staging, durable object registration, and replay session commits.
+//! for staging, durable object registration, and replay dataset commits.
 //! Application and replay loading APIs belong to `ledger` and `ledger-replay`.
 
 pub mod book_check;

@@ -5,7 +5,7 @@
 //! cancels, and emits delayed/coalesced visibility frames.
 //!
 //! This crate must not download, preprocess, locate, hydrate, or cache market
-//! data. Session loading belongs to `ledger` and storage/catalog work
+//! data. Replay dataset loading belongs to `ledger` and storage/catalog work
 //! belongs to `ledger-store`.
 
 mod execution;

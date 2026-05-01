@@ -1,6 +1,6 @@
 # Ledger Store Architecture
 
-Ledger separates durable storage, local catalog queries, replay session loading, and ingest staging.
+Ledger separates durable storage, local catalog queries, replay dataset loading, and ingest staging.
 
 ## Responsibilities
 
@@ -9,11 +9,11 @@ Ledger separates durable storage, local catalog queries, replay session loading,
 ```text
 R2              durable immutable blobs
 SQLite          local operational catalog
-session cache   replay artifacts used by Ledger/replay
+dataset cache   replay artifacts used by Ledger/replay
 tmp/staging     incomplete ingest work
 ```
 
-The important boundary is that the session cache is not a generic object cache. It contains only replay artifacts. Raw DBN is staged for ingest and stored durably in R2, but it is not kept as a replay cache file.
+The important boundary is that the dataset cache is not a generic object cache. It contains only replay artifacts. Raw DBN is staged for ingest and stored durably in R2, but it is not kept as a replay cache file.
 
 ## Local Layout
 
@@ -47,7 +47,7 @@ data/catalog.sqlite
 It records:
 
 ```text
-market_days              known sessions and readiness
+market_days              known MarketDays and readiness
 objects                  durable R2 objects, including raw_dbn
 object_dependencies      artifact lineage
 session_cache_entries    local replay artifact files only
@@ -90,20 +90,22 @@ download or hydrate raw DBN into data/tmp/
 
 Only complete, verified replay artifacts are committed to `data/sessions/`.
 
-## Replay Session Loading
+## Replay Dataset Loading
 
-`Ledger` loads a replay session through `ledger-store`.
+`Ledger` loads a replay dataset through `ledger-store`.
 
 ```text
-load replay session
+load replay dataset
   -> query SQLite for ready replay artifacts
   -> reuse valid data/sessions files when present
   -> hydrate missing/corrupt artifacts from R2
   -> validate size and SHA256
-  -> return ReplaySession with local artifact paths
+  -> return ReplayDataset with local artifact paths
 ```
 
-Callers should not request individual artifact hydration. Loading the replay session is the abstraction, and `ReplaySession` can decode those local artifacts into an `EventStore`.
+Callers should not request individual artifact hydration. Loading the replay
+dataset is the abstraction, and `ReplayDataset` can decode those local artifacts
+into an `EventStore`.
 
 `ledger-cli session validate` composes this loading boundary with local
 artifact decode/index validation, deterministic book-check comparison, and a
@@ -112,13 +114,13 @@ not the future API/server surface.
 
 ## Cache Pruning
 
-The session cache is pruned by least-recently-used market session. The default limit is:
+The replay dataset cache is pruned by least-recently-used market day. The default limit is:
 
 ```text
 LEDGER_CACHE_MAX_SESSIONS=5
 ```
 
-Pruning removes whole session directories under `data/sessions/`. It does not delete R2 objects, SQLite object rows, or raw DBN staging files.
+Pruning removes whole replay dataset directories under `data/sessions/`. It does not delete R2 objects, SQLite object rows, or raw DBN staging files.
 
 ## Catalog Durability
 

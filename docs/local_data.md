@@ -27,7 +27,7 @@ It records:
 known market days
 durable R2 objects
 artifact dependencies
-loaded replay session files
+loaded replay dataset files
 ingest runs
 ```
 
@@ -35,7 +35,9 @@ CLI commands like `status` and `list` read this catalog. The catalog is not curr
 
 ## `sessions/`
 
-`sessions/` is the replay session cache.
+`sessions/` is the replay dataset cache. The directory name is historical; the
+contents are immutable `ReplayDataset` artifacts, not active `ReplaySession`
+state.
 
 Example:
 
@@ -47,7 +49,7 @@ data/sessions/ES/ESH6/2026-03-12/
   book_check.v1.json
 ```
 
-These files are local speed-ups for replay and replay session loading. They can
+These files are local speed-ups for replay and replay dataset loading. They can
 be removed and later hydrated again from R2 by running:
 
 ```bash

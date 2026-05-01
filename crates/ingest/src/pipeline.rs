@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::NaiveDate;
 use ledger_domain::{MarketDay, MarketDayStatus, StorageKind};
 use ledger_store::{
-    IngestStaging, LedgerStore, LoadedSession, ObjectStore, PutFileRequest, StoredObject,
+    IngestStaging, LedgerStore, LoadedReplayDataset, ObjectStore, PutFileRequest, StoredObject,
 };
 use serde::{Deserialize, Serialize};
 
@@ -74,9 +74,12 @@ where
         let md = MarketDay::resolve_es(symbol, date)?;
         if let Some(record) = self.store.catalog.market_day(&md.id)? {
             if record.ready {
-                let loaded = self.store.load_session(symbol, date).await?;
+                let loaded = self.store.load_replay_dataset(symbol, date).await?;
                 return self
-                    .report_from_loaded_session(loaded, vec!["ready_session".to_string()])
+                    .report_from_loaded_replay_dataset(
+                        loaded,
+                        vec!["ready_replay_dataset".to_string()],
+                    )
                     .await;
             }
         }
@@ -187,10 +190,10 @@ where
             .mark_market_day_status(&mut md, MarketDayStatus::Ready, true)?;
         let loaded = self
             .store
-            .load_session(&md.contract_symbol, md.market_date)
+            .load_replay_dataset(&md.contract_symbol, md.market_date)
             .await?;
         let mut report = self
-            .report_from_loaded_session(loaded, reused)
+            .report_from_loaded_replay_dataset(loaded, reused)
             .await
             .context("building ingest report")?;
         report.created = created;
@@ -291,9 +294,9 @@ where
             .await
     }
 
-    async fn report_from_loaded_session(
+    async fn report_from_loaded_replay_dataset(
         &self,
-        loaded: LoadedSession,
+        loaded: LoadedReplayDataset,
         reused: Vec<String>,
     ) -> Result<IngestReport> {
         let raw = self
@@ -326,7 +329,7 @@ fn object_of(objects: &[StoredObject], kind: StorageKind) -> Result<StoredObject
         .iter()
         .find(|object| object.kind == kind)
         .cloned()
-        .ok_or_else(|| anyhow!("loaded session missing {}", kind.as_str()))
+        .ok_or_else(|| anyhow!("loaded replay dataset missing {}", kind.as_str()))
 }
 
 #[cfg(test)]
@@ -405,7 +408,7 @@ mod tests {
             .exists());
 
         let second = pipeline.ingest_market_day("ESH6", date).await.unwrap();
-        assert!(second.reused.contains(&"ready_session".to_string()));
+        assert!(second.reused.contains(&"ready_replay_dataset".to_string()));
         assert_eq!(*provider.calls.lock().unwrap(), 1);
     }
 }

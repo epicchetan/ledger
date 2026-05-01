@@ -20,7 +20,7 @@ Resolve an ES contract and market date into Ledger's market-day window.
 cargo run -p ledger-cli -- resolve --symbol ESH6 --date 2026-03-12
 ```
 
-This does not touch R2, SQLite, or local session files. It only prints the resolved market-day metadata.
+This does not touch R2, SQLite, or local replay dataset files. It only prints the resolved market-day metadata.
 
 ## `ingest`
 
@@ -41,7 +41,7 @@ writes SQLite catalog rows
 commits replay artifacts into data/sessions/
 ```
 
-Rerunning `ingest` for a ready session should reuse the cataloged durable objects and avoid a Databento redownload.
+Rerunning `ingest` for a ready `MarketDay` should reuse the cataloged durable objects and avoid a Databento redownload.
 
 `download` is a hidden alias for `ingest`.
 
@@ -60,16 +60,16 @@ catalog_found              SQLite knows about this market day
 ready                      ingest completed and required objects are cataloged
 raw_available_remote       raw DBN object is cataloged
 artifacts_available_remote replay artifacts are cataloged
-session_loaded_local       replay artifacts have local paths
-session_cache_valid        local replay artifacts pass size/SHA validation
-last_accessed_ns           last session load/access time
+dataset_loaded_local       replay artifacts have local paths
+dataset_cache_valid        local replay artifacts pass size/SHA validation
+last_accessed_ns           last dataset load/access time
 ```
 
-`status` does not hydrate files. Use `session load` to load the replay session artifacts locally.
+`status` does not hydrate files. Use `session load` to load the replay dataset artifacts locally.
 
 ## `list`
 
-Query cataloged sessions.
+Query cataloged market days.
 
 ```bash
 cargo run -p ledger-cli -- list --root ES --ready
@@ -86,13 +86,15 @@ This reads SQLite only. It does not scan R2.
 
 ## `session load`
 
-Load replay artifacts for a ready replay session.
+Load replay artifacts for a ready `ReplayDataset`.
 
 ```bash
 cargo run -p ledger-cli -- session load --symbol ESH6 --date 2026-03-12
 ```
 
-This asks Ledger to load a replay session. Store reuses valid files under `data/sessions/` or hydrates missing/corrupt replay artifacts from R2. Raw DBN is not loaded into the session cache.
+This asks Ledger to load a `ReplayDataset`. Store reuses valid files under
+`data/sessions/` or hydrates missing/corrupt replay artifacts from R2. Raw DBN
+is not loaded into the replay dataset cache.
 
 Returned paths point at:
 
@@ -105,7 +107,7 @@ book_check.v1.json
 
 ## `session validate`
 
-Validate a locally loaded replay session before wiring it into API or UI work.
+Validate a locally loaded `ReplayDataset` before wiring it into API or UI work.
 
 ```bash
 cargo run -p ledger-cli -- session validate --symbol ESH6 --date 2026-03-12
@@ -114,7 +116,7 @@ cargo run -p ledger-cli -- session validate --symbol ESH6 --date 2026-03-12
 This command:
 
 ```text
-loads or hydrates replay session artifacts
+loads or hydrates replay dataset artifacts
 decodes events, batches, and trades into an EventStore
 validates rebuilt batch/trade indexes against decoded indexes
 compares the deterministic book-check report with book_check.v1.json
@@ -135,10 +137,10 @@ still matches, and replay simulation can consume the hydrated `EventStore`.
 
 ## `cache prune`
 
-Prune old loaded replay sessions.
+Prune old loaded replay datasets.
 
 ```bash
 cargo run -p ledger-cli -- cache prune --max-sessions 5
 ```
 
-Pruning removes least-recently-used session directories under `data/sessions/`. It does not delete R2 objects or SQLite object rows.
+Pruning removes least-recently-used replay dataset directories under `data/sessions/`. It does not delete R2 objects or SQLite object rows.

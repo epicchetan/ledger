@@ -9,15 +9,15 @@ ledger-cli ingest
   -> ledger-book runs deterministic book-check
   -> ledger-store uploads durable blobs to R2
   -> ledger-store records catalog rows in SQLite
-  -> ledger-store commits replay artifacts into the session cache
-  -> ledger loads replay sessions from store artifacts
+  -> ledger-store commits replay artifacts into the replay dataset cache
+  -> ledger loads ReplayDatasets from store artifacts
 ```
 
 ## Crate Boundaries
 
 `ledger-domain` owns shared types and codecs. It has no Databento, R2, SQLite, CLI, or application dependency. It defines market-day resolution, normalized MBO events, batch/trade indexes, artifact binary codecs, and shared replay types.
 
-`ledger-store` owns persistence. It manages the SQLite catalog, R2 object operations, content-addressed object keys, ingest staging directories, replay session cache, session loading, and session cache pruning.
+`ledger-store` owns persistence. It manages the SQLite catalog, R2 object operations, content-addressed object keys, ingest staging directories, replay dataset cache, replay dataset loading, and cache pruning.
 
 `ledger-ingest` owns historical data preparation. It downloads Databento MBO data, preprocesses DBN into Ledger artifacts, runs book-check, and asks `ledger-store` to persist raw/artifact objects.
 
@@ -25,7 +25,7 @@ ledger-cli ingest
 
 `ledger-replay` owns replay simulation. It handles replay timing, delayed visibility, execution latency, queue-ahead, fills, and conservative same-timestamp ordering.
 
-`ledger` owns replay readiness and replay session loading. It asks `ledger-store` for ready replay artifact paths, returns `ReplaySession`, and can hydrate those artifacts into `ledger-domain::EventStore`.
+`ledger` owns replay readiness and replay dataset loading. It asks `ledger-store` for ready replay artifact paths, returns `ReplayDataset`, and can hydrate those artifacts into `ledger-domain::EventStore`.
 
 `ledger-cli` is a thin command adapter. It parses terminal arguments, loads `.env`, constructs store/ingest/Ledger services, prints progress to stderr, and prints JSON results to stdout. Its `session validate` command is a local validation adapter for decoded replay artifacts and replay simulator probes; it is not the future API/server surface.
 

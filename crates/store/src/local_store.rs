@@ -39,7 +39,7 @@ impl LocalStore {
             .join(format!("{market_date}.dbn.zst"))
     }
 
-    pub fn session_dir(&self, root: &str, symbol: &str, market_date: &str) -> PathBuf {
+    pub fn replay_dataset_dir(&self, root: &str, symbol: &str, market_date: &str) -> PathBuf {
         self.root
             .join("sessions")
             .join(root)
@@ -47,9 +47,13 @@ impl LocalStore {
             .join(market_date)
     }
 
-    pub fn session_artifact_path(&self, md: &MarketDay, kind: StorageKind) -> Result<PathBuf> {
+    pub fn replay_dataset_artifact_path(
+        &self,
+        md: &MarketDay,
+        kind: StorageKind,
+    ) -> Result<PathBuf> {
         Ok(self
-            .session_dir(&md.root, &md.contract_symbol, &md.market_date.to_string())
+            .replay_dataset_dir(&md.root, &md.contract_symbol, &md.market_date.to_string())
             .join(replay_file_name(kind)?))
     }
 

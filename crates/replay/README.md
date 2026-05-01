@@ -5,7 +5,7 @@
 
 The crate separates exchange truth from trader visibility and simulated order
 arrival. It consumes already-prepared artifacts; it does not find, download, or
-cache sessions.
+cache replay datasets.
 
 ## Owns
 
@@ -20,7 +20,7 @@ cache sessions.
 ## Must Not Own
 
 - Databento download or DBN preprocessing.
-- R2, SQLite, filesystem staging, or session loading.
+- R2, SQLite, filesystem staging, or replay dataset loading.
 - CLI command surfaces.
 - Durable artifact format definitions beyond consuming `EventStore`.
 

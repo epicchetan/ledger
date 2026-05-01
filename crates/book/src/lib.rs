@@ -6,7 +6,7 @@
 //! used by replay execution.
 //!
 //! This crate must not know about Databento downloads, DBN files, R2, SQLite,
-//! session loading, replay timing, or CLI/API behavior.
+//! replay dataset loading, replay timing, or CLI/API behavior.
 
 mod order_book;
 

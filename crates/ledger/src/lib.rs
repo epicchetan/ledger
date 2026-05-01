@@ -1,4 +1,4 @@
-//! Ledger-facing replay session loading.
+//! Ledger-facing replay dataset loading.
 //!
 //! This crate is the boundary a UI, API, or command adapter should use when it
 //! needs to inspect or load replay inputs. It delegates persistence and cache
@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use ledger_domain::{decode_batches, decode_events, decode_trades, EventStore, MarketDay};
 use ledger_store::{
-    LedgerStore, LoadedSession, MarketDayFilter, MarketDayRecord, ObjectStore, R2LedgerStore,
-    SessionStatus,
+    LedgerStore, LoadedReplayDataset, MarketDayFilter, MarketDayRecord, ObjectStore, R2LedgerStore,
+    ReplayDatasetStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ pub struct Ledger<S: ObjectStore + 'static> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReplaySession {
+pub struct ReplayDataset {
     pub market_day: MarketDay,
     pub events_path: PathBuf,
     pub batches_path: PathBuf,
@@ -29,7 +29,7 @@ pub struct ReplaySession {
     pub book_check_path: PathBuf,
 }
 
-impl ReplaySession {
+impl ReplayDataset {
     pub async fn event_store(&self) -> Result<EventStore> {
         let events_bytes = read_artifact("events", &self.events_path).await?;
         let batches_bytes = read_artifact("batches", &self.batches_path).await?;
@@ -49,7 +49,7 @@ impl ReplaySession {
 
         store
             .validate()
-            .with_context(|| format!("validating replay session {}", self.market_day.id))?;
+            .with_context(|| format!("validating replay dataset {}", self.market_day.id))?;
         Ok(store)
     }
 }
@@ -70,26 +70,26 @@ impl<S: ObjectStore + 'static> Ledger<S> {
         Self { store }
     }
 
-    pub async fn status(&self, symbol: &str, date: NaiveDate) -> Result<SessionStatus> {
-        self.store.session_status(symbol, date).await
+    pub async fn status(&self, symbol: &str, date: NaiveDate) -> Result<ReplayDatasetStatus> {
+        self.store.replay_dataset_status(symbol, date).await
     }
 
     pub fn list(&self, filter: MarketDayFilter) -> Result<Vec<MarketDayRecord>> {
         self.store.list_market_days(filter)
     }
 
-    pub async fn load_replay_session(
+    pub async fn load_replay_dataset(
         &self,
         symbol: &str,
         date: NaiveDate,
-    ) -> Result<ReplaySession> {
-        let session: LoadedSession = self.store.load_session(symbol, date).await?;
-        Ok(ReplaySession {
-            market_day: session.market_day,
-            events_path: session.events_path,
-            batches_path: session.batches_path,
-            trades_path: session.trades_path,
-            book_check_path: session.book_check_path,
+    ) -> Result<ReplayDataset> {
+        let dataset: LoadedReplayDataset = self.store.load_replay_dataset(symbol, date).await?;
+        Ok(ReplayDataset {
+            market_day: dataset.market_day,
+            events_path: dataset.events_path,
+            batches_path: dataset.batches_path,
+            trades_path: dataset.trades_path,
+            book_check_path: dataset.book_check_path,
         })
     }
 }
@@ -123,8 +123,8 @@ mod tests {
         )
     }
 
-    fn replay_session(dir: &Path) -> ReplaySession {
-        ReplaySession {
+    fn replay_dataset(dir: &Path) -> ReplayDataset {
+        ReplayDataset {
             market_day: MarketDay::resolve_es(
                 "ESH6",
                 NaiveDate::from_ymd_opt(2026, 3, 12).unwrap(),
@@ -137,14 +137,14 @@ mod tests {
         }
     }
 
-    async fn write_artifacts(session: &ReplaySession, store: &EventStore) {
-        tokio::fs::write(&session.events_path, encode_events(&store.events))
+    async fn write_artifacts(dataset: &ReplayDataset, store: &EventStore) {
+        tokio::fs::write(&dataset.events_path, encode_events(&store.events))
             .await
             .unwrap();
-        tokio::fs::write(&session.batches_path, encode_batches(&store.batches))
+        tokio::fs::write(&dataset.batches_path, encode_batches(&store.batches))
             .await
             .unwrap();
-        tokio::fs::write(&session.trades_path, encode_trades(&store.trades))
+        tokio::fs::write(&dataset.trades_path, encode_trades(&store.trades))
             .await
             .unwrap();
     }
@@ -158,68 +158,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_session_hydrates_event_store() {
+    async fn replay_dataset_hydrates_event_store() {
         let dir = tempdir().unwrap();
-        let session = replay_session(dir.path());
+        let dataset = replay_dataset(dir.path());
         let expected = event_store(vec![
             add(100, 1, BookSide::Bid, 100, 2, 1),
             add(101, 2, BookSide::Ask, 101, 3, 2),
         ]);
-        write_artifacts(&session, &expected).await;
+        write_artifacts(&dataset, &expected).await;
 
-        let actual = session.event_store().await.unwrap();
+        let actual = dataset.event_store().await.unwrap();
 
         assert_eq!(actual, expected);
     }
 
     #[tokio::test]
-    async fn replay_session_reports_corrupt_artifact_path() {
+    async fn replay_dataset_reports_corrupt_artifact_path() {
         let dir = tempdir().unwrap();
-        let session = replay_session(dir.path());
+        let dataset = replay_dataset(dir.path());
         let empty = EventStore::default();
-        tokio::fs::write(&session.events_path, b"bad")
+        tokio::fs::write(&dataset.events_path, b"bad")
             .await
             .unwrap();
-        tokio::fs::write(&session.batches_path, encode_batches(&empty.batches))
+        tokio::fs::write(&dataset.batches_path, encode_batches(&empty.batches))
             .await
             .unwrap();
-        tokio::fs::write(&session.trades_path, encode_trades(&empty.trades))
+        tokio::fs::write(&dataset.trades_path, encode_trades(&empty.trades))
             .await
             .unwrap();
 
-        let err = session.event_store().await.unwrap_err();
+        let err = dataset.event_store().await.unwrap_err();
         let report = format!("{err:#}");
 
         assert!(report.contains("decoding events artifact"));
-        assert!(report.contains(&session.events_path.display().to_string()));
+        assert!(report.contains(&dataset.events_path.display().to_string()));
     }
 
     #[tokio::test]
-    async fn replay_session_rejects_inconsistent_indexes() {
+    async fn replay_dataset_rejects_inconsistent_indexes() {
         let dir = tempdir().unwrap();
-        let session = replay_session(dir.path());
+        let dataset = replay_dataset(dir.path());
         let mut store = event_store(vec![add(100, 1, BookSide::Bid, 100, 2, 1)]);
         store.batches[0].end_idx = 0;
-        write_artifacts(&session, &store).await;
+        write_artifacts(&dataset, &store).await;
 
-        let err = session.event_store().await.unwrap_err();
+        let err = dataset.event_store().await.unwrap_err();
         let report = format!("{err:#}");
 
-        assert!(report.contains("validating replay session"));
+        assert!(report.contains("validating replay dataset"));
         assert!(report.contains("batch index mismatch"));
     }
 
     #[tokio::test]
     async fn hydrated_event_store_drives_replay_simulator() {
         let dir = tempdir().unwrap();
-        let session = replay_session(dir.path());
+        let dataset = replay_dataset(dir.path());
         let store = event_store(vec![
             add(100, 1, BookSide::Bid, 100, 2, 1),
             add(101, 2, BookSide::Ask, 101, 3, 2),
         ]);
-        write_artifacts(&session, &store).await;
+        write_artifacts(&dataset, &store).await;
 
-        let hydrated = session.event_store().await.unwrap();
+        let hydrated = dataset.event_store().await.unwrap();
         let mut sim =
             ReplaySimulator::new(hydrated, Default::default(), VisibilityProfile::truth());
         let report = sim.run_until(101).unwrap();
