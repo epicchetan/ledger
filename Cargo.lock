@@ -1976,9 +1976,12 @@ dependencies = [
  "clap",
  "dotenvy",
  "ledger",
+ "ledger-book",
  "ledger-domain",
  "ledger-ingest",
+ "ledger-replay",
  "ledger-store",
+ "serde",
  "serde_json",
  "tokio",
 ]

@@ -27,7 +27,7 @@ ledger-cli ingest
 
 `ledger` owns replay readiness and replay session loading. It asks `ledger-store` for ready replay artifact paths, returns `ReplaySession`, and can hydrate those artifacts into `ledger-domain::EventStore`.
 
-`ledger-cli` is a thin command adapter. It parses terminal arguments, loads `.env`, constructs store/ingest/Ledger services, and prints JSON.
+`ledger-cli` is a thin command adapter. It parses terminal arguments, loads `.env`, constructs store/ingest/Ledger services, prints progress to stderr, and prints JSON results to stdout. Its `session validate` command is a local validation adapter for decoded replay artifacts and replay simulator probes; it is not the future API/server surface.
 
 ## Ingest Output
 

@@ -7,7 +7,10 @@ Global options:
 ```bash
 --data-dir <path>      # default: data, env: LEDGER_DATA_DIR
 --r2-prefix <prefix>   # default: ledger/v1, env: LEDGER_R2_PREFIX
+--quiet                # suppress progress logs on stderr
 ```
+
+Commands print progress to stderr and keep structured results on stdout as JSON.
 
 ## `resolve`
 
@@ -99,6 +102,36 @@ batches.v1.bin
 trades.v1.bin
 book_check.v1.json
 ```
+
+## `session validate`
+
+Validate a locally loaded replay session before wiring it into API or UI work.
+
+```bash
+cargo run -p ledger-cli -- session validate --symbol ESH6 --date 2026-03-12
+```
+
+This command:
+
+```text
+loads or hydrates replay session artifacts
+decodes events, batches, and trades into an EventStore
+validates rebuilt batch/trade indexes against decoded indexes
+compares the deterministic book-check report with book_check.v1.json
+steps the replay simulator through a small probe
+```
+
+By default, the replay probe steps one batch. Useful variants:
+
+```bash
+cargo run -p ledger-cli -- session validate --symbol ESH6 --date 2026-03-12 --replay-batches 1000
+cargo run -p ledger-cli -- session validate --symbol ESH6 --date 2026-03-12 --replay-all
+cargo run -p ledger-cli -- session validate --symbol ESH6 --date 2026-03-12 --skip-book-check
+```
+
+`session validate` is a local validation tool. It is not the API/server surface;
+it exists to prove replay artifacts decode, index validation holds, book-check
+still matches, and replay simulation can consume the hydrated `EventStore`.
 
 ## `cache prune`
 

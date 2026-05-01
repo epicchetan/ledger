@@ -54,6 +54,13 @@ be removed and later hydrated again from R2 by running:
 cargo run -p ledger-cli -- session load --symbol ESH6 --date 2026-03-12
 ```
 
+To decode the local artifacts, validate their indexes, compare `book_check`, and
+run a small replay probe:
+
+```bash
+cargo run -p ledger-cli -- session validate --symbol ESH6 --date 2026-03-12
+```
+
 Raw DBN files do not belong in `sessions/`.
 
 ## `tmp/`

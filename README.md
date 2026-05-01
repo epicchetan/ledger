@@ -42,6 +42,12 @@ Load replay artifacts into the local session cache:
 cargo run -p ledger-cli -- session load --symbol ESH6 --date 2026-03-12
 ```
 
+Validate decoded replay artifacts and run a replay probe:
+
+```bash
+cargo run -p ledger-cli -- session validate --symbol ESH6 --date 2026-03-12
+```
+
 List cataloged sessions:
 
 ```bash
@@ -113,6 +119,7 @@ cargo run -p ledger-cli -- ingest --symbol ESH6 --date 2026-03-12
 cargo run -p ledger-cli -- status --symbol ESH6 --date 2026-03-12
 cargo run -p ledger-cli -- list --root ES --ready
 cargo run -p ledger-cli -- session load --symbol ESH6 --date 2026-03-12
+cargo run -p ledger-cli -- session validate --symbol ESH6 --date 2026-03-12
 cargo run -p ledger-cli -- cache prune --max-sessions 5
 ```
 

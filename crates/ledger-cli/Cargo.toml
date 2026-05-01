@@ -14,7 +14,10 @@ chrono.workspace = true
 dotenvy.workspace = true
 ledger-domain = { path = "../ledger-domain" }
 ledger-ingest = { path = "../ledger-ingest" }
+ledger-book = { path = "../ledger-book" }
+ledger-replay = { path = "../ledger-replay" }
 ledger = { path = "../ledger" }
 ledger-store = { path = "../ledger-store" }
 tokio.workspace = true
 serde_json.workspace = true
+serde.workspace = true

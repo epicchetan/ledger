@@ -105,6 +105,11 @@ load replay session
 
 Callers should not request individual artifact hydration. Loading the replay session is the abstraction, and `ReplaySession` can decode those local artifacts into an `EventStore`.
 
+`ledger-cli session validate` composes this loading boundary with local
+artifact decode/index validation, deterministic book-check comparison, and a
+bounded replay simulator probe. It is a validation tool for replay artifacts,
+not the future API/server surface.
+
 ## Cache Pruning
 
 The session cache is pruned by least-recently-used market session. The default limit is:

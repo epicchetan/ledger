@@ -8,6 +8,7 @@
 - `.env` loading with `dotenvy`.
 - Construction of `ledger-store`, `ledger-ingest`, and `ledger`.
 - JSON output for command results.
+- Progress output on stderr.
 
 ## Does Not Own
 
@@ -27,6 +28,7 @@ ingest
 status
 list
 session load
+session validate
 cache prune
 ```
 
@@ -34,7 +36,11 @@ cache prune
 
 ## Boundary
 
-Keep this crate thin. If a command needs meaningful behavior beyond parsing arguments and printing a result, that behavior belongs in one of the library crates.
+Keep this crate thin. If a command needs meaningful behavior beyond parsing
+arguments and printing a result, that behavior belongs in one of the library
+crates. `session validate` is intentionally a local validation adapter that
+composes replay session hydration, book-check comparison, and a small replay
+simulator probe before API/server work begins.
 
 ## Tests
 
