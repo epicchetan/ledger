@@ -8,9 +8,9 @@ anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 dbn.workspace = true
-ledger-book = { path = "../ledger-book" }
-ledger-domain = { path = "../ledger-domain" }
-ledger-store = { path = "../ledger-store" }
+ledger-book = { path = "../book" }
+ledger-domain = { path = "../domain" }
+ledger-store = { path = "../store" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

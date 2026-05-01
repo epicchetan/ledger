@@ -57,13 +57,14 @@ cargo run -p ledger-cli -- list --root ES --ready
 ## Crates
 
 ```text
-ledger-domain   shared market-day, event, artifact, and replay types
-ledger-store    SQLite catalog, R2 object store, session cache, object keys
-ledger-ingest   Databento provider, DBN preprocessing, durable ingest pipeline
-ledger-book     pure L3 order book
-ledger-replay   replay clock, visibility delay, latency, queue-ahead, and fills
-ledger          application-facing Ledger and replay session loading boundary
-ledger-cli      thin terminal adapter
+crates/domain   package ledger-domain: shared market-day, event, artifact, and replay types
+crates/store    package ledger-store: SQLite catalog, R2 object store, session cache, object keys
+crates/ingest   package ledger-ingest: Databento provider, DBN preprocessing, durable ingest pipeline
+crates/book     package ledger-book: pure L3 order book
+crates/replay   package ledger-replay: replay clock, visibility delay, latency, queue-ahead, and fills
+crates/ledger   package ledger: application-facing Ledger and replay session loading boundary
+crates/cli      package ledger-cli: thin terminal adapter
+lens/           Vite frontend for Ledger Lens
 ```
 
 ## Storage Model

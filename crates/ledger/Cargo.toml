@@ -6,12 +6,12 @@ edition.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
-ledger-domain = { path = "../ledger-domain" }
-ledger-store = { path = "../ledger-store" }
+ledger-domain = { path = "../domain" }
+ledger-store = { path = "../store" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-ledger-replay = { path = "../ledger-replay" }
+ledger-replay = { path = "../replay" }
 tempfile.workspace = true

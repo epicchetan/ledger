@@ -12,12 +12,12 @@ anyhow.workspace = true
 clap.workspace = true
 chrono.workspace = true
 dotenvy.workspace = true
-ledger-domain = { path = "../ledger-domain" }
-ledger-ingest = { path = "../ledger-ingest" }
-ledger-book = { path = "../ledger-book" }
-ledger-replay = { path = "../ledger-replay" }
+ledger-domain = { path = "../domain" }
+ledger-ingest = { path = "../ingest" }
+ledger-book = { path = "../book" }
+ledger-replay = { path = "../replay" }
 ledger = { path = "../ledger" }
-ledger-store = { path = "../ledger-store" }
+ledger-store = { path = "../store" }
 tokio.workspace = true
 serde_json.workspace = true
 serde.workspace = true
