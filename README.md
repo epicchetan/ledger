@@ -109,9 +109,12 @@ The current storage source-of-truth decision is:
 SQLite = local Ledger control plane
 R2     = durable large-object data plane
 tmp    = disposable job staging
+cache  = disposable replay performance layer
 ```
 
 SQLite owns the catalog, object metadata, jobs, validation summaries, and future journal/session/study state. R2 stores raw DBN files and replay artifacts. `data/tmp` is temporary staging for ingest and validation jobs, not a product-level replay cache.
+`data/cache` is a read-through cache for active replay and can be rebuilt from
+R2.
 
 ## 4. Data Quality and Validation Philosophy
 
@@ -504,24 +507,29 @@ Completed foundation:
 6. Split SQLite control plane from R2 durable blob storage.
 7. Persist jobs, job progress, job history, and validation reports for Lens.
 8. Wire Lens Data Center to the real API with table actions and trust state.
+9. Add stronger data-quality report fields and Lens trust summaries.
+10. Introduce active ReplaySession controller over ReplayDataset and ReplaySimulator.
+11. Add headless CLI replay run flow for agentic validation.
+12. Add local read-through ReplayDataset cache for active replay startup.
 ```
 
 Next sequence:
 
 ```text
-1. Add stronger data-quality report fields.
-2. Introduce active ReplaySession controller.
-3. Add WebSocket projection protocol.
-4. Build bars, BBO, DOM, trade stream, and base projection graph.
-5. Add StudyGraph and first L3 studies.
-6. Add journaling/training memory.
-7. Add levels and 0DTE/gamma heatmap.
-8. Add model studies and live mode later.
+1. Specify the projection/study graph boundary before locking the WebSocket shape.
+2. Add base replay projections in Ledger: cursor, status, BBO, trades, DOM/depth, and bars.
+3. Add CLI projection replay runs so projections are validated headlessly before Lens depends on them.
+4. Add WebSocket transport on top of ReplaySession controls and projection subscriptions.
+5. Connect Lens replay controls and initial chart/DOM panels to the WebSocket protocol.
+6. Add StudyGraph and first L3 studies.
+7. Add journaling/training memory.
+8. Add levels and 0DTE/gamma heatmap.
+9. Add model studies and live mode later.
 ```
 
-The next major product boundary is active `ReplaySession`: opening a validated `ReplayDataset` into a mutable replay controller that owns cursor, play/pause, speed, visibility profile, execution profile, simulated orders/fills, and projection subscriptions.
+The next major product boundary is now the projection graph around active `ReplaySession`. ReplaySession proves the mutable simulation core: open a validated `ReplayDataset`, seek, step, and report deterministic state. The next step is deciding what Ledger computes and emits from that session: base projections first, then derived studies, then WebSocket frames for Lens.
 
-The purpose of this sequence is to avoid painting ourselves into a corner. The Data Center proves data ownership. ReplaySession proves active simulation. StudyGraph proves extensibility. Levels/gamma and journaling then become natural extensions instead of rewrites.
+The purpose of this sequence is to avoid painting ourselves into a corner. The Data Center proves data ownership. ReplaySession proves active simulation. The projection graph defines the contract between replay truth and UI rendering. StudyGraph then proves extensibility, and levels/gamma and journaling become natural extensions instead of rewrites.
 
 ## 14. Source-of-Truth Decision
 

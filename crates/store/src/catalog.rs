@@ -242,10 +242,23 @@ pub struct ReplayDatasetStatus {
     pub catalog_found: bool,
     pub raw: Option<RawMarketDataRecord>,
     pub replay_dataset: Option<ReplayDatasetRecord>,
+    pub cache: Option<ReplayDatasetCacheRecord>,
     pub replay_artifacts_available: bool,
     pub replay_objects_valid: bool,
     pub last_validation: Option<ValidationReportRecord>,
     pub objects: Vec<ReplayDatasetObjectStatus>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ReplayDatasetCacheRecord {
+    pub replay_dataset_id: String,
+    pub market_day_id: String,
+    pub cache_dir: PathBuf,
+    pub status: String,
+    pub artifact_count: u64,
+    pub size_bytes: u64,
+    pub created_at_ns: u64,
+    pub last_accessed_at_ns: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -450,6 +463,22 @@ impl SqliteCatalog {
                 FOREIGN KEY(replay_dataset_id) REFERENCES replay_datasets(id),
                 FOREIGN KEY(object_remote_key) REFERENCES objects(remote_key)
             );
+
+            CREATE TABLE IF NOT EXISTS replay_dataset_cache (
+                replay_dataset_id TEXT PRIMARY KEY,
+                market_day_id TEXT NOT NULL,
+                cache_dir TEXT NOT NULL,
+                status TEXT NOT NULL,
+                artifact_count INTEGER NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                created_at_ns INTEGER NOT NULL,
+                last_accessed_at_ns INTEGER NOT NULL,
+                FOREIGN KEY(replay_dataset_id) REFERENCES replay_datasets(id),
+                FOREIGN KEY(market_day_id) REFERENCES market_days(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_replay_dataset_cache_lru
+                ON replay_dataset_cache(last_accessed_at_ns ASC);
 
             CREATE TABLE IF NOT EXISTS validation_reports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -984,6 +1013,126 @@ impl SqliteCatalog {
             .map_err(Into::into)
     }
 
+    pub fn replay_dataset_cache(
+        &self,
+        replay_dataset_id: &str,
+    ) -> Result<Option<ReplayDatasetCacheRecord>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT replay_dataset_id, market_day_id, cache_dir, status, artifact_count,
+                    size_bytes, created_at_ns, last_accessed_at_ns
+             FROM replay_dataset_cache
+             WHERE replay_dataset_id = ?1",
+            params![replay_dataset_id],
+            row_to_replay_dataset_cache,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn replay_dataset_cache_for_market_day(
+        &self,
+        market_day_id: &str,
+    ) -> Result<Option<ReplayDatasetCacheRecord>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            r#"
+            SELECT c.replay_dataset_id, c.market_day_id, c.cache_dir, c.status,
+                   c.artifact_count, c.size_bytes, c.created_at_ns, c.last_accessed_at_ns
+            FROM replay_dataset_cache c
+            JOIN replay_datasets d ON d.id = c.replay_dataset_id
+            WHERE d.market_day_id = ?1
+            ORDER BY c.last_accessed_at_ns DESC LIMIT 1
+            "#,
+            params![market_day_id],
+            row_to_replay_dataset_cache,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn upsert_replay_dataset_cache(
+        &self,
+        replay_dataset_id: &str,
+        market_day_id: &str,
+        cache_dir: &Path,
+        status: &str,
+        artifact_count: usize,
+        size_bytes: u64,
+    ) -> Result<ReplayDatasetCacheRecord> {
+        let now = now_ns() as i64;
+        let cache_dir = cache_dir.to_string_lossy().to_string();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            INSERT INTO replay_dataset_cache (
+                replay_dataset_id, market_day_id, cache_dir, status, artifact_count,
+                size_bytes, created_at_ns, last_accessed_at_ns
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+            ON CONFLICT(replay_dataset_id) DO UPDATE SET
+                market_day_id=excluded.market_day_id,
+                cache_dir=excluded.cache_dir,
+                status=excluded.status,
+                artifact_count=excluded.artifact_count,
+                size_bytes=excluded.size_bytes,
+                last_accessed_at_ns=excluded.last_accessed_at_ns
+            "#,
+            params![
+                replay_dataset_id,
+                market_day_id,
+                cache_dir,
+                status,
+                artifact_count as i64,
+                size_bytes as i64,
+                now,
+            ],
+        )?;
+        drop(conn);
+        self.replay_dataset_cache(replay_dataset_id)?
+            .ok_or_else(|| anyhow!("replay dataset cache {replay_dataset_id} missing after upsert"))
+    }
+
+    pub fn touch_replay_dataset_cache(&self, replay_dataset_id: &str) -> Result<()> {
+        let now = now_ns() as i64;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE replay_dataset_cache
+             SET last_accessed_at_ns = ?1
+             WHERE replay_dataset_id = ?2",
+            params![now, replay_dataset_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn replay_dataset_caches_lru(&self) -> Result<Vec<ReplayDatasetCacheRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT replay_dataset_id, market_day_id, cache_dir, status, artifact_count,
+                    size_bytes, created_at_ns, last_accessed_at_ns
+             FROM replay_dataset_cache
+             ORDER BY last_accessed_at_ns ASC",
+        )?;
+        let rows = stmt.query_map([], row_to_replay_dataset_cache)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn remove_replay_dataset_cache(
+        &self,
+        replay_dataset_id: &str,
+    ) -> Result<Option<ReplayDatasetCacheRecord>> {
+        let existing = self.replay_dataset_cache(replay_dataset_id)?;
+        if existing.is_some() {
+            let conn = self.conn.lock().unwrap();
+            conn.execute(
+                "DELETE FROM replay_dataset_cache WHERE replay_dataset_id = ?1",
+                params![replay_dataset_id],
+            )?;
+        }
+        Ok(existing)
+    }
+
     pub fn insert_validation_report(
         &self,
         replay_dataset_id: &str,
@@ -1094,6 +1243,10 @@ impl SqliteCatalog {
             .collect();
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM replay_dataset_cache WHERE replay_dataset_id = ?1",
+            params![replay_dataset.id],
+        )?;
         tx.execute(
             "DELETE FROM validation_reports WHERE replay_dataset_id = ?1",
             params![replay_dataset.id],
@@ -1539,6 +1692,22 @@ fn row_to_replay_dataset(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReplayData
         artifact_set_hash: row.get(7)?,
         created_at_ns: row.get::<_, i64>(8)? as u64,
         updated_at_ns: row.get::<_, i64>(9)? as u64,
+    })
+}
+
+fn row_to_replay_dataset_cache(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ReplayDatasetCacheRecord> {
+    let cache_dir: String = row.get(2)?;
+    Ok(ReplayDatasetCacheRecord {
+        replay_dataset_id: row.get(0)?,
+        market_day_id: row.get(1)?,
+        cache_dir: PathBuf::from(cache_dir),
+        status: row.get(3)?,
+        artifact_count: row.get::<_, i64>(4)? as u64,
+        size_bytes: row.get::<_, i64>(5)? as u64,
+        created_at_ns: row.get::<_, i64>(6)? as u64,
+        last_accessed_at_ns: row.get::<_, i64>(7)? as u64,
     })
 }
 

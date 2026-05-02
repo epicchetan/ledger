@@ -1,16 +1,17 @@
 use crate::dto::{
     DataCenterMarketDay, DataCenterObjectSummary, DataCenterRawDataLayer, DataCenterRawDataStatus,
-    DataCenterReplayArtifact, DataCenterReplayDatasetLayer, DataCenterReplayDatasetStatus,
-    DataCenterTrustStatus, DataCenterValidationCheck, DataCenterValidationCheckStatus,
-    DataCenterValidationIssue, DataCenterValidationIssueSeverity, DataCenterValidationMode,
-    DataCenterValidationStatus, DataCenterValidationSummary, DataCenterValidationTrigger,
+    DataCenterReplayArtifact, DataCenterReplayCacheSummary, DataCenterReplayDatasetLayer,
+    DataCenterReplayDatasetStatus, DataCenterTrustStatus, DataCenterValidationCheck,
+    DataCenterValidationCheckStatus, DataCenterValidationIssue, DataCenterValidationIssueSeverity,
+    DataCenterValidationMode, DataCenterValidationStatus, DataCenterValidationSummary,
+    DataCenterValidationTrigger,
 };
 use crate::time::{ns_iso, ns_string};
 use ledger_domain::MarketDay;
 use ledger_store::{
-    MarketDayRecord, RawMarketDataRecord, RawMarketDataStatus, ReplayDatasetObjectStatus,
-    ReplayDatasetRecord, ReplayDatasetRecordStatus, ReplayDatasetStatus, StoredObject,
-    ValidationMode, ValidationReportRecord, ValidationReportStatus,
+    MarketDayRecord, RawMarketDataRecord, RawMarketDataStatus, ReplayDatasetCacheRecord,
+    ReplayDatasetObjectStatus, ReplayDatasetRecord, ReplayDatasetRecordStatus, ReplayDatasetStatus,
+    StoredObject, ValidationMode, ValidationReportRecord, ValidationReportStatus,
 };
 use serde_json::Value;
 
@@ -20,6 +21,7 @@ pub(crate) fn data_center_market_day(record: MarketDayRecord) -> DataCenterMarke
         true,
         record.raw,
         record.replay_dataset,
+        None,
         false,
         false,
         Vec::new(),
@@ -33,6 +35,7 @@ pub(crate) fn data_center_market_day_status(status: ReplayDatasetStatus) -> Data
         status.catalog_found,
         status.raw,
         status.replay_dataset,
+        status.cache,
         status.replay_artifacts_available,
         status.replay_objects_valid,
         status.objects,
@@ -45,6 +48,7 @@ fn data_center_market_day_from_parts(
     catalog_found: bool,
     raw: Option<RawMarketDataRecord>,
     replay_dataset: Option<ReplayDatasetRecord>,
+    cache: Option<ReplayDatasetCacheRecord>,
     artifacts_available: bool,
     objects_valid: bool,
     artifacts: Vec<ReplayDatasetObjectStatus>,
@@ -71,6 +75,7 @@ fn data_center_market_day_from_parts(
             replay_dataset,
             artifacts_available,
             objects_valid,
+            cache,
             artifacts,
             validation,
         ),
@@ -112,6 +117,7 @@ fn data_center_replay_dataset(
     replay_dataset: Option<ReplayDatasetRecord>,
     artifacts_available: bool,
     objects_valid: bool,
+    cache: Option<ReplayDatasetCacheRecord>,
     artifacts: Vec<ReplayDatasetObjectStatus>,
     validation: Option<ValidationReportRecord>,
 ) -> DataCenterReplayDatasetLayer {
@@ -134,6 +140,7 @@ fn data_center_replay_dataset(
             updated_at_iso: None,
             artifacts_available: false,
             objects_valid: false,
+            cache: None,
             artifacts,
             validation,
         };
@@ -157,8 +164,28 @@ fn data_center_replay_dataset(
         updated_at_iso: Some(ns_iso(updated_at_ns)),
         artifacts_available,
         objects_valid,
+        cache: Some(data_center_replay_cache(cache)),
         artifacts,
         validation,
+    }
+}
+
+fn data_center_replay_cache(
+    cache: Option<ReplayDatasetCacheRecord>,
+) -> DataCenterReplayCacheSummary {
+    let cached = cache
+        .as_ref()
+        .is_some_and(|cache| cache.status == "available" && cache.artifact_count >= 4);
+    DataCenterReplayCacheSummary {
+        cached,
+        artifact_count: cache.as_ref().map_or(0, |cache| cache.artifact_count),
+        size_bytes: cache.as_ref().map_or(0, |cache| cache.size_bytes),
+        last_accessed_at_ns: cache
+            .as_ref()
+            .map(|cache| ns_string(cache.last_accessed_at_ns)),
+        last_accessed_iso: cache
+            .as_ref()
+            .map(|cache| ns_iso(cache.last_accessed_at_ns)),
     }
 }
 

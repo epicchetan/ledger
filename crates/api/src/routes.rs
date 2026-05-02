@@ -1,6 +1,7 @@
 use crate::dto::{
-    CreateJobResponse, DataCenterMarketDay, DeleteRawMarketDataBody, HealthResponse, JobResponse,
-    JobsQuery, MarketDayListQuery, MarketDayStatusQuery, ValidateReplayDatasetBody,
+    CreateJobResponse, DataCenterMarketDay, DeleteRawMarketDataBody,
+    DeleteReplayDatasetCacheResponse, HealthResponse, JobResponse, JobsQuery, MarketDayListQuery,
+    MarketDayStatusQuery, ValidateReplayDatasetBody,
 };
 use crate::error::ApiError;
 use crate::jobs::{
@@ -239,6 +240,42 @@ pub(crate) async fn delete_replay_dataset(
 
     log_done(&label, started_at);
     Ok(Json(CreateJobResponse { job }))
+}
+
+pub(crate) async fn delete_replay_dataset_cache(
+    State(state): State<ApiState>,
+    Path((symbol, date)): Path<(String, String)>,
+) -> Result<Json<DeleteReplayDatasetCacheResponse>, ApiError> {
+    let date = parse_date(&date)?;
+    let label = format!("DELETE /market-days/{symbol}/{date}/replay/cache");
+    let started_at = log_start(&label);
+    let target = market_day_job_target(&state.ledger, &symbol, date)?;
+    if let Some(active) = state
+        .ledger
+        .store
+        .catalog
+        .active_job_for_market_day(&target.market_day_id)
+        .map_err(ApiError::internal)?
+    {
+        return Err(ApiError::conflict(format!(
+            "market day {} already has active job {} ({})",
+            target.market_day_id, active.id, active.kind
+        )));
+    }
+
+    let report = state
+        .ledger
+        .delete_replay_dataset_cache(&symbol, date)
+        .await
+        .map_err(ApiError::internal)?;
+    log_done(&label, started_at);
+    Ok(Json(DeleteReplayDatasetCacheResponse {
+        replay_dataset_id: report.replay_dataset_id,
+        market_day_id: report.market_day_id,
+        deleted_files: report.deleted_files,
+        deleted_dirs: report.deleted_dirs,
+        bytes_deleted: report.bytes_deleted,
+    }))
 }
 
 pub(crate) async fn delete_raw_market_data(

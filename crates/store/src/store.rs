@@ -8,8 +8,9 @@ use std::sync::Arc;
 use crate::{
     is_replay_artifact, required_replay_kinds, sha256_file, CleanupTmpReport, LoadedReplayDataset,
     LocalStore, MarketDayFilter, MarketDayRecord, ObjectKeyBuilder, ObjectMetadata, ObjectStore,
-    R2Config, R2ObjectStore, ReplayDatasetObjectStatus, ReplayDatasetRecordStatus,
-    ReplayDatasetStatus, SqliteCatalog, StoredObject, ValidationMode, ValidationReportStatus,
+    R2Config, R2ObjectStore, ReplayDatasetCacheRecord, ReplayDatasetObjectStatus,
+    ReplayDatasetRecordStatus, ReplayDatasetStatus, SqliteCatalog, StoredObject, ValidationMode,
+    ValidationReportStatus,
 };
 
 #[derive(Clone)]
@@ -18,6 +19,7 @@ pub struct LedgerStore<S: ObjectStore + 'static> {
     pub remote: Arc<S>,
     pub keys: ObjectKeyBuilder,
     pub catalog: SqliteCatalog,
+    pub replay_cache: ReplayCacheConfig,
 }
 
 pub type R2LedgerStore = LedgerStore<R2ObjectStore>;
@@ -64,28 +66,83 @@ pub struct DeleteRawMarketDataReport {
     pub bytes_deleted: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplayCacheConfig {
+    pub max_datasets: usize,
+}
+
+impl Default for ReplayCacheConfig {
+    fn default() -> Self {
+        Self { max_datasets: 10 }
+    }
+}
+
+impl ReplayCacheConfig {
+    pub fn from_env() -> Result<Self> {
+        let max_datasets = match std::env::var("LEDGER_REPLAY_CACHE_MAX_DATASETS") {
+            Ok(value) => value
+                .parse::<usize>()
+                .with_context(|| format!("parsing LEDGER_REPLAY_CACHE_MAX_DATASETS={value}"))?,
+            Err(std::env::VarError::NotPresent) => Self::default().max_datasets,
+            Err(err) => return Err(err).context("reading LEDGER_REPLAY_CACHE_MAX_DATASETS"),
+        };
+        Ok(Self { max_datasets })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct ReplayDatasetCacheStatus {
+    pub replay_dataset_id: Option<String>,
+    pub market_day_id: String,
+    pub cached: bool,
+    pub artifact_count: usize,
+    pub size_bytes: u64,
+    pub cache_dir: Option<PathBuf>,
+    pub last_accessed_at_ns: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct DeleteReplayDatasetCacheReport {
+    pub replay_dataset_id: Option<String>,
+    pub market_day_id: String,
+    pub deleted_files: usize,
+    pub deleted_dirs: usize,
+    pub bytes_deleted: u64,
+}
+
 impl R2LedgerStore {
     pub async fn from_env(
         data_dir: impl Into<PathBuf>,
         r2_prefix: impl Into<String>,
     ) -> Result<Self> {
         let remote = Arc::new(R2ObjectStore::new(R2Config::from_env()?).await?);
-        LedgerStore::open(
+        LedgerStore::open_with_cache_config(
             LocalStore::new(data_dir),
             remote,
             ObjectKeyBuilder::new(r2_prefix),
+            ReplayCacheConfig::from_env()?,
         )
     }
 }
 
 impl<S: ObjectStore + 'static> LedgerStore<S> {
     pub fn open(local: LocalStore, remote: Arc<S>, keys: ObjectKeyBuilder) -> Result<Self> {
+        Self::open_with_cache_config(local, remote, keys, ReplayCacheConfig::default())
+    }
+
+    pub fn open_with_cache_config(
+        local: LocalStore,
+        remote: Arc<S>,
+        keys: ObjectKeyBuilder,
+        replay_cache: ReplayCacheConfig,
+    ) -> Result<Self> {
         let catalog = SqliteCatalog::open(local.catalog_path())?;
         Ok(Self {
             local,
             remote,
             keys,
             catalog,
+            replay_cache,
         })
     }
 
@@ -162,6 +219,7 @@ impl<S: ObjectStore + 'static> LedgerStore<S> {
                 catalog_found: false,
                 raw: None,
                 replay_dataset: None,
+                cache: None,
                 replay_artifacts_available: false,
                 replay_objects_valid: false,
                 last_validation: None,
@@ -178,6 +236,7 @@ impl<S: ObjectStore + 'static> LedgerStore<S> {
                 catalog_found: true,
                 raw,
                 replay_dataset: None,
+                cache: None,
                 replay_artifacts_available: false,
                 replay_objects_valid: false,
                 last_validation: validation,
@@ -226,6 +285,13 @@ impl<S: ObjectStore + 'static> LedgerStore<S> {
             market_day: record.market_day,
             catalog_found: true,
             raw,
+            cache: if self.replay_cache.max_datasets == 0 {
+                None
+            } else {
+                self.catalog
+                    .replay_dataset_cache(&replay_dataset.id)?
+                    .filter(cache_record_available)
+            },
             replay_dataset: Some(replay_dataset),
             replay_artifacts_available,
             replay_objects_valid,
@@ -301,6 +367,180 @@ impl<S: ObjectStore + 'static> LedgerStore<S> {
         })
     }
 
+    pub async fn load_replay_dataset_cached(
+        &self,
+        symbol: &str,
+        date: NaiveDate,
+    ) -> Result<LoadedReplayDataset> {
+        if self.replay_cache.max_datasets == 0 {
+            return self.load_replay_dataset(symbol, date).await;
+        }
+
+        let md = self.catalog_market_day(symbol, date).await?;
+        let replay_dataset = self
+            .catalog
+            .replay_dataset(&md.id)?
+            .ok_or_else(|| anyhow!("market day {} has no replay dataset", md.id))?;
+        if replay_dataset.status != ReplayDatasetRecordStatus::Available {
+            return Err(anyhow!(
+                "replay dataset {} is not available",
+                replay_dataset.id
+            ));
+        }
+
+        let artifacts = self.catalog.replay_dataset_artifacts(&replay_dataset.id)?;
+        let events = self
+            .require_replay_object(&artifacts, &replay_dataset.id, StorageKind::EventStore)
+            .await?;
+        let batches = self
+            .require_replay_object(&artifacts, &replay_dataset.id, StorageKind::BatchIndex)
+            .await?;
+        let trades = self
+            .require_replay_object(&artifacts, &replay_dataset.id, StorageKind::TradeIndex)
+            .await?;
+        let book_check = self
+            .require_replay_object(&artifacts, &replay_dataset.id, StorageKind::BookCheck)
+            .await?;
+        let objects = vec![events, batches, trades, book_check];
+
+        let mut paths = Vec::with_capacity(objects.len());
+        for object in &objects {
+            let path = self.local.replay_cache_artifact_path(
+                &md,
+                &replay_dataset.id,
+                object.kind.clone(),
+            )?;
+            if !self.path_valid_for_object(&path, object)? {
+                self.hydrate_object_to_path(object, &path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "caching replay artifact {} for {}",
+                            object.kind.as_str(),
+                            replay_dataset.id
+                        )
+                    })?;
+            }
+            paths.push((object.kind.clone(), path));
+        }
+
+        let cache_dir = self.local.replay_cache_dataset_dir(&md, &replay_dataset.id);
+        let size_bytes = objects
+            .iter()
+            .map(|object| object.size_bytes.max(0) as u64)
+            .sum::<u64>();
+        self.catalog.upsert_replay_dataset_cache(
+            &replay_dataset.id,
+            &md.id,
+            &cache_dir,
+            "available",
+            objects.len(),
+            size_bytes,
+        )?;
+        self.catalog.touch_market_day(&md.id).ok();
+        self.enforce_replay_cache_limit(Some(&replay_dataset.id))?;
+
+        Ok(LoadedReplayDataset {
+            replay_dataset_id: replay_dataset.id,
+            market_day: md,
+            events_path: cached_path(&paths, StorageKind::EventStore)?,
+            batches_path: cached_path(&paths, StorageKind::BatchIndex)?,
+            trades_path: cached_path(&paths, StorageKind::TradeIndex)?,
+            book_check_path: cached_path(&paths, StorageKind::BookCheck)?,
+            objects,
+        })
+    }
+
+    pub async fn replay_cache_status(
+        &self,
+        symbol: &str,
+        date: NaiveDate,
+    ) -> Result<ReplayDatasetCacheStatus> {
+        let md = self.catalog_market_day(symbol, date).await?;
+        let Some(replay_dataset) = self.catalog.replay_dataset(&md.id)? else {
+            return Ok(ReplayDatasetCacheStatus {
+                market_day_id: md.id,
+                ..Default::default()
+            });
+        };
+        if self.replay_cache.max_datasets == 0 {
+            return Ok(ReplayDatasetCacheStatus {
+                replay_dataset_id: Some(replay_dataset.id),
+                market_day_id: md.id,
+                ..Default::default()
+            });
+        }
+        let cache = self.catalog.replay_dataset_cache(&replay_dataset.id)?;
+        Ok(replay_cache_status(&md.id, Some(&replay_dataset.id), cache))
+    }
+
+    pub async fn delete_replay_dataset_cache(
+        &self,
+        symbol: &str,
+        date: NaiveDate,
+    ) -> Result<DeleteReplayDatasetCacheReport> {
+        let md = self.catalog_market_day(symbol, date).await?;
+        let Some(replay_dataset) = self.catalog.replay_dataset(&md.id)? else {
+            return Ok(DeleteReplayDatasetCacheReport {
+                market_day_id: md.id,
+                ..Default::default()
+            });
+        };
+        self.delete_replay_dataset_cache_by_id(&md.id, &replay_dataset.id)
+    }
+
+    fn delete_replay_dataset_cache_by_id(
+        &self,
+        market_day_id: &str,
+        replay_dataset_id: &str,
+    ) -> Result<DeleteReplayDatasetCacheReport> {
+        let cache = self
+            .catalog
+            .remove_replay_dataset_cache(replay_dataset_id)?;
+        let Some(cache) = cache else {
+            return Ok(DeleteReplayDatasetCacheReport {
+                replay_dataset_id: Some(replay_dataset_id.to_string()),
+                market_day_id: market_day_id.to_string(),
+                ..Default::default()
+            });
+        };
+        let local_report = self.local.remove_replay_cache_dir(cache.cache_dir)?;
+        Ok(DeleteReplayDatasetCacheReport {
+            replay_dataset_id: Some(replay_dataset_id.to_string()),
+            market_day_id: market_day_id.to_string(),
+            deleted_files: local_report.deleted_files,
+            deleted_dirs: local_report.deleted_dirs,
+            bytes_deleted: local_report.bytes_deleted,
+        })
+    }
+
+    fn enforce_replay_cache_limit(&self, protected_dataset_id: Option<&str>) -> Result<()> {
+        let max_datasets = self.replay_cache.max_datasets;
+        if max_datasets == 0 {
+            for cache in self.catalog.replay_dataset_caches_lru()? {
+                self.delete_replay_dataset_cache_by_id(
+                    &cache.market_day_id,
+                    &cache.replay_dataset_id,
+                )?;
+            }
+            return Ok(());
+        }
+
+        let caches = self.catalog.replay_dataset_caches_lru()?;
+        let mut extra = caches.len().saturating_sub(max_datasets);
+        for cache in caches {
+            if extra == 0 {
+                break;
+            }
+            if protected_dataset_id.is_some_and(|id| id == cache.replay_dataset_id) {
+                continue;
+            }
+            self.delete_replay_dataset_cache_by_id(&cache.market_day_id, &cache.replay_dataset_id)?;
+            extra -= 1;
+        }
+        Ok(())
+    }
+
     pub async fn begin_ingest(&self, md: &MarketDay) -> Result<IngestStaging> {
         let run_id = self.catalog.create_ingest_run(md)?;
         let run_label = format!("{}-{run_id}", self.local.new_ingest_run_label());
@@ -361,6 +601,7 @@ impl<S: ObjectStore + 'static> LedgerStore<S> {
             ..Default::default()
         };
         let mut objects_to_delete = self.catalog.replay_dataset_artifacts(&replay_dataset.id)?;
+        self.delete_replay_dataset_cache_by_id(&md.id, &replay_dataset.id)?;
         if include_raw {
             if let Some(raw) = self.catalog.raw_market_data(&md.id)? {
                 objects_to_delete.push(raw.object);
@@ -665,6 +906,39 @@ impl<S: ObjectStore + 'static> LedgerStore<S> {
     }
 }
 
+fn cached_path(paths: &[(StorageKind, PathBuf)], kind: StorageKind) -> Result<PathBuf> {
+    paths
+        .iter()
+        .find(|(path_kind, _)| path_kind == &kind)
+        .map(|(_, path)| path.clone())
+        .ok_or_else(|| anyhow!("cached replay artifact path missing {}", kind.as_str()))
+}
+
+fn cache_record_available(cache: &ReplayDatasetCacheRecord) -> bool {
+    cache.status == "available"
+        && cache.artifact_count >= required_replay_kinds().len() as u64
+        && cache.cache_dir.exists()
+}
+
+fn replay_cache_status(
+    market_day_id: &str,
+    replay_dataset_id: Option<&str>,
+    cache: Option<ReplayDatasetCacheRecord>,
+) -> ReplayDatasetCacheStatus {
+    let cached = cache.as_ref().is_some_and(cache_record_available);
+    ReplayDatasetCacheStatus {
+        replay_dataset_id: replay_dataset_id.map(str::to_string),
+        market_day_id: market_day_id.to_string(),
+        cached,
+        artifact_count: cache
+            .as_ref()
+            .map_or(0, |cache| cache.artifact_count as usize),
+        size_bytes: cache.as_ref().map_or(0, |cache| cache.size_bytes),
+        cache_dir: cache.as_ref().map(|cache| cache.cache_dir.clone()),
+        last_accessed_at_ns: cache.as_ref().map(|cache| cache.last_accessed_at_ns),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,6 +1012,24 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    async fn register_test_replay_dataset(
+        store: &LedgerStore<MemoryObjectStore>,
+        md: &MarketDay,
+        events_bytes: &[u8],
+    ) -> Vec<StoredObject> {
+        let raw = register_test_raw(store, md).await;
+        let events = register_test_artifact(store, md, StorageKind::EventStore, events_bytes).await;
+        let batches = register_test_artifact(store, md, StorageKind::BatchIndex, b"batches").await;
+        let trades = register_test_artifact(store, md, StorageKind::TradeIndex, b"trades").await;
+        let book = register_test_artifact(store, md, StorageKind::BookCheck, b"book").await;
+        let artifacts = vec![events, batches, trades, book];
+        store
+            .register_replay_dataset(md, &raw, &artifacts)
+            .await
+            .unwrap();
+        artifacts
     }
 
     #[tokio::test]
@@ -917,6 +1209,159 @@ mod tests {
         assert_eq!(
             tokio::fs::read(loaded.events_path).await.unwrap(),
             b"events"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_replay_dataset_hydrates_once_and_reuses_local_files() {
+        let (_dir, store, mut md) = sample_store().await;
+        store
+            .mark_market_day_status(&mut md, MarketDayStatus::Ready, true)
+            .await
+            .unwrap();
+        let artifacts = register_test_replay_dataset(&store, &md, b"events").await;
+
+        let loaded = store
+            .load_replay_dataset_cached("ESH6", md.market_date)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read(&loaded.events_path).await.unwrap(),
+            b"events"
+        );
+        assert!(loaded
+            .events_path
+            .starts_with(store.local.replay_cache_dir()));
+        let status = store
+            .replay_cache_status("ESH6", md.market_date)
+            .await
+            .unwrap();
+        assert!(status.cached);
+        assert_eq!(status.artifact_count, 4);
+
+        for artifact in artifacts {
+            store.remote.delete(&artifact.remote_key).await.unwrap();
+        }
+        let loaded_again = store
+            .load_replay_dataset_cached("ESH6", md.market_date)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read(&loaded_again.events_path).await.unwrap(),
+            b"events"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_replay_dataset_repairs_missing_artifact() {
+        let (_dir, store, mut md) = sample_store().await;
+        store
+            .mark_market_day_status(&mut md, MarketDayStatus::Ready, true)
+            .await
+            .unwrap();
+        register_test_replay_dataset(&store, &md, b"events").await;
+
+        let loaded = store
+            .load_replay_dataset_cached("ESH6", md.market_date)
+            .await
+            .unwrap();
+        tokio::fs::remove_file(&loaded.events_path).await.unwrap();
+
+        let repaired = store
+            .load_replay_dataset_cached("ESH6", md.market_date)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read(&repaired.events_path).await.unwrap(),
+            b"events"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_cache_lru_evicts_oldest_dataset() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = LocalStore::new(dir.path());
+        let remote = Arc::new(MemoryObjectStore::new("test"));
+        let store = LedgerStore::open_with_cache_config(
+            local,
+            remote,
+            ObjectKeyBuilder::default(),
+            ReplayCacheConfig { max_datasets: 1 },
+        )
+        .unwrap();
+        let mut first =
+            MarketDay::resolve_es("ESH6", NaiveDate::from_ymd_opt(2026, 3, 11).unwrap()).unwrap();
+        let mut second =
+            MarketDay::resolve_es("ESH6", NaiveDate::from_ymd_opt(2026, 3, 12).unwrap()).unwrap();
+        for md in [&mut first, &mut second] {
+            store
+                .mark_market_day_status(md, MarketDayStatus::Ready, true)
+                .await
+                .unwrap();
+            register_test_replay_dataset(&store, md, md.id.as_bytes()).await;
+        }
+
+        let first_loaded = store
+            .load_replay_dataset_cached("ESH6", first.market_date)
+            .await
+            .unwrap();
+        assert!(first_loaded.events_path.exists());
+        let first_dataset_id = first_loaded.replay_dataset_id.clone();
+
+        let second_loaded = store
+            .load_replay_dataset_cached("ESH6", second.market_date)
+            .await
+            .unwrap();
+        assert!(second_loaded.events_path.exists());
+        assert!(!first_loaded.events_path.exists());
+        assert!(
+            !store
+                .replay_cache_status("ESH6", first.market_date)
+                .await
+                .unwrap()
+                .cached
+        );
+        assert!(
+            store
+                .replay_cache_status("ESH6", second.market_date)
+                .await
+                .unwrap()
+                .cached
+        );
+        assert!(store
+            .catalog
+            .replay_dataset_cache(&first_dataset_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_replay_dataset_cache_removes_files_and_catalog_row() {
+        let (_dir, store, mut md) = sample_store().await;
+        store
+            .mark_market_day_status(&mut md, MarketDayStatus::Ready, true)
+            .await
+            .unwrap();
+        register_test_replay_dataset(&store, &md, b"events").await;
+
+        let loaded = store
+            .load_replay_dataset_cached("ESH6", md.market_date)
+            .await
+            .unwrap();
+        let cache_dir = loaded.events_path.parent().unwrap().to_path_buf();
+        let report = store
+            .delete_replay_dataset_cache("ESH6", md.market_date)
+            .await
+            .unwrap();
+
+        assert_eq!(report.deleted_files, 4);
+        assert!(!cache_dir.exists());
+        assert!(
+            !store
+                .replay_cache_status("ESH6", md.market_date)
+                .await
+                .unwrap()
+                .cached
         );
     }
 

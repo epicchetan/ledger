@@ -2,9 +2,11 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
-use aws_sdk_s3::config::Region;
+use aws_sdk_s3::config::{Region, SharedHttpClient};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
+#[allow(deprecated)]
+use aws_smithy_http_client::hyper_014::HyperClientBuilder;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -96,12 +98,24 @@ impl R2ObjectStore {
             "ledger-r2",
         );
         let sdk_config = aws_config::defaults(BehaviorVersion::latest())
+            .http_client(Self::webpki_http_client())
             .endpoint_url(config.endpoint())
             .region(Region::new(config.region.clone()))
             .credentials_provider(creds)
             .load()
             .await;
         Ok(Client::new(&sdk_config))
+    }
+
+    fn webpki_http_client() -> SharedHttpClient {
+        let tls_connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_only()
+            .enable_http1()
+            .enable_http2()
+            .build();
+
+        HyperClientBuilder::new().build(tls_connector)
     }
 
     fn metadata_map(metadata: &ObjectMetadata) -> HashMap<String, String> {

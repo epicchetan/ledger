@@ -12,7 +12,7 @@ export type ArtifactStatus = "missing" | "remote" | "valid" | "invalid"
 
 export type ArtifactKey = "events" | "batches" | "trades" | "bookCheck"
 
-export type DatasetAction = "prepare" | "rebuild" | "validate" | "deleteReplay" | "deleteRaw" | "history"
+export type DatasetAction = "prepare" | "rebuild" | "validate" | "deleteCache" | "deleteReplay" | "deleteRaw" | "history"
 
 export type JobStatus = "queued" | "running" | "succeeded" | "failed"
 
@@ -43,6 +43,13 @@ export interface ReplayArtifact {
   size: string | null
   sha256: string | null
   updatedAt: string | null
+}
+
+export interface ReplayCacheSummary {
+  cached: boolean
+  artifactCount: number
+  size: string | null
+  lastAccessedAt: string | null
 }
 
 export type TrustStatus =
@@ -103,6 +110,7 @@ export interface ReplayDatasetSummary {
   checks: ValidationCheck[]
   issues: ValidationIssue[]
   warnings: string[]
+  cache: ReplayCacheSummary | null
   artifacts: Record<ArtifactKey, ReplayArtifact>
 }
 

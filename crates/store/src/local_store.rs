@@ -1,3 +1,4 @@
+use crate::sanitize_path_component;
 use anyhow::{Context, Result};
 use ledger_domain::{now_ns, MarketDay, StorageKind};
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,29 @@ impl LocalStore {
             .join(replay_file_name(kind)?))
     }
 
+    pub fn replay_cache_dir(&self) -> PathBuf {
+        self.root.join("cache").join("replay")
+    }
+
+    pub fn replay_cache_dataset_dir(&self, md: &MarketDay, replay_dataset_id: &str) -> PathBuf {
+        self.replay_cache_dir()
+            .join(&md.root)
+            .join(&md.contract_symbol)
+            .join(md.market_date.to_string())
+            .join(sanitize_path_component(replay_dataset_id))
+    }
+
+    pub fn replay_cache_artifact_path(
+        &self,
+        md: &MarketDay,
+        replay_dataset_id: &str,
+        kind: StorageKind,
+    ) -> Result<PathBuf> {
+        Ok(self
+            .replay_cache_dataset_dir(md, replay_dataset_id)
+            .join(replay_file_name(kind)?))
+    }
+
     pub fn tmp_dir(&self) -> PathBuf {
         self.root.join("tmp")
     }
@@ -96,6 +120,20 @@ impl LocalStore {
             return Ok(report);
         }
         cleanup_tmp_entries(&tmp, older_than, &mut report)?;
+        Ok(report)
+    }
+
+    pub fn remove_replay_cache_dir(&self, dir: PathBuf) -> Result<RemoveLocalDirReport> {
+        let mut report = RemoveLocalDirReport {
+            root: dir.clone(),
+            ..Default::default()
+        };
+        if !dir.exists() {
+            return Ok(report);
+        }
+        collect_local_dir_entries(&dir, &mut report)?;
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("removing replay cache dir {}", dir.display()))?;
         Ok(report)
     }
 
@@ -160,6 +198,14 @@ pub struct CleanupTmpReport {
     pub bytes_deleted: u64,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RemoveLocalDirReport {
+    pub root: PathBuf,
+    pub deleted_files: usize,
+    pub deleted_dirs: usize,
+    pub bytes_deleted: u64,
+}
+
 fn cleanup_tmp_entries(
     dir: &Path,
     older_than: Option<Duration>,
@@ -187,6 +233,22 @@ fn cleanup_tmp_entries(
         }
     }
     Ok(empty)
+}
+
+fn collect_local_dir_entries(dir: &Path, report: &mut RemoveLocalDirReport) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            report.deleted_dirs += 1;
+            collect_local_dir_entries(&path, report)?;
+        } else {
+            report.deleted_files += 1;
+            report.bytes_deleted += metadata.len();
+        }
+    }
+    Ok(())
 }
 
 fn eligible(metadata: &std::fs::Metadata, older_than: Option<Duration>) -> bool {

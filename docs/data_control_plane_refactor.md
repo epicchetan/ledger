@@ -34,8 +34,9 @@ job leaves behind a current trust status.
 - Remove R2 manifests from the active product model.
 - Clean up R2 object paths while the dataset is still tiny.
 - Preserve existing DBN files without redownloading them from Databento.
-- Keep room for a future explicit replay cache when active replay performance
-  requires it.
+- Keep room for an explicit replay cache when active replay performance
+  requires it. That cache now lives outside the Data Center source-of-truth
+  model.
 
 ## Non-Goals
 
@@ -151,9 +152,9 @@ files for diagnosis, with a later explicit cleanup command.
 ### No Persistent Materialization Yet
 
 Do not expose or depend on persistent `data/materialized/...` in Data Center.
-Replay artifact files may be downloaded into `tmp` for validation. A future
-active replay cache can be added later when replay speed and repeated access
-patterns are real requirements.
+Replay artifact files may be downloaded into `tmp` for validation. Active
+ReplaySession startup uses `data/cache/replay/...` as a separate read-through
+performance cache.
 
 ## Local Layout
 
@@ -162,12 +163,14 @@ Target layout:
 ```text
 data/
   ledger.sqlite
+  cache/
+    replay/
   tmp/
     ingest/
     validate/
 ```
 
-Optional later layout:
+Future study cache layout:
 
 ```text
 data/
@@ -178,8 +181,7 @@ data/
     studies/
 ```
 
-`cache/` should not be introduced until active replay or study computation needs
-it.
+`cache/` remains disposable and is not part of durable Data Center truth.
 
 ## API Surface
 
@@ -741,15 +743,15 @@ Delete Raw Data -> blocked unless replay is gone or cascade is explicit
 
 ## Future Work
 
-Once active replay exists, add an explicit cache layer:
+Active replay now owns an explicit cache layer:
 
 ```text
 data/cache/replay/<market-day>/<replay-dataset-id>/
 ```
 
-That cache should be versioned, disposable, and owned by active replay/study
-performance needs. It should not be part of the Data Center source-of-truth
-model.
+That cache is versioned, disposable, LRU-capped, and owned by active
+replay/study performance needs. It is not part of the Data Center
+source-of-truth model.
 
 Once the database becomes valuable, add backup/export:
 

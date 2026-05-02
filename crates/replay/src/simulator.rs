@@ -91,6 +91,7 @@ impl ReplaySimulator {
         );
         self.cursor_ts_ns = span.ts_event_ns;
         self.batch_idx += 1;
+        self.visibility.emit_due(self.cursor_ts_ns);
         Ok(())
     }
 
@@ -114,6 +115,14 @@ impl ReplaySimulator {
             frames: self.visibility.emitted().to_vec(),
             final_book_checksum: self.book.checksum(),
         }
+    }
+
+    pub fn cursor_ts_ns(&self) -> u64 {
+        self.cursor_ts_ns
+    }
+
+    pub fn batch_idx(&self) -> usize {
+        self.batch_idx
     }
 
     pub fn book(&self) -> &OrderBook {

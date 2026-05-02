@@ -14,8 +14,9 @@ use ledger_ingest::{
     IngestProgressSink, IngestReport,
 };
 use ledger_store::{
-    DeleteRawMarketDataReport, DeleteReplayDatasetReport, LedgerStore, LoadedReplayDataset,
-    MarketDayFilter, MarketDayRecord, R2LedgerStore, ReplayDatasetStatus,
+    DeleteRawMarketDataReport, DeleteReplayDatasetCacheReport, DeleteReplayDatasetReport,
+    LedgerStore, LoadedReplayDataset, MarketDayFilter, MarketDayRecord, R2LedgerStore,
+    ReplayDatasetCacheStatus, ReplayDatasetStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -23,10 +24,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 mod progress;
+mod replay_session;
 mod validation;
 
 pub use ledger_store::ObjectStore;
 pub use progress::*;
+pub use replay_session::*;
 pub use validation::*;
 
 #[derive(Clone)]
@@ -171,6 +174,39 @@ impl<S: ObjectStore + 'static> Ledger<S> {
             trades_path: dataset.trades_path,
             book_check_path: dataset.book_check_path,
         })
+    }
+
+    pub async fn load_cached_replay_dataset(
+        &self,
+        symbol: &str,
+        date: NaiveDate,
+    ) -> Result<ReplayDataset> {
+        let dataset: LoadedReplayDataset =
+            self.store.load_replay_dataset_cached(symbol, date).await?;
+        Ok(ReplayDataset {
+            replay_dataset_id: dataset.replay_dataset_id,
+            market_day: dataset.market_day,
+            events_path: dataset.events_path,
+            batches_path: dataset.batches_path,
+            trades_path: dataset.trades_path,
+            book_check_path: dataset.book_check_path,
+        })
+    }
+
+    pub async fn replay_cache_status(
+        &self,
+        symbol: &str,
+        date: NaiveDate,
+    ) -> Result<ReplayDatasetCacheStatus> {
+        self.store.replay_cache_status(symbol, date).await
+    }
+
+    pub async fn delete_replay_dataset_cache(
+        &self,
+        symbol: &str,
+        date: NaiveDate,
+    ) -> Result<DeleteReplayDatasetCacheReport> {
+        self.store.delete_replay_dataset_cache(symbol, date).await
     }
 
     pub async fn delete_remote_replay_dataset(

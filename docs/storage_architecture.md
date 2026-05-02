@@ -7,11 +7,13 @@ plane:
 SQLite = local Ledger control plane
 R2     = durable large-object data plane
 tmp    = disposable job staging
+cache  = disposable replay performance layer
 ```
 
 SQLite owns catalog state, object metadata, jobs, validation summaries, and
 future journal/session/study state. R2 stores large immutable blobs. Normal code
-does not use R2 JSON manifests as a catalog.
+does not use R2 JSON manifests as a catalog. `data/cache` stores local copies of
+ReplayDataset artifacts only so active replay can avoid repeated R2 downloads.
 
 ## Layers
 
@@ -45,13 +47,17 @@ lineage relationships.
 ```text
 data/
   ledger.sqlite
+  cache/
+    replay/
   tmp/
     ingest/
     validate/
 ```
 
-`tmp/` is disposable staging. Persistent replay caches are intentionally
-deferred until active replay needs them.
+`tmp/` is disposable staging. `cache/replay` is a read-through local cache for
+immutable ReplayDataset artifacts. It is capped by
+`LEDGER_REPLAY_CACHE_MAX_DATASETS`, defaults to 10 cached datasets, and is safe
+to delete when sessions are stopped.
 
 ## Lifecycle
 
@@ -71,8 +77,16 @@ validate
   -> decode and run validation/probe
   -> write SQLite validation report
 
+open replay session
+  -> look up replay artifact keys from SQLite
+  -> reuse valid files under data/cache/replay/...
+  -> download missing/stale artifacts from R2
+  -> update SQLite cache metadata and LRU access time
+  -> hydrate EventStore and create ReplaySession
+
 delete replay
   -> delete Layer 2 objects from R2
+  -> delete matching local replay cache
   -> delete replay dataset/artifact/validation rows from SQLite
   -> preserve Layer 1 raw data
 ```

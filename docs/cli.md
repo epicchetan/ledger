@@ -114,6 +114,47 @@ the API uses. It proves replay artifacts decode, index validation holds,
 book-check still matches, and replay simulation can consume the hydrated
 `EventStore`.
 
+## `replay run`
+
+Run the active `ReplaySession` controller headlessly and print a deterministic
+JSON report.
+
+```bash
+cargo run -p ledger-cli -- replay run --symbol ESH6 --date 2026-03-12
+```
+
+Useful variants:
+
+```bash
+cargo run -p ledger-cli -- replay run --symbol ESH6 --date 2026-03-12 --batches 100
+cargo run -p ledger-cli -- replay run --symbol ESH6 --date 2026-03-12 --start-ts-ns 1773235800000000000
+cargo run -p ledger-cli -- replay run --symbol ESH6 --date 2026-03-12 --truth-visibility
+```
+
+This is the headless adapter for agentic/developer validation of replay
+feature work. It loads the `ReplayDataset` through the local replay cache,
+opens a `ReplaySession`, steps the requested number of batches, and reports
+cursor, batch index, checksum, BBO, frame count, and fill count. It does not
+persist a training session.
+
+## `replay cache-status`
+
+Inspect whether the current durable `ReplayDataset` is cached locally.
+
+```bash
+cargo run -p ledger-cli -- replay cache-status --symbol ESH6 --date 2026-03-12
+```
+
+## `replay cache-remove`
+
+Remove the local replay cache for a market day. This only deletes
+`data/cache/replay/...`; it does not delete R2 replay artifacts or SQLite
+catalog records for the durable `ReplayDataset`.
+
+```bash
+cargo run -p ledger-cli -- replay cache-remove --symbol ESH6 --date 2026-03-12
+```
+
 ## `storage cleanup-tmp`
 
 Delete disposable job staging files under `data/tmp`.

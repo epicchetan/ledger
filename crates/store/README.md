@@ -11,6 +11,7 @@ staging, and explicit delete/cleanup operations.
 - Build stable market-day-centered object keys for raw DBN files and replay artifacts.
 - Stage ingest work under `data/tmp/ingest/...`.
 - Stage validation artifacts under `data/tmp/validate/...`.
+- Cache active replay artifacts under `data/cache/replay/...`.
 - Track Layer 1 raw market data and Layer 2 replay datasets separately.
 - Report cheap durable layer state for UI/status reads.
 - Delete durable replay datasets and raw data through explicit higher-layer calls.
@@ -43,6 +44,10 @@ without redownloading Databento data.
 - `replay_dataset_status` reports raw/replay layer state from SQLite.
 - `verified_replay_dataset_status` checks R2 object metadata for replay artifacts.
 - `load_replay_dataset` stages replay artifacts under `data/tmp/validate/...`.
+- `load_replay_dataset_cached` hydrates and reuses replay artifacts under
+  `data/cache/replay/...` for active replay.
+- `delete_replay_dataset_cache` removes local cached artifacts without touching
+  R2.
 - `delete_remote_replay_dataset` removes Layer 2 replay artifacts from R2 and SQLite.
 - `delete_raw_market_data` removes Layer 1 raw data and refuses while replay exists unless cascade is requested.
 - `cleanup_tmp` removes disposable staging files left by failed or interrupted jobs.

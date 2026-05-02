@@ -6,6 +6,7 @@ import type {
   MarketDayStatus,
   RawDataSummary,
   ReplayArtifact,
+  ReplayCacheSummary,
   ReplayDatasetSummary,
   TrustStatus,
   ValidationCheck,
@@ -72,8 +73,17 @@ interface ApiReplayDatasetLayer {
   updated_at_iso: string | null
   artifacts_available: boolean
   objects_valid: boolean
+  cache: ApiReplayCacheSummary | null
   artifacts: ApiReplayArtifact[]
   validation: ApiValidationSummary | null
+}
+
+interface ApiReplayCacheSummary {
+  cached: boolean
+  artifact_count: number
+  size_bytes: number
+  last_accessed_at_ns: string | null
+  last_accessed_iso: string | null
 }
 
 interface ApiReplayArtifact {
@@ -128,6 +138,14 @@ interface ApiJobResponse {
   job: JobRecord
 }
 
+interface ApiDeleteReplayDatasetCacheResponse {
+  replay_dataset_id: string | null
+  market_day_id: string
+  deleted_files: number
+  deleted_dirs: number
+  bytes_deleted: number
+}
+
 interface RequestOptions extends RequestInit {
   emptyBody?: boolean
 }
@@ -170,6 +188,12 @@ export async function deleteReplayDataset(day: MarketDay): Promise<JobRecord> {
     method: "DELETE",
   })
   return response.job
+}
+
+export async function deleteReplayDatasetCache(day: MarketDay): Promise<ApiDeleteReplayDatasetCacheResponse> {
+  return request<ApiDeleteReplayDatasetCacheResponse>(marketDayPath(day, "replay/cache"), {
+    method: "DELETE",
+  })
 }
 
 export async function deleteRawMarketData(day: MarketDay): Promise<JobRecord> {
@@ -305,7 +329,18 @@ function datasetSummary(record: ApiDataCenterMarketDay): ReplayDatasetSummary {
     checks: validation?.checks.map(mapValidationCheck) ?? [],
     issues: validation?.issues.map(mapValidationIssue) ?? [],
     warnings: validation?.warnings ?? [],
+    cache: cacheSummary(replayDataset.cache),
     artifacts: artifactMap(replayDataset.artifacts),
+  }
+}
+
+function cacheSummary(cache: ApiReplayCacheSummary | null): ReplayCacheSummary | null {
+  if (!cache) return null
+  return {
+    cached: cache.cached,
+    artifactCount: cache.artifact_count,
+    size: formatBytes(cache.size_bytes),
+    lastAccessedAt: formatIso(cache.last_accessed_iso),
   }
 }
 

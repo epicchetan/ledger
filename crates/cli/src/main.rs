@@ -9,8 +9,8 @@ use anyhow::Result;
 use chrono::NaiveDate;
 use clap::{Args, Parser, Subcommand};
 use ledger::{
-    Ledger, LedgerProgressEvent, LedgerProgressSink, ValidateReplayDatasetRequest,
-    ValidationTrigger,
+    Ledger, LedgerProgressEvent, LedgerProgressSink, ReplayRunRequest,
+    ValidateReplayDatasetRequest, ValidationTrigger,
 };
 use ledger_store::MarketDayFilter;
 use std::path::PathBuf;
@@ -44,6 +44,7 @@ enum Command {
     List(ListArgs),
     Storage(StorageCommand),
     Session(SessionCommand),
+    Replay(ReplayCommand),
 }
 
 #[derive(Subcommand)]
@@ -71,6 +72,19 @@ struct SessionCommand {
     command: SessionSubcommand,
 }
 
+#[derive(Subcommand)]
+enum ReplaySubcommand {
+    Run(ReplayRunArgs),
+    CacheStatus(MarketDayArgs),
+    CacheRemove(MarketDayArgs),
+}
+
+#[derive(Args)]
+struct ReplayCommand {
+    #[command(subcommand)]
+    command: ReplaySubcommand,
+}
+
 #[derive(Args, Clone)]
 struct MarketDayArgs {
     #[arg(long)]
@@ -92,6 +106,21 @@ struct ValidateArgs {
 
     #[arg(long)]
     skip_book_check: bool,
+}
+
+#[derive(Args, Clone)]
+struct ReplayRunArgs {
+    #[command(flatten)]
+    market_day: MarketDayArgs,
+
+    #[arg(long, default_value_t = 1)]
+    batches: usize,
+
+    #[arg(long)]
+    start_ts_ns: Option<u64>,
+
+    #[arg(long)]
+    truth_visibility: bool,
 }
 
 #[derive(Args)]
@@ -174,6 +203,58 @@ async fn main() -> Result<()> {
                         },
                         progress.sink(),
                     )
+                    .await?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+        },
+        Command::Replay(replay) => match replay.command {
+            ReplaySubcommand::Run(args) => {
+                let date = parse_date(&args.market_day.date)?;
+                progress.step(format!(
+                    "running headless ReplaySession for {} {}",
+                    args.market_day.symbol, date
+                ));
+                let ledger = Ledger::from_env(&cli.data_dir, &cli.r2_prefix).await?;
+                let cache = ledger
+                    .replay_cache_status(&args.market_day.symbol, date)
+                    .await?;
+                if cache.cached {
+                    progress.step("replay cache hit; using local ReplayDataset artifacts");
+                } else {
+                    progress.step("replay cache miss; hydrating ReplayDataset artifacts from R2");
+                }
+                let started_at = Instant::now();
+                let report = ledger
+                    .run_replay_session(ReplayRunRequest {
+                        symbol: args.market_day.symbol,
+                        market_date: date,
+                        start_ts_ns: args.start_ts_ns,
+                        batches: args.batches,
+                        truth_visibility: args.truth_visibility,
+                    })
+                    .await?;
+                progress.done("headless ReplaySession run completed", started_at);
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            ReplaySubcommand::CacheStatus(args) => {
+                let date = parse_date(&args.date)?;
+                progress.step(format!(
+                    "checking replay cache for {} {}",
+                    args.symbol, date
+                ));
+                let ledger = Ledger::from_env(&cli.data_dir, &cli.r2_prefix).await?;
+                let status = ledger.replay_cache_status(&args.symbol, date).await?;
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            }
+            ReplaySubcommand::CacheRemove(args) => {
+                let date = parse_date(&args.date)?;
+                progress.step(format!(
+                    "removing replay cache for {} {}",
+                    args.symbol, date
+                ));
+                let ledger = Ledger::from_env(&cli.data_dir, &cli.r2_prefix).await?;
+                let report = ledger
+                    .delete_replay_dataset_cache(&args.symbol, date)
                     .await?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }

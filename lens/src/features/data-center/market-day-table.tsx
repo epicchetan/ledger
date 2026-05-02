@@ -1,5 +1,5 @@
 import type { Column, ColumnDef } from "@tanstack/react-table"
-import { ArrowUpDown, Database, MoreVertical, RefreshCw, ScrollText, ShieldCheck, Trash2 } from "lucide-react"
+import { ArrowUpDown, Database, HardDrive, MoreVertical, RefreshCw, ScrollText, ShieldCheck, Trash2 } from "lucide-react"
 import { useMemo } from "react"
 
 import { Button } from "@/components/ui/button"
@@ -71,6 +71,12 @@ export function MarketDayTable({ days, activeJobDayIds, onAction }: MarketDayTab
         accessorFn: (day) => day.replayDataset.status,
         header: ({ column }) => <SortableHeader column={column} label="Replay Dataset" />,
         cell: ({ row }) => <ReplayHover day={row.original} />,
+      },
+      {
+        id: "cache",
+        accessorFn: (day) => (day.replayDataset.cache?.cached ? 1 : 0),
+        header: ({ column }) => <SortableHeader column={column} label="Cache" />,
+        cell: ({ row }) => <CacheHover day={row.original} />,
       },
       ...artifactColumns.map<ColumnDef<MarketDay>>((artifactColumn) => ({
         id: artifactColumn.key,
@@ -183,6 +189,29 @@ function ReplayHover({ day }: { day: MarketDay }) {
         <DetailRow label="Batches" value={formatCount(dataset.batchCount)} />
         <DetailRow label="Trades" value={formatCount(dataset.tradeCount)} />
         {dataset.recommendedAction ? <DetailRow label="Next" value={dataset.recommendedAction} wrap /> : null}
+      </HoverCardContent>
+    </HoverCard>
+  )
+}
+
+function CacheHover({ day }: { day: MarketDay }) {
+  const cache = day.replayDataset.cache
+  const cached = cache?.cached ?? false
+
+  return (
+    <HoverCard>
+      <HoverCardTrigger asChild>
+        <button type="button" className="text-left">
+          <DatasetStatusBadge status={cached ? "valid" : "missing"} compact />
+          <span className="ml-2 text-muted-foreground">{cached ? "Cached" : "-"}</span>
+        </button>
+      </HoverCardTrigger>
+      <HoverCardContent align="start" className="w-72 border border-border bg-popover p-3 text-xs">
+        <DetailTitle title="Replay Cache" />
+        <DetailRow label="Status" value={cached ? "Cached locally" : "Not cached"} />
+        <DetailRow label="Artifacts" value={cache ? String(cache.artifactCount) : "-"} />
+        <DetailRow label="Size" value={cache?.size ?? "-"} />
+        <DetailRow label="Last Used" value={cache?.lastAccessedAt ?? "-"} wrap />
       </HoverCardContent>
     </HoverCard>
   )
@@ -320,6 +349,7 @@ function RowActions({
 }) {
   const hasRaw = day.rawData.status === "available"
   const hasReplay = day.replayDataset.status === "available"
+  const hasCache = day.replayDataset.cache?.cached ?? false
 
   return (
     <DropdownMenu>
@@ -346,6 +376,10 @@ function RowActions({
           Job History
         </DropdownMenuItem>
         <DropdownMenuSeparator />
+        <DropdownMenuItem disabled={!hasCache} onSelect={() => onAction(day, "deleteCache")}>
+          <HardDrive className="size-3.5" />
+          Remove From Cache
+        </DropdownMenuItem>
         <DropdownMenuItem disabled={!hasReplay} className="text-red-300 focus:text-red-200" onSelect={() => onAction(day, "deleteReplay")}>
           <Trash2 className="size-3.5" />
           Delete ReplayDataset

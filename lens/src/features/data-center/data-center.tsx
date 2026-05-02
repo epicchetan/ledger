@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input"
 import {
   deleteRawMarketData,
   deleteReplayDataset,
+  deleteReplayDatasetCache,
   fetchActiveJobs,
   fetchMarketDays,
   fetchMarketDayStatus,
@@ -210,6 +211,12 @@ export function DataCenter() {
         await prepareMarketDay(day.contract, day.marketDate)
       } else if (action === "history") {
         await loadJobHistory(day)
+      } else if (action === "deleteCache") {
+        const report = await deleteReplayDatasetCache(day)
+        toast.success("Replay cache removed", {
+          description: `${day.contract} ${day.marketDate} removed ${formatBytes(report.bytes_deleted)} from local cache.`,
+        })
+        await refresh()
       } else {
         const job = await startDatasetAction(day, action)
         toast.success(`${actionLabel(action)} job started`, {
@@ -342,6 +349,8 @@ function actionLabel(action: DatasetAction) {
       return "Rebuild"
     case "validate":
       return "Validate"
+    case "deleteCache":
+      return "Remove From Cache"
     case "deleteReplay":
       return "Delete ReplayDataset"
     case "deleteRaw":
@@ -359,6 +368,8 @@ function startDatasetAction(day: MarketDay, action: DatasetAction) {
       return rebuildReplayDataset(day)
     case "validate":
       return validateReplayDataset(day)
+    case "deleteCache":
+      throw new Error("Replay cache removal is handled separately")
     case "deleteReplay":
       return deleteReplayDataset(day)
     case "deleteRaw":
@@ -374,6 +385,13 @@ function sleep(ms: number) {
 
 function shortJobId(jobId: string) {
   return jobId.slice(0, 8)
+}
+
+function formatBytes(bytes: number) {
+  return new Intl.NumberFormat("en-US", {
+    maximumFractionDigits: bytes >= 1_000_000_000 ? 2 : 1,
+    notation: "compact",
+  }).format(bytes)
 }
 
 function HeaderTab({ active, onClick, children }: { active: boolean; onClick: () => void; children: ReactNode }) {

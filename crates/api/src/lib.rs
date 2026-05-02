@@ -47,6 +47,10 @@ pub fn router(state: ApiState) -> Router {
             delete(routes::delete_replay_dataset),
         )
         .route(
+            "/market-days/{symbol}/{date}/replay/cache",
+            delete(routes::delete_replay_dataset_cache),
+        )
+        .route(
             "/market-days/{symbol}/{date}/raw",
             delete(routes::delete_raw_market_data),
         )

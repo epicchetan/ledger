@@ -19,6 +19,7 @@ POST /market-days/:symbol/:date/prepare
 POST /market-days/:symbol/:date/replay/build
 POST /market-days/:symbol/:date/replay/validate
 DELETE /market-days/:symbol/:date/replay
+DELETE /market-days/:symbol/:date/replay/cache
 DELETE /market-days/:symbol/:date/raw
 GET  /jobs?active=true
 GET  /jobs?active=false&limit=50
@@ -42,6 +43,8 @@ durable in R2, build replay artifacts when needed, run light readiness checks,
 and leave a ReplayDataset with current validation status.
 `replay/build` forces the Layer 2 rebuild path while preserving Layer 1 raw
 data. `replay/validate` is the heavier audit path.
+`replay/cache` removes only local cached replay artifacts; it does not touch R2
+or durable catalog records.
 
 ## Development
 

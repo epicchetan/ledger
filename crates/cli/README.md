@@ -28,6 +28,9 @@ ingest
 status
 list
 session validate
+replay run
+replay cache-status
+replay cache-remove
 storage cleanup-tmp
 ```
 
@@ -35,8 +38,9 @@ storage cleanup-tmp
 
 `session validate` operates on immutable `ReplayDataset` artifacts and delegates
 shared validation composition to `ledger`. `storage cleanup-tmp` removes
-disposable staging files left by failed or interrupted jobs. The active mutable
-`ReplaySession` controller is future work.
+disposable staging files left by failed or interrupted jobs. `replay run`
+opens the active mutable `ReplaySession` controller headlessly, and the replay
+cache commands inspect/remove its local read-through artifact cache.
 
 ## Boundary
 

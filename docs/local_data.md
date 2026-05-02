@@ -13,6 +13,7 @@ This directory is ignored by git.
 ```text
 data/
   ledger.sqlite
+  cache/
   tmp/
 ```
 
@@ -52,6 +53,29 @@ data/tmp/validate/ES/ESH6/2026-03-12/<run-id>/
 ```
 
 It is safe to remove `tmp/` when API/jobs are stopped.
+
+## `cache/`
+
+`cache/` is disposable local replay performance storage.
+
+Examples:
+
+```text
+data/cache/replay/ES/ESH6/2026-03-12/<replay-dataset-id>/
+  events.v1.bin
+  batches.v1.bin
+  trades.v1.bin
+  book_check.v1.json
+```
+
+Active `ReplaySession` startup uses this as a read-through cache for immutable
+ReplayDataset artifacts. R2 remains the durable source of truth, and SQLite
+records cache metadata for status display and LRU eviction. The default cap is
+10 cached ReplayDatasets and can be changed with
+`LEDGER_REPLAY_CACHE_MAX_DATASETS`.
+
+It is safe to remove `cache/` when API/replay sessions are stopped. Ledger will
+download needed ReplayDataset artifacts from R2 again on the next replay run.
 
 ## Commit Hygiene
 

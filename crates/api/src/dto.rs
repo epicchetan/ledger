@@ -34,6 +34,15 @@ pub struct JobResponse {
     pub job: JobRecord,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteReplayDatasetCacheResponse {
+    pub replay_dataset_id: Option<String>,
+    pub market_day_id: String,
+    pub deleted_files: usize,
+    pub deleted_dirs: usize,
+    pub bytes_deleted: u64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct MarketDayListQuery {
     pub root: Option<String>,
@@ -126,8 +135,18 @@ pub struct DataCenterReplayDatasetLayer {
     pub updated_at_iso: Option<String>,
     pub artifacts_available: bool,
     pub objects_valid: bool,
+    pub cache: Option<DataCenterReplayCacheSummary>,
     pub artifacts: Vec<DataCenterReplayArtifact>,
     pub validation: Option<DataCenterValidationSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataCenterReplayCacheSummary {
+    pub cached: bool,
+    pub artifact_count: u64,
+    pub size_bytes: u64,
+    pub last_accessed_at_ns: Option<String>,
+    pub last_accessed_iso: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
