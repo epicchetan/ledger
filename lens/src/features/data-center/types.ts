@@ -45,6 +45,31 @@ export interface ReplayArtifact {
   updatedAt: string | null
 }
 
+export type TrustStatus =
+  | "missing"
+  | "raw_available"
+  | "replay_dataset_available"
+  | "ready_to_train"
+  | "ready_with_warnings"
+  | "invalid"
+
+export type ValidationCheckStatus = "pass" | "warning" | "fail" | "skipped"
+
+export interface ValidationCheck {
+  id: string
+  label: string
+  status: ValidationCheckStatus
+  summary: string
+}
+
+export interface ValidationIssue {
+  severity: "warning" | "error"
+  code: string
+  message: string
+  checkId: string
+  recommendedAction: string | null
+}
+
 export interface RawDataSummary {
   status: "missing" | "available" | "error"
   provider: string | null
@@ -59,6 +84,7 @@ export interface RawDataSummary {
 
 export interface ReplayDatasetSummary {
   status: "missing" | "building" | "available" | "invalid"
+  trustStatus: TrustStatus
   id: string | null
   rawObjectKey: string | null
   eventCount: number | null
@@ -67,7 +93,15 @@ export interface ReplayDatasetSummary {
   firstEventTime: string | null
   lastEventTime: string | null
   lastValidatedAt: string | null
+  validationTrigger: "prepare" | "rebuild" | "manual" | null
   trustSummary: string
+  recommendedAction: string | null
+  checkCount: number
+  passedCheckCount: number
+  warningCount: number
+  errorCount: number
+  checks: ValidationCheck[]
+  issues: ValidationIssue[]
   warnings: string[]
   artifacts: Record<ArtifactKey, ReplayArtifact>
 }

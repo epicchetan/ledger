@@ -278,6 +278,11 @@ impl Ledger<ledger_store::R2ObjectStore> {
                 ValidateReplayDatasetRequest {
                     symbol: request.symbol,
                     market_date: request.market_date,
+                    trigger: if request.rebuild_replay {
+                        ValidationTrigger::Rebuild
+                    } else {
+                        ValidationTrigger::Prepare
+                    },
                     // Prepare should establish readiness, not perform an audit
                     // book-check pass unless explicitly requested later.
                     skip_book_check: request.skip_book_check,

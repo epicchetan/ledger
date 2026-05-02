@@ -197,6 +197,11 @@ pub struct ValidationReportRecord {
     pub replay_dataset_id: String,
     pub mode: ValidationMode,
     pub status: ValidationReportStatus,
+    pub trigger: String,
+    pub trust_status: String,
+    pub summary: String,
+    pub warning_count: i64,
+    pub error_count: i64,
     pub report_json: serde_json::Value,
     pub created_at_ns: u64,
 }
@@ -451,6 +456,11 @@ impl SqliteCatalog {
                 replay_dataset_id TEXT NOT NULL,
                 mode TEXT NOT NULL,
                 status TEXT NOT NULL,
+                trigger TEXT NOT NULL DEFAULT 'manual',
+                trust_status TEXT NOT NULL DEFAULT 'replay_dataset_available',
+                summary TEXT NOT NULL DEFAULT '',
+                warning_count INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
                 report_json TEXT NOT NULL,
                 created_at_ns INTEGER NOT NULL,
                 FOREIGN KEY(replay_dataset_id) REFERENCES replay_datasets(id)
@@ -491,6 +501,31 @@ impl SqliteCatalog {
         )?;
         conn.execute(
             "ALTER TABLE jobs ADD COLUMN request_json TEXT NOT NULL DEFAULT '{}'",
+            [],
+        )
+        .ok();
+        conn.execute(
+            "ALTER TABLE validation_reports ADD COLUMN trigger TEXT NOT NULL DEFAULT 'manual'",
+            [],
+        )
+        .ok();
+        conn.execute(
+            "ALTER TABLE validation_reports ADD COLUMN trust_status TEXT NOT NULL DEFAULT 'replay_dataset_available'",
+            [],
+        )
+        .ok();
+        conn.execute(
+            "ALTER TABLE validation_reports ADD COLUMN summary TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .ok();
+        conn.execute(
+            "ALTER TABLE validation_reports ADD COLUMN warning_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .ok();
+        conn.execute(
+            "ALTER TABLE validation_reports ADD COLUMN error_count INTEGER NOT NULL DEFAULT 0",
             [],
         )
         .ok();
@@ -954,18 +989,29 @@ impl SqliteCatalog {
         replay_dataset_id: &str,
         mode: ValidationMode,
         status: ValidationReportStatus,
+        trigger: &str,
+        trust_status: &str,
+        summary: &str,
+        warning_count: usize,
+        error_count: usize,
         report_json: serde_json::Value,
     ) -> Result<()> {
         let now = now_ns() as i64;
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO validation_reports
-             (replay_dataset_id, mode, status, report_json, created_at_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             (replay_dataset_id, mode, status, trigger, trust_status, summary,
+              warning_count, error_count, report_json, created_at_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 replay_dataset_id,
                 mode.as_str(),
                 status.as_str(),
+                trigger,
+                trust_status,
+                summary,
+                warning_count as i64,
+                error_count as i64,
                 report_json.to_string(),
                 now,
             ],
@@ -979,7 +1025,8 @@ impl SqliteCatalog {
     ) -> Result<Option<ValidationReportRecord>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, replay_dataset_id, mode, status, report_json, created_at_ns
+            "SELECT id, replay_dataset_id, mode, status, trigger, trust_status, summary,
+                    warning_count, error_count, report_json, created_at_ns
              FROM validation_reports
              WHERE replay_dataset_id = ?1
              ORDER BY created_at_ns DESC LIMIT 1",
@@ -1498,21 +1545,69 @@ fn row_to_replay_dataset(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReplayData
 fn row_to_validation_report(row: &rusqlite::Row<'_>) -> rusqlite::Result<ValidationReportRecord> {
     let mode: String = row.get(2)?;
     let status: String = row.get(3)?;
-    let report_json: String = row.get(4)?;
+    let report_json: String = row.get(9)?;
+    let status = ValidationReportStatus::parse(&status).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, err.into())
+    })?;
+    let report_json: serde_json::Value = serde_json::from_str(&report_json).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(err))
+    })?;
+    let mut trigger: String = row.get(4)?;
+    if let Some(value) = report_json
+        .get("trigger")
+        .and_then(serde_json::Value::as_str)
+    {
+        trigger = value.to_string();
+    }
+    let mut trust_status: String = row.get(5)?;
+    if trust_status == "replay_dataset_available" {
+        if let Some(value) = report_json
+            .get("trust_status")
+            .or_else(|| report_json.get("status"))
+            .and_then(serde_json::Value::as_str)
+        {
+            trust_status = value.to_string();
+        }
+    }
+    let mut summary: String = row.get(6)?;
+    if summary.is_empty() {
+        summary = report_json
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| validation_status_summary(&status, &trust_status));
+    }
     Ok(ValidationReportRecord {
         id: row.get(0)?,
         replay_dataset_id: row.get(1)?,
         mode: ValidationMode::parse(&mode).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, err.into())
         })?,
-        status: ValidationReportStatus::parse(&status).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, err.into())
-        })?,
-        report_json: serde_json::from_str(&report_json).map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(err))
-        })?,
-        created_at_ns: row.get::<_, i64>(5)? as u64,
+        status,
+        trigger,
+        trust_status,
+        summary,
+        warning_count: row.get(7)?,
+        error_count: row.get(8)?,
+        report_json,
+        created_at_ns: row.get::<_, i64>(10)? as u64,
     })
+}
+
+fn validation_status_summary(status: &ValidationReportStatus, trust_status: &str) -> String {
+    match trust_status {
+        "ready_to_train" => "ReplayDataset validated and ready for training.",
+        "ready_with_warnings" => "ReplayDataset is usable but has validation warnings.",
+        "invalid" => "ReplayDataset is invalid.",
+        _ => match status {
+            ValidationReportStatus::Valid => "ReplayDataset has a persisted validation report.",
+            ValidationReportStatus::Warning => {
+                "ReplayDataset is usable but has validation warnings."
+            }
+            ValidationReportStatus::Invalid => "ReplayDataset is invalid.",
+        },
+    }
+    .to_string()
 }
 
 fn row_to_job_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<LedgerJobRecord> {

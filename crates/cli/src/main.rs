@@ -8,7 +8,10 @@
 use anyhow::Result;
 use chrono::NaiveDate;
 use clap::{Args, Parser, Subcommand};
-use ledger::{Ledger, LedgerProgressEvent, LedgerProgressSink, ValidateReplayDatasetRequest};
+use ledger::{
+    Ledger, LedgerProgressEvent, LedgerProgressSink, ValidateReplayDatasetRequest,
+    ValidationTrigger,
+};
 use ledger_store::MarketDayFilter;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -164,6 +167,7 @@ async fn main() -> Result<()> {
                         ValidateReplayDatasetRequest {
                             symbol: args.market_day.symbol,
                             market_date: date,
+                            trigger: ValidationTrigger::Manual,
                             skip_book_check: args.skip_book_check,
                             replay_batches: args.replay_batches,
                             replay_all: args.replay_all,

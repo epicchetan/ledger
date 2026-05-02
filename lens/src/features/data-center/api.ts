@@ -7,6 +7,9 @@ import type {
   RawDataSummary,
   ReplayArtifact,
   ReplayDatasetSummary,
+  TrustStatus,
+  ValidationCheck,
+  ValidationIssue,
 } from "@/features/data-center/types"
 
 const API_BASE = import.meta.env.VITE_LEDGER_API_URL ?? "http://127.0.0.1:3001"
@@ -84,12 +87,37 @@ interface ApiReplayArtifact {
 interface ApiValidationSummary {
   mode: "light" | "full"
   status: "valid" | "warning" | "invalid"
+  trigger: "prepare" | "rebuild" | "manual"
+  trust_status: TrustStatus
+  summary: string
+  recommended_action: string | null
   created_at_ns: string
   created_at_iso: string
   event_count: number | null
   batch_count: number | null
   trade_count: number | null
+  check_count: number
+  passed_check_count: number
+  warning_count: number
+  error_count: number
+  checks: ApiValidationCheck[]
+  issues: ApiValidationIssue[]
   warnings: string[]
+}
+
+interface ApiValidationCheck {
+  id: string
+  label: string
+  status: "pass" | "warning" | "fail" | "skipped"
+  summary: string
+}
+
+interface ApiValidationIssue {
+  severity: "warning" | "error"
+  code: string
+  message: string
+  check_id: string
+  recommended_action: string | null
 }
 
 interface ApiCreateJobResponse {
@@ -231,10 +259,8 @@ function mapMarketDay(record: ApiDataCenterMarketDay): MarketDay {
 function statusToViewStatus(record: ApiDataCenterMarketDay): MarketDayStatus {
   const validation = record.replay_dataset.validation
   if (record.market_day_status === "downloading" || record.market_day_status === "preprocessing") return "loading"
-  if (validation?.status === "invalid" || record.replay_dataset.status === "invalid") return "invalid"
-  if (validation?.status === "warning") return "warning"
-  if (validation?.status === "valid") return "ready"
-  if (record.replay_dataset.objects_valid) return "ready"
+  if (validation) return trustStatusToViewStatus(validation.trust_status)
+  if (record.replay_dataset.status === "invalid") return "invalid"
   if (record.replay_dataset.status === "available") return "replay"
   if (record.raw.status === "available") return "raw"
   return "missing"
@@ -260,6 +286,7 @@ function datasetSummary(record: ApiDataCenterMarketDay): ReplayDatasetSummary {
 
   return {
     status: replayDataset.status,
+    trustStatus: validation?.trust_status ?? fallbackTrustStatus(record),
     id: replayDataset.id,
     rawObjectKey: replayDataset.raw_object_key,
     eventCount: validation?.event_count ?? null,
@@ -268,7 +295,15 @@ function datasetSummary(record: ApiDataCenterMarketDay): ReplayDatasetSummary {
     firstEventTime: null,
     lastEventTime: null,
     lastValidatedAt: formatIso(validation?.created_at_iso ?? null),
+    validationTrigger: validation?.trigger ?? null,
     trustSummary: trustSummary(record),
+    recommendedAction: validation?.recommended_action ?? null,
+    checkCount: validation?.check_count ?? 0,
+    passedCheckCount: validation?.passed_check_count ?? 0,
+    warningCount: validation?.warning_count ?? validation?.warnings.length ?? 0,
+    errorCount: validation?.error_count ?? 0,
+    checks: validation?.checks.map(mapValidationCheck) ?? [],
+    issues: validation?.issues.map(mapValidationIssue) ?? [],
     warnings: validation?.warnings ?? [],
     artifacts: artifactMap(replayDataset.artifacts),
   }
@@ -276,8 +311,7 @@ function datasetSummary(record: ApiDataCenterMarketDay): ReplayDatasetSummary {
 
 function trustSummary(record: ApiDataCenterMarketDay) {
   const validation = record.replay_dataset.validation
-  if (validation?.status === "valid") return "ReplayDataset has a persisted validation report."
-  if (validation?.status === "warning") return "ReplayDataset is usable but has validation warnings."
+  if (validation) return validation.summary
   if (record.replay_dataset.status === "available") {
     return record.replay_dataset.objects_valid
       ? "ReplayDataset artifacts are durable in R2 and available for validation or replay-session staging."
@@ -285,6 +319,49 @@ function trustSummary(record: ApiDataCenterMarketDay) {
   }
   if (record.raw.status === "available") return "Raw market data is durable in R2. ReplayDataset can be built without redownloading."
   return "No raw market data or replay dataset is available for this MarketDay."
+}
+
+function fallbackTrustStatus(record: ApiDataCenterMarketDay): TrustStatus {
+  if (record.replay_dataset.status === "invalid") return "invalid"
+  if (record.replay_dataset.status === "available") return "replay_dataset_available"
+  if (record.raw.status === "available") return "raw_available"
+  return "missing"
+}
+
+function trustStatusToViewStatus(status: TrustStatus): MarketDayStatus {
+  switch (status) {
+    case "ready_to_train":
+      return "ready"
+    case "ready_with_warnings":
+      return "warning"
+    case "invalid":
+      return "invalid"
+    case "replay_dataset_available":
+      return "replay"
+    case "raw_available":
+      return "raw"
+    case "missing":
+      return "missing"
+  }
+}
+
+function mapValidationCheck(check: ApiValidationCheck): ValidationCheck {
+  return {
+    id: check.id,
+    label: check.label,
+    status: check.status,
+    summary: check.summary,
+  }
+}
+
+function mapValidationIssue(issue: ApiValidationIssue): ValidationIssue {
+  return {
+    severity: issue.severity,
+    code: issue.code,
+    message: issue.message,
+    checkId: issue.check_id,
+    recommendedAction: issue.recommended_action,
+  }
 }
 
 function artifactMap(artifacts: ApiReplayArtifact[]): Record<ArtifactKey, ReplayArtifact> {

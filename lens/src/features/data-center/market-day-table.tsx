@@ -14,7 +14,14 @@ import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/h
 import { DataTable } from "@/features/data-center/data-table"
 import { DatasetStatusBadge } from "@/features/data-center/dataset-status-badge"
 import { statusLabel } from "@/features/data-center/status-labels"
-import type { ArtifactKey, DatasetAction, MarketDay, RawDataSummary, ReplayArtifact } from "@/features/data-center/types"
+import type {
+  ArtifactKey,
+  DatasetAction,
+  MarketDay,
+  RawDataSummary,
+  ReplayArtifact,
+  ValidationCheck,
+} from "@/features/data-center/types"
 
 interface MarketDayTableProps {
   days: MarketDay[]
@@ -151,7 +158,14 @@ function RawHover({ raw }: { raw: RawDataSummary }) {
 
 function ReplayHover({ day }: { day: MarketDay }) {
   const dataset = day.replayDataset
-  const status = dataset.status === "available" ? (day.status === "ready" ? "ready" : "replay") : dataset.status === "invalid" ? "invalid" : "missing"
+  const status =
+    dataset.status === "available"
+      ? day.status === "ready" || day.status === "warning"
+        ? day.status
+        : "replay"
+      : dataset.status === "invalid"
+        ? "invalid"
+        : "missing"
 
   return (
     <HoverCard>
@@ -168,6 +182,7 @@ function ReplayHover({ day }: { day: MarketDay }) {
         <DetailRow label="Events" value={formatCount(dataset.eventCount)} />
         <DetailRow label="Batches" value={formatCount(dataset.batchCount)} />
         <DetailRow label="Trades" value={formatCount(dataset.tradeCount)} />
+        {dataset.recommendedAction ? <DetailRow label="Next" value={dataset.recommendedAction} wrap /> : null}
       </HoverCardContent>
     </HoverCard>
   )
@@ -196,29 +211,102 @@ function ArtifactHover({ label, artifact }: { label: string; artifact: ReplayArt
 
 function ValidationCell({ day }: { day: MarketDay }) {
   const status = day.status === "ready" ? "valid" : day.status === "warning" ? "warning" : day.status === "invalid" ? "invalid" : "missing"
+  const dataset = day.replayDataset
   return (
     <HoverCard>
       <HoverCardTrigger asChild>
         <button type="button" className="text-left">
           <DatasetStatusBadge status={status} compact />
-          <span className="ml-2 text-muted-foreground">{day.replayDataset.lastValidatedAt ?? "-"}</span>
+          <span className="ml-2 text-muted-foreground">{dataset.lastValidatedAt ?? "-"}</span>
         </button>
       </HoverCardTrigger>
       <HoverCardContent align="end" className="w-72 border border-border bg-popover p-3 text-xs">
         <DetailTitle title="Validation" />
-        <p className="mb-2 leading-5 text-muted-foreground">{day.replayDataset.trustSummary}</p>
-        {day.replayDataset.warnings.length > 0 ? (
-          <ul className="space-y-1 text-amber-300">
-            {day.replayDataset.warnings.map((warning) => (
-              <li key={warning}>{warning}</li>
+        <p className="mb-2 leading-5 text-muted-foreground">{dataset.trustSummary}</p>
+        <DetailRow label="Trigger" value={triggerLabel(dataset.validationTrigger)} />
+        <DetailRow label="Checks" value={dataset.checkCount ? `${dataset.passedCheckCount}/${dataset.checkCount} passed` : "-"} />
+        <DetailRow label="Warnings" value={dataset.warningCount ? String(dataset.warningCount) : "-"} />
+        <DetailRow label="Errors" value={dataset.errorCount ? String(dataset.errorCount) : "-"} />
+        {dataset.recommendedAction ? <DetailRow label="Next" value={dataset.recommendedAction} wrap /> : null}
+        {dataset.checks.length > 0 ? (
+          <div className="mt-3 space-y-1.5">
+            {dataset.checks.map((check) => (
+              <ValidationCheckRow key={check.id} check={check} />
             ))}
-          </ul>
+          </div>
+        ) : null}
+        {dataset.issues.length > 0 ? (
+          <div className="mt-3 space-y-1.5">
+            {dataset.issues.map((issue) => (
+              <div
+                key={`${issue.code}-${issue.message}`}
+                className={issue.severity === "error" ? "leading-5 text-red-300" : "leading-5 text-amber-300"}
+              >
+                {issue.message}
+              </div>
+            ))}
+          </div>
+        ) : dataset.warnings.length > 0 ? (
+          <div className="mt-3 space-y-1.5">
+            {dataset.warnings.map((warning) => (
+              <div key={warning} className="leading-5 text-amber-300">
+                {warning}
+              </div>
+            ))}
+          </div>
         ) : (
           <DetailRow label="Warnings" value="-" />
         )}
       </HoverCardContent>
     </HoverCard>
   )
+}
+
+function ValidationCheckRow({ check }: { check: ValidationCheck }) {
+  const tone =
+    check.status === "pass"
+      ? "text-emerald-300"
+      : check.status === "warning"
+        ? "text-amber-300"
+        : check.status === "fail"
+          ? "text-red-300"
+          : "text-muted-foreground"
+
+  return (
+    <div className="border border-border/70 px-2 py-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <span className="font-medium text-foreground">{check.label}</span>
+        <span className={tone}>{checkStatusLabel(check.status)}</span>
+      </div>
+      {check.summary ? <div className="mt-1 leading-5 text-muted-foreground">{check.summary}</div> : null}
+    </div>
+  )
+}
+
+function checkStatusLabel(status: ValidationCheck["status"]) {
+  switch (status) {
+    case "pass":
+      return "Pass"
+    case "warning":
+      return "Warning"
+    case "fail":
+      return "Fail"
+    case "skipped":
+      return "Skipped"
+  }
+}
+
+function triggerLabel(trigger: "prepare" | "rebuild" | "manual" | null) {
+  switch (trigger) {
+    case "prepare":
+      return "Prepare"
+    case "rebuild":
+      return "Rebuild"
+    case "manual":
+      return "Manual"
+    default:
+      return "-"
+  }
 }
 
 function RowActions({

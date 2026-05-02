@@ -13,7 +13,7 @@ use axum::{
     Json,
 };
 use chrono::NaiveDate;
-use ledger::{PrepareReplayDatasetRequest, ValidateReplayDatasetRequest};
+use ledger::{PrepareReplayDatasetRequest, ValidateReplayDatasetRequest, ValidationTrigger};
 use ledger_domain::MarketDay;
 use ledger_store::MarketDayFilter;
 use serde_json::json;
@@ -193,6 +193,7 @@ pub(crate) async fn validate_replay_dataset(
                     ValidateReplayDatasetRequest {
                         symbol,
                         market_date: date,
+                        trigger: ValidationTrigger::Manual,
                         skip_book_check: body.skip_book_check,
                         replay_batches: body.replay_batches,
                         replay_all: body.replay_all,

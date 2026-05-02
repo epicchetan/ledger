@@ -154,14 +154,76 @@ pub enum DataCenterValidationStatus {
     Invalid,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DataCenterValidationTrigger {
+    Prepare,
+    Rebuild,
+    Manual,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DataCenterTrustStatus {
+    Missing,
+    RawAvailable,
+    ReplayDatasetAvailable,
+    ReadyToTrain,
+    ReadyWithWarnings,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DataCenterValidationCheckStatus {
+    Pass,
+    Warning,
+    Fail,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataCenterValidationCheck {
+    pub id: String,
+    pub label: String,
+    pub status: DataCenterValidationCheckStatus,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DataCenterValidationIssueSeverity {
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataCenterValidationIssue {
+    pub severity: DataCenterValidationIssueSeverity,
+    pub code: String,
+    pub message: String,
+    pub check_id: String,
+    pub recommended_action: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataCenterValidationSummary {
     pub mode: DataCenterValidationMode,
     pub status: DataCenterValidationStatus,
+    pub trigger: DataCenterValidationTrigger,
+    pub trust_status: DataCenterTrustStatus,
+    pub summary: String,
+    pub recommended_action: Option<String>,
     pub created_at_ns: String,
     pub created_at_iso: String,
     pub event_count: Option<u64>,
     pub batch_count: Option<u64>,
     pub trade_count: Option<u64>,
+    pub check_count: u64,
+    pub passed_check_count: u64,
+    pub warning_count: u64,
+    pub error_count: u64,
+    pub checks: Vec<DataCenterValidationCheck>,
+    pub issues: Vec<DataCenterValidationIssue>,
     pub warnings: Vec<String>,
 }

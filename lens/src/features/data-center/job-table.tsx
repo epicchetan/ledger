@@ -177,7 +177,19 @@ function JobStatusBadge({ status }: { status: JobRecord["status"] }) {
 }
 
 function latestJobLine(job: JobRecord) {
-  return job.error ?? job.progress.at(-1) ?? "No progress recorded."
+  return job.error ?? jobResultSummary(job.result) ?? job.progress.at(-1) ?? "No progress recorded."
+}
+
+function jobResultSummary(result: unknown) {
+  if (!isRecord(result)) return null
+  const validation = isRecord(result.validation) ? result.validation : result
+  if (typeof validation.summary === "string") return validation.summary
+  if (typeof result.summary === "string") return result.summary
+  return null
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function shortJobId(jobId: string) {

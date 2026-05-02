@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use ledger_book::OrderBook;
 use ledger_domain::{now_ns, EventStore, ExecutionProfile, MarketDay, VisibilityProfile};
@@ -15,6 +15,7 @@ use crate::{Ledger, LedgerProgress, LedgerProgressSink, ObjectStore, ReplayDatas
 pub struct ValidateReplayDatasetRequest {
     pub symbol: String,
     pub market_date: NaiveDate,
+    pub trigger: ValidationTrigger,
     pub skip_book_check: bool,
     pub replay_batches: Option<usize>,
     pub replay_all: bool,
@@ -53,26 +54,95 @@ pub struct ReplayDatasetCounts {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum ValidationTrigger {
+    Prepare,
+    Rebuild,
+    Manual,
+}
+
+impl ValidationTrigger {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Prepare => "prepare",
+            Self::Rebuild => "rebuild",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ReplayDatasetTrustStatus {
     Missing,
-    Downloaded,
-    Hydrated,
-    Validated,
+    RawAvailable,
+    ReplayDatasetAvailable,
     ReadyToTrain,
     ReadyWithWarnings,
     Invalid,
 }
 
+impl ReplayDatasetTrustStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::RawAvailable => "raw_available",
+            Self::ReplayDatasetAvailable => "replay_dataset_available",
+            Self::ReadyToTrain => "ready_to_train",
+            Self::ReadyWithWarnings => "ready_with_warnings",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationCheckStatus {
+    Pass,
+    Warning,
+    Fail,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidationCheck {
+    pub id: String,
+    pub label: String,
+    pub status: ValidationCheckStatus,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationIssueSeverity {
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidationIssue {
+    pub severity: ValidationIssueSeverity,
+    pub code: String,
+    pub message: String,
+    pub check_id: String,
+    pub recommended_action: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayDatasetValidationReport {
+    pub schema_version: u32,
     pub replay_dataset_id: String,
     pub market_day: MarketDay,
+    pub trigger: ValidationTrigger,
+    pub mode: ValidationMode,
     pub artifacts: ReplayDatasetArtifacts,
-    pub counts: ReplayDatasetCounts,
-    pub indexes_valid: bool,
+    pub counts: Option<ReplayDatasetCounts>,
     pub book_check: Option<BookCheckValidationReport>,
-    pub replay_probe: ReplayProbeReport,
-    pub status: ReplayDatasetTrustStatus,
+    pub replay_probe: Option<ReplayProbeReport>,
+    pub trust_status: ReplayDatasetTrustStatus,
+    pub summary: String,
+    pub recommended_action: Option<String>,
+    pub checks: Vec<ValidationCheck>,
+    pub issues: Vec<ValidationIssue>,
     pub warnings: Vec<String>,
 }
 
@@ -131,18 +201,47 @@ impl<S: ObjectStore + 'static> Ledger<S> {
         };
         progress.done("replay dataset loaded", load_started_at);
 
-        let report = validate_loaded_replay_dataset(dataset, request, progress).await?;
-        let status = if report.warnings.is_empty() {
-            ValidationReportStatus::Valid
-        } else {
-            ValidationReportStatus::Warning
+        let report = match validate_loaded_replay_dataset(
+            dataset.clone(),
+            request.clone(),
+            progress,
+        )
+        .await
+        {
+            Ok(report) => report,
+            Err(err) => {
+                let report = invalid_validation_report(dataset, request, err.to_string());
+                self.store
+                    .record_validation_report(
+                        &report.market_day,
+                        &report.replay_dataset_id,
+                        report.trigger.as_str(),
+                        report.mode.clone(),
+                        report_status(&report),
+                        report.trust_status.as_str(),
+                        &report.summary,
+                        warning_count(&report),
+                        error_count(&report),
+                        stored_validation_report_json(&report),
+                    )
+                    .await?;
+                self.store
+                    .cleanup_staged_replay_dataset(&report.market_day, &run_label)
+                    .await?;
+                return Err(err);
+            }
         };
         self.store
             .record_validation_report(
                 &report.market_day,
                 &report.replay_dataset_id,
-                ValidationMode::Full,
-                status,
+                report.trigger.as_str(),
+                report.mode.clone(),
+                report_status(&report),
+                report.trust_status.as_str(),
+                &report.summary,
+                warning_count(&report),
+                error_count(&report),
                 stored_validation_report_json(&report),
             )
             .await?;
@@ -176,54 +275,119 @@ async fn validate_loaded_replay_dataset(
         batch_count: event_store.batches.len(),
         trade_count: event_store.trades.len(),
     };
+    let mut checks = vec![
+        validation_check(
+            "artifact_presence",
+            "Artifact presence",
+            ValidationCheckStatus::Pass,
+            "Required replay artifacts were staged from R2.",
+        ),
+        validation_check(
+            "artifact_integrity",
+            "Artifact integrity",
+            ValidationCheckStatus::Pass,
+            "Staged artifact size and checksum verification passed.",
+        ),
+        validation_check(
+            "artifact_decode",
+            "Artifact decode",
+            ValidationCheckStatus::Pass,
+            "Events, batches, and trades decoded successfully.",
+        ),
+        validation_check(
+            "index_integrity",
+            "Index integrity",
+            ValidationCheckStatus::Pass,
+            "EventStore batch and trade indexes rebuilt cleanly.",
+        ),
+    ];
 
     let book_check = if request.skip_book_check {
         progress.step("skipping book-check comparison");
+        checks.push(validation_check(
+            "book_check",
+            "Book check",
+            ValidationCheckStatus::Skipped,
+            "Book-check comparison was skipped for this validation run.",
+        ));
         None
     } else {
-        Some(validate_book_check(&dataset.book_check_path, &event_store, &progress).await?)
+        let report = validate_book_check(&dataset.book_check_path, &event_store, &progress).await?;
+        checks.push(book_check_validation_check(&report));
+        Some(report)
     };
 
-    let warnings = validation_warnings(book_check.as_ref());
+    let issues = validation_issues(book_check.as_ref());
     let replay_probe = run_replay_probe(
         event_store,
         request.replay_batches,
         request.replay_all,
         &progress,
     )?;
-    let status = if warnings.is_empty() {
-        ReplayDatasetTrustStatus::ReadyToTrain
-    } else {
+    checks.push(validation_check(
+        "replay_probe",
+        "Replay probe",
+        ValidationCheckStatus::Pass,
+        format!(
+            "ReplaySimulator applied {}/{} requested batches.",
+            replay_probe.applied_batches, replay_probe.requested_batches
+        ),
+    ));
+    let trust_status = if issues
+        .iter()
+        .any(|issue| issue.severity == ValidationIssueSeverity::Error)
+    {
+        ReplayDatasetTrustStatus::Invalid
+    } else if issues
+        .iter()
+        .any(|issue| issue.severity == ValidationIssueSeverity::Warning)
+    {
         ReplayDatasetTrustStatus::ReadyWithWarnings
+    } else {
+        ReplayDatasetTrustStatus::ReadyToTrain
     };
+    let warnings = warning_messages(&issues);
+    let (summary, recommended_action) = validation_outcome_text(trust_status, &issues);
 
     Ok(ReplayDatasetValidationReport {
+        schema_version: 1,
         replay_dataset_id: dataset.replay_dataset_id,
         market_day: dataset.market_day,
+        trigger: request.trigger,
+        mode: ValidationMode::Full,
         artifacts: ReplayDatasetArtifacts {
             events_path: dataset.events_path,
             batches_path: dataset.batches_path,
             trades_path: dataset.trades_path,
             book_check_path: dataset.book_check_path,
         },
-        counts,
-        indexes_valid: true,
+        counts: Some(counts),
         book_check,
-        replay_probe,
-        status,
+        replay_probe: Some(replay_probe),
+        trust_status,
+        summary,
+        recommended_action,
+        checks,
+        issues,
         warnings,
     })
 }
 
 fn stored_validation_report_json(report: &ReplayDatasetValidationReport) -> serde_json::Value {
     serde_json::json!({
+        "schema_version": report.schema_version,
         "replay_dataset_id": report.replay_dataset_id,
         "market_day_id": report.market_day.id,
+        "trigger": report.trigger,
+        "mode": report.mode,
         "counts": report.counts,
-        "indexes_valid": report.indexes_valid,
         "book_check": report.book_check,
         "replay_probe": report.replay_probe,
-        "status": report.status,
+        "trust_status": report.trust_status,
+        "summary": report.summary,
+        "recommended_action": report.recommended_action,
+        "checks": report.checks,
+        "issues": report.issues,
         "warnings": report.warnings,
     })
 }
@@ -248,12 +412,8 @@ async fn validate_book_check(
     let actual = run_book_check_with_progress(event_store, progress)?;
     progress.done("book-check comparison completed", started_at);
 
-    if actual != expected {
-        bail!("book-check mismatch: expected {expected:?}, actual {actual:?}");
-    }
-
     Ok(BookCheckValidationReport {
-        matched: true,
+        matched: actual == expected,
         expected,
         actual,
     })
@@ -346,17 +506,202 @@ fn run_replay_probe(
     })
 }
 
-fn validation_warnings(book_check: Option<&BookCheckValidationReport>) -> Vec<String> {
-    let mut warnings = Vec::new();
+fn validation_issues(book_check: Option<&BookCheckValidationReport>) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
     if let Some(book_check) = book_check {
+        if !book_check.matched {
+            issues.push(ValidationIssue {
+                severity: ValidationIssueSeverity::Error,
+                code: "book_check.mismatch".to_string(),
+                message: "Book-check comparison did not match the persisted artifact.".to_string(),
+                check_id: "book_check".to_string(),
+                recommended_action: Some("Rebuild ReplayDataset from raw data.".to_string()),
+            });
+        }
         if book_check.actual.warning_count > 0 {
-            warnings.push(format!(
-                "book-check reported {} order-book warnings",
-                book_check.actual.warning_count
-            ));
+            issues.push(ValidationIssue {
+                severity: ValidationIssueSeverity::Warning,
+                code: "book_check.order_book_warnings".to_string(),
+                message: format!(
+                    "Book-check reported {} order-book warnings.",
+                    book_check.actual.warning_count
+                ),
+                check_id: "book_check".to_string(),
+                recommended_action: Some(
+                    "Review book-check details before using this day for training.".to_string(),
+                ),
+            });
         }
     }
-    warnings
+    issues
+}
+
+fn invalid_validation_report(
+    dataset: ReplayDataset,
+    request: ValidateReplayDatasetRequest,
+    error: String,
+) -> ReplayDatasetValidationReport {
+    let issues = vec![ValidationIssue {
+        severity: ValidationIssueSeverity::Error,
+        code: "validation.failed".to_string(),
+        message: error,
+        check_id: "validation".to_string(),
+        recommended_action: Some("Rebuild ReplayDataset from raw data.".to_string()),
+    }];
+    let warnings = warning_messages(&issues);
+    let (summary, recommended_action) =
+        validation_outcome_text(ReplayDatasetTrustStatus::Invalid, &issues);
+
+    ReplayDatasetValidationReport {
+        schema_version: 1,
+        replay_dataset_id: dataset.replay_dataset_id,
+        market_day: dataset.market_day,
+        trigger: request.trigger,
+        mode: ValidationMode::Full,
+        artifacts: ReplayDatasetArtifacts {
+            events_path: dataset.events_path,
+            batches_path: dataset.batches_path,
+            trades_path: dataset.trades_path,
+            book_check_path: dataset.book_check_path,
+        },
+        counts: None,
+        book_check: None,
+        replay_probe: None,
+        trust_status: ReplayDatasetTrustStatus::Invalid,
+        summary,
+        recommended_action,
+        checks: vec![validation_check(
+            "validation",
+            "Validation",
+            ValidationCheckStatus::Fail,
+            "Validation failed before all checks could complete.",
+        )],
+        issues,
+        warnings,
+    }
+}
+
+fn report_status(report: &ReplayDatasetValidationReport) -> ValidationReportStatus {
+    if error_count(report) > 0 {
+        ValidationReportStatus::Invalid
+    } else if warning_count(report) > 0 {
+        ValidationReportStatus::Warning
+    } else {
+        ValidationReportStatus::Valid
+    }
+}
+
+fn warning_count(report: &ReplayDatasetValidationReport) -> usize {
+    report
+        .issues
+        .iter()
+        .filter(|issue| issue.severity == ValidationIssueSeverity::Warning)
+        .count()
+}
+
+fn error_count(report: &ReplayDatasetValidationReport) -> usize {
+    report
+        .issues
+        .iter()
+        .filter(|issue| issue.severity == ValidationIssueSeverity::Error)
+        .count()
+}
+
+fn warning_messages(issues: &[ValidationIssue]) -> Vec<String> {
+    issues
+        .iter()
+        .filter(|issue| issue.severity == ValidationIssueSeverity::Warning)
+        .map(|issue| issue.message.clone())
+        .collect()
+}
+
+fn validation_check(
+    id: impl Into<String>,
+    label: impl Into<String>,
+    status: ValidationCheckStatus,
+    summary: impl Into<String>,
+) -> ValidationCheck {
+    ValidationCheck {
+        id: id.into(),
+        label: label.into(),
+        status,
+        summary: summary.into(),
+    }
+}
+
+fn book_check_validation_check(report: &BookCheckValidationReport) -> ValidationCheck {
+    let status = if !report.matched {
+        ValidationCheckStatus::Fail
+    } else if report.actual.warning_count > 0 {
+        ValidationCheckStatus::Warning
+    } else {
+        ValidationCheckStatus::Pass
+    };
+    validation_check(
+        "book_check",
+        "Book check",
+        status,
+        if report.matched {
+            format!(
+                "Book-check matched with {} order-book warnings.",
+                report.actual.warning_count
+            )
+        } else {
+            "Book-check comparison did not match the persisted artifact.".to_string()
+        },
+    )
+}
+
+fn validation_outcome_text(
+    trust_status: ReplayDatasetTrustStatus,
+    issues: &[ValidationIssue],
+) -> (String, Option<String>) {
+    match trust_status {
+        ReplayDatasetTrustStatus::ReadyToTrain => (
+            "ReplayDataset validated and ready for training.".to_string(),
+            None,
+        ),
+        ReplayDatasetTrustStatus::ReadyWithWarnings => (
+            format!(
+                "ReplayDataset is usable but has {} validation warning{}.",
+                issues
+                    .iter()
+                    .filter(|issue| issue.severity == ValidationIssueSeverity::Warning)
+                    .count(),
+                if issues
+                    .iter()
+                    .filter(|issue| issue.severity == ValidationIssueSeverity::Warning)
+                    .count()
+                    == 1
+                {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+            Some("Review warnings before using this day for training.".to_string()),
+        ),
+        ReplayDatasetTrustStatus::Invalid => (
+            issues
+                .iter()
+                .find(|issue| issue.severity == ValidationIssueSeverity::Error)
+                .map(|issue| format!("ReplayDataset is invalid: {}", issue.message))
+                .unwrap_or_else(|| "ReplayDataset is invalid.".to_string()),
+            Some("Rebuild ReplayDataset from raw data.".to_string()),
+        ),
+        ReplayDatasetTrustStatus::Missing => (
+            "No raw data or ReplayDataset is available for this MarketDay.".to_string(),
+            Some("Prepare this MarketDay.".to_string()),
+        ),
+        ReplayDatasetTrustStatus::RawAvailable => (
+            "Raw market data is available; ReplayDataset has not been built.".to_string(),
+            Some("Build ReplayDataset from raw data.".to_string()),
+        ),
+        ReplayDatasetTrustStatus::ReplayDatasetAvailable => (
+            "ReplayDataset is available but has not been validated.".to_string(),
+            Some("Run validation before training.".to_string()),
+        ),
+    }
 }
 
 fn progress_interval(total: usize) -> usize {

@@ -1,7 +1,9 @@
 use crate::dto::{
     DataCenterMarketDay, DataCenterObjectSummary, DataCenterRawDataLayer, DataCenterRawDataStatus,
     DataCenterReplayArtifact, DataCenterReplayDatasetLayer, DataCenterReplayDatasetStatus,
-    DataCenterValidationMode, DataCenterValidationStatus, DataCenterValidationSummary,
+    DataCenterTrustStatus, DataCenterValidationCheck, DataCenterValidationCheckStatus,
+    DataCenterValidationIssue, DataCenterValidationIssueSeverity, DataCenterValidationMode,
+    DataCenterValidationStatus, DataCenterValidationSummary, DataCenterValidationTrigger,
 };
 use crate::time::{ns_iso, ns_string};
 use ledger_domain::MarketDay;
@@ -184,18 +186,17 @@ fn data_center_replay_artifact(artifact: ReplayDatasetObjectStatus) -> DataCente
 
 fn data_center_validation(report: ValidationReportRecord) -> DataCenterValidationSummary {
     let counts = report.report_json.get("counts");
-    let warnings = report
-        .report_json
-        .get("warnings")
-        .and_then(Value::as_array)
-        .map(|warnings| {
-            warnings
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+    let checks = validation_checks(&report.report_json);
+    let issues = validation_issues(&report.report_json);
+    let warnings = report_warnings(&report.report_json, &issues);
+    let warning_count = report.warning_count.max(warnings.len() as i64) as u64;
+    let error_count = report.error_count.max(
+        issues
+            .iter()
+            .filter(|issue| issue.severity == DataCenterValidationIssueSeverity::Error)
+            .count() as i64,
+    ) as u64;
+    let summary = report_summary(&report);
 
     DataCenterValidationSummary {
         mode: match report.mode {
@@ -207,6 +208,14 @@ fn data_center_validation(report: ValidationReportRecord) -> DataCenterValidatio
             ValidationReportStatus::Warning => DataCenterValidationStatus::Warning,
             ValidationReportStatus::Invalid => DataCenterValidationStatus::Invalid,
         },
+        trigger: validation_trigger(&report),
+        trust_status: trust_status(&report),
+        summary,
+        recommended_action: report
+            .report_json
+            .get("recommended_action")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         created_at_ns: ns_string(report.created_at_ns),
         created_at_iso: ns_iso(report.created_at_ns),
         event_count: counts
@@ -218,6 +227,157 @@ fn data_center_validation(report: ValidationReportRecord) -> DataCenterValidatio
         trade_count: counts
             .and_then(|counts| counts.get("trade_count"))
             .and_then(Value::as_u64),
+        check_count: checks.len() as u64,
+        passed_check_count: checks
+            .iter()
+            .filter(|check| check.status == DataCenterValidationCheckStatus::Pass)
+            .count() as u64,
+        warning_count,
+        error_count,
+        checks,
+        issues,
         warnings,
     }
+}
+
+fn report_summary(report: &ValidationReportRecord) -> String {
+    if !report.summary.is_empty() {
+        return report.summary.clone();
+    }
+    report
+        .report_json
+        .get("summary")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            match report.status {
+                ValidationReportStatus::Valid => "ReplayDataset has a persisted validation report.",
+                ValidationReportStatus::Warning => {
+                    "ReplayDataset is usable but has validation warnings."
+                }
+                ValidationReportStatus::Invalid => "ReplayDataset is invalid.",
+            }
+            .to_string()
+        })
+}
+
+fn validation_trigger(report: &ValidationReportRecord) -> DataCenterValidationTrigger {
+    let value = report
+        .report_json
+        .get("trigger")
+        .and_then(Value::as_str)
+        .unwrap_or(&report.trigger);
+    match value {
+        "prepare" => DataCenterValidationTrigger::Prepare,
+        "rebuild" => DataCenterValidationTrigger::Rebuild,
+        _ => DataCenterValidationTrigger::Manual,
+    }
+}
+
+fn trust_status(report: &ValidationReportRecord) -> DataCenterTrustStatus {
+    let value = report
+        .report_json
+        .get("trust_status")
+        .or_else(|| report.report_json.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or(&report.trust_status);
+    match value {
+        "missing" => DataCenterTrustStatus::Missing,
+        "raw_available" => DataCenterTrustStatus::RawAvailable,
+        "ready_to_train" => DataCenterTrustStatus::ReadyToTrain,
+        "ready_with_warnings" => DataCenterTrustStatus::ReadyWithWarnings,
+        "invalid" => DataCenterTrustStatus::Invalid,
+        _ => DataCenterTrustStatus::ReplayDatasetAvailable,
+    }
+}
+
+fn validation_checks(report_json: &Value) -> Vec<DataCenterValidationCheck> {
+    report_json
+        .get("checks")
+        .and_then(Value::as_array)
+        .map(|checks| {
+            checks
+                .iter()
+                .map(|check| DataCenterValidationCheck {
+                    id: string_field(check, "id", "unknown"),
+                    label: string_field(check, "label", "Check"),
+                    status: check_status(
+                        check
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("skipped"),
+                    ),
+                    summary: string_field(check, "summary", ""),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn validation_issues(report_json: &Value) -> Vec<DataCenterValidationIssue> {
+    report_json
+        .get("issues")
+        .and_then(Value::as_array)
+        .map(|issues| {
+            issues
+                .iter()
+                .map(|issue| DataCenterValidationIssue {
+                    severity: match issue
+                        .get("severity")
+                        .and_then(Value::as_str)
+                        .unwrap_or("warning")
+                    {
+                        "error" => DataCenterValidationIssueSeverity::Error,
+                        _ => DataCenterValidationIssueSeverity::Warning,
+                    },
+                    code: string_field(issue, "code", "validation.issue"),
+                    message: string_field(issue, "message", ""),
+                    check_id: string_field(issue, "check_id", "validation"),
+                    recommended_action: issue
+                        .get("recommended_action")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn report_warnings(report_json: &Value, issues: &[DataCenterValidationIssue]) -> Vec<String> {
+    let warnings = report_json
+        .get("warnings")
+        .and_then(Value::as_array)
+        .map(|warnings| {
+            warnings
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !warnings.is_empty() {
+        return warnings;
+    }
+    issues
+        .iter()
+        .filter(|issue| issue.severity == DataCenterValidationIssueSeverity::Warning)
+        .map(|issue| issue.message.clone())
+        .collect()
+}
+
+fn check_status(value: &str) -> DataCenterValidationCheckStatus {
+    match value {
+        "pass" => DataCenterValidationCheckStatus::Pass,
+        "warning" => DataCenterValidationCheckStatus::Warning,
+        "fail" => DataCenterValidationCheckStatus::Fail,
+        _ => DataCenterValidationCheckStatus::Skipped,
+    }
+}
+
+fn string_field(value: &Value, key: &str, default: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or(default)
+        .to_string()
 }

@@ -126,14 +126,24 @@ impl<S: ObjectStore + 'static> LedgerStore<S> {
         &self,
         _md: &MarketDay,
         replay_dataset_id: &str,
+        trigger: impl AsRef<str>,
         mode: ValidationMode,
         status: ValidationReportStatus,
+        trust_status: impl AsRef<str>,
+        summary: impl AsRef<str>,
+        warning_count: usize,
+        error_count: usize,
         report_json: serde_json::Value,
     ) -> Result<()> {
         self.catalog.insert_validation_report(
             replay_dataset_id,
             mode.clone(),
             status.clone(),
+            trigger.as_ref(),
+            trust_status.as_ref(),
+            summary.as_ref(),
+            warning_count,
+            error_count,
             report_json.clone(),
         )?;
         Ok(())
