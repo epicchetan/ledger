@@ -49,9 +49,9 @@ Study
 
 This naming is cleaner: a dataset is input; a session is something actively experienced and controlled.
 
-## 3. Immediate Product Priority: Lens Data Center
+## 3. Current Product Priority: Lens Data Center
 
-The first serious Lens overhaul should be a Data Center surface, not a replay chart polish pass. The old prototype viewer can remain temporarily, but Lens should first prove it can manage Ledger’s data lifecycle.
+The first serious Lens overhaul is the Data Center surface, not a replay chart polish pass. The old prototype viewer can remain temporarily, but Lens should first prove it can manage Ledger’s data lifecycle.
 
 The Data Center should answer:
 
@@ -59,45 +59,67 @@ The Data Center should answer:
 What days do I have?
 What is missing?
 What is downloaded but not validated?
-What is loaded locally?
+What durable raw and replay layers exist?
 Is this day trustworthy enough to train on?
 What warnings should I care about?
+What job is currently changing this day?
+What happened during the last prepare/rebuild/validate/delete job?
 ```
 
-Initial Data Center actions:
+Data Center actions:
 
 ```text
 select symbol/date
 resolve full ES MarketDay
-trigger ingest/download
-track ingest job progress
-load/hydrate ReplayDataset
-run validation / data-quality checks
+prepare raw data + ReplayDataset
+rebuild ReplayDataset from existing raw data
+run validation / data-quality checks again
+delete ReplayDataset
+delete raw data
+track job progress and history
 view trust report
 open validated day as a ReplaySession later
 ```
 
-The first Ledger API should therefore be a small Data Center API:
+Loading or hydrating a `ReplayDataset` is not a Data Center user action. It is an internal implementation detail used by validation today and by active `ReplaySession` startup later.
+
+The first Ledger API is therefore a small Data Center API:
 
 ```text
 GET  /health
 GET  /market-days
 GET  /market-days/:symbol/:date
+GET  /market-days/:symbol/:date/jobs
 POST /market-days/:symbol/:date/prepare
 POST /market-days/:symbol/:date/replay/build
 POST /market-days/:symbol/:date/replay/validate
 DELETE /market-days/:symbol/:date/replay
 DELETE /market-days/:symbol/:date/raw
+GET  /jobs
+GET  /jobs?active=true
+GET  /jobs?active=false&limit=50
 GET  /jobs/:id
 ```
 
 Replay controls and WebSockets come after Lens can download, validate, and trust data.
+
+The current storage source-of-truth decision is:
+
+```text
+SQLite = local Ledger control plane
+R2     = durable large-object data plane
+tmp    = disposable job staging
+```
+
+SQLite owns the catalog, object metadata, jobs, validation summaries, and future journal/session/study state. R2 stores raw DBN files and replay artifacts. `data/tmp` is temporary staging for ingest and validation jobs, not a product-level replay cache.
 
 ## 4. Data Quality and Validation Philosophy
 
 Current ingestion and validation should be treated as **artifact integrity and deterministic replay-readiness checks**. They prove that Ledger can reconstruct and replay the data through its own deterministic pipeline. They do not yet prove that a day is free of subtle feed gaps, market-quality problems, or modeling assumptions.
 
 Lens should present validation as a trader-facing trust report, not raw JSON.
+
+`prepare` and `rebuild` should leave behind a persisted validation result before completing. The separate `validate` action is for a manual re-audit when validation logic changes, corruption is suspected, or a deeper check is wanted.
 
 Recommended top-level statuses:
 
@@ -428,30 +450,80 @@ short documentation
 
 This gives us speed without losing control.
 
-## 12. Near-Term Build Order
+## 12. Current Implementation Map
 
-Revised next sequence:
+The repo is currently split along these boundaries:
+
+```text
+ledger-domain
+  Shared pure types, MarketDay resolution, EventStore, codecs, storage kind names,
+  and simulator request/profile/result types.
+
+ledger-book
+  Deterministic L3 order-book truth over normalized MBO events.
+
+ledger-replay
+  Headless replay simulator, trader visibility, simulated execution, latency,
+  queue-ahead, and same-timestamp policy.
+
+ledger-store
+  SQLite control plane, R2 object storage, market-day catalog, raw/replay layer
+  records, validation summaries, job records, and tmp staging.
+
+ledger-ingest
+  Databento/raw DBN download or reuse, DBN preprocessing, replay artifact
+  creation, book-check generation, and artifact persistence through store.
+
+ledger
+  Application orchestration: prepare, rebuild, validate, delete, replay probes,
+  and shared CLI/API behavior.
+
+ledger-api
+  HTTP transport adapter for Lens: routes, DTOs, jobs, progress events, CORS,
+  and response presentation.
+
+ledger-cli
+  Internal terminal adapter for resolve, ingest, status, list, validation, and
+  tmp cleanup.
+
+lens
+  Web operating surface. Data Center currently manages market days, durable
+  layers, jobs, row actions, trust status, and job history.
+```
+
+## 13. Near-Term Build Order
+
+Completed foundation:
 
 ```text
 1. Adopt naming: ReplayDataset = immutable inputs, ReplaySession = active simulator.
 2. Add / update docs with this vision.
 3. Build Lens Data Center surface.
-4. Add minimal Ledger Data API for market days, ingest jobs, load, and validation.
+4. Add minimal Ledger Data API for market days, jobs, prepare, rebuild, validation, and delete.
 5. Move validation composition into Ledger so CLI/API share logic.
-6. Add stronger data-quality report fields.
-7. Persist validation reports for Lens.
-8. Introduce active ReplaySession controller.
-9. Add WebSocket projection protocol.
-10. Build bars, DOM, and base projection graph.
-11. Add StudyGraph and first L3 studies.
-12. Add journaling/training memory.
-13. Add levels and 0DTE/gamma heatmap.
-14. Add model studies and live mode later.
+6. Split SQLite control plane from R2 durable blob storage.
+7. Persist jobs, job progress, job history, and validation reports for Lens.
+8. Wire Lens Data Center to the real API with table actions and trust state.
 ```
+
+Next sequence:
+
+```text
+1. Add stronger data-quality report fields.
+2. Introduce active ReplaySession controller.
+3. Add WebSocket projection protocol.
+4. Build bars, BBO, DOM, trade stream, and base projection graph.
+5. Add StudyGraph and first L3 studies.
+6. Add journaling/training memory.
+7. Add levels and 0DTE/gamma heatmap.
+8. Add model studies and live mode later.
+```
+
+The next major product boundary is active `ReplaySession`: opening a validated `ReplayDataset` into a mutable replay controller that owns cursor, play/pause, speed, visibility profile, execution profile, simulated orders/fills, and projection subscriptions.
 
 The purpose of this sequence is to avoid painting ourselves into a corner. The Data Center proves data ownership. ReplaySession proves active simulation. StudyGraph proves extensibility. Levels/gamma and journaling then become natural extensions instead of rewrites.
 
-## 13. Source-of-Truth Decision
+## 14. Source-of-Truth Decision
 
 This document establishes the base direction:
 

@@ -14,77 +14,66 @@ const REQUEST_TIMEOUT_MS = 20_000
 
 type StorageKind = "raw_dbn" | "event_store" | "batch_index" | "trade_index" | "book_check" | string
 
-interface ApiMarketDay {
+type ApiMarketDayStatus = "missing" | "downloading" | "downloaded" | "preprocessing" | "ready" | "error"
+
+interface ApiDataCenterMarketDay {
   id: string
   root: string
-  contract_symbol: string
+  contract: string
   market_date: string
-  data_start_ns: number
-  data_end_ns: number
-  status: string
+  timezone: string
+  data_start_ns: string
+  data_start_iso: string
+  data_end_ns: string
+  data_end_iso: string
+  rth_start_ns: string
+  rth_start_iso: string
+  rth_end_ns: string
+  rth_end_iso: string
+  market_day_status: ApiMarketDayStatus
+  catalog_found: boolean
+  raw: ApiRawDataLayer
+  replay_dataset: ApiReplayDatasetLayer
 }
 
-interface ApiStoredObject {
+interface ApiObjectSummary {
   kind: StorageKind
   logical_key: string
   format: string
   schema_version: number
   content_sha256: string
   size_bytes: number
-  remote_bucket: string
   remote_key: string
-  producer: string | null
-  producer_version: string | null
-  source_provider: string | null
-  source_dataset: string | null
-  source_schema: string | null
-  source_symbol: string | null
-  metadata_json: Record<string, unknown>
 }
 
-interface ApiRawMarketDataRecord {
-  object: ApiStoredObject
-  provider: string
-  dataset: string
-  schema: string
-  source_symbol: string
+interface ApiRawDataLayer {
   status: "missing" | "available" | "error"
-  updated_at_ns: number
+  provider: string | null
+  dataset: string | null
+  schema: string | null
+  source_symbol: string | null
+  object: ApiObjectSummary | null
+  updated_at_ns: string | null
+  updated_at_iso: string | null
 }
 
-interface ApiReplayDatasetRecord {
-  id: string
-  raw_object_remote_key: string
+interface ApiReplayDatasetLayer {
   status: "missing" | "building" | "available" | "invalid"
-  schema_version: number
+  id: string | null
+  raw_object_key: string | null
+  schema_version: number | null
   producer: string | null
   producer_version: string | null
-  artifact_set_hash: string
-  updated_at_ns: number
+  artifact_set_hash: string | null
+  updated_at_ns: string | null
+  updated_at_iso: string | null
+  artifacts_available: boolean
+  objects_valid: boolean
+  artifacts: ApiReplayArtifact[]
+  validation: ApiValidationSummary | null
 }
 
-interface ApiValidationReportRecord {
-  mode: "light" | "full"
-  status: "valid" | "warning" | "invalid"
-  created_at_ns: number
-  report_json: {
-    counts?: {
-      event_count?: number
-      batch_count?: number
-      trade_count?: number
-    }
-    warnings?: string[]
-  }
-}
-
-interface ApiMarketDayRecord {
-  market_day: ApiMarketDay
-  raw: ApiRawMarketDataRecord | null
-  replay_dataset: ApiReplayDatasetRecord | null
-  last_validation: ApiValidationReportRecord | null
-}
-
-interface ApiReplayDatasetObjectStatus {
+interface ApiReplayArtifact {
   kind: StorageKind
   remote_key: string | null
   size_bytes: number | null
@@ -92,11 +81,15 @@ interface ApiReplayDatasetObjectStatus {
   object_valid: boolean
 }
 
-interface ApiReplayDatasetStatus extends ApiMarketDayRecord {
-  catalog_found: boolean
-  replay_artifacts_available: boolean
-  replay_objects_valid: boolean
-  objects: ApiReplayDatasetObjectStatus[]
+interface ApiValidationSummary {
+  mode: "light" | "full"
+  status: "valid" | "warning" | "invalid"
+  created_at_ns: string
+  created_at_iso: string
+  event_count: number | null
+  batch_count: number | null
+  trade_count: number | null
+  warnings: string[]
 }
 
 interface ApiCreateJobResponse {
@@ -112,13 +105,13 @@ interface RequestOptions extends RequestInit {
 }
 
 export async function fetchMarketDays(): Promise<MarketDay[]> {
-  const records = await request<ApiMarketDayRecord[]>("/market-days")
-  return records.map((record) => mapMarketDay(record, null))
+  const records = await request<ApiDataCenterMarketDay[]>("/market-days")
+  return records.map(mapMarketDay)
 }
 
 export async function fetchMarketDayStatus(day: MarketDay): Promise<MarketDay> {
-  const status = await request<ApiReplayDatasetStatus>(marketDayPath(day, ""))
-  return mapMarketDay(status, status)
+  const status = await request<ApiDataCenterMarketDay>(marketDayPath(day, ""))
+  return mapMarketDay(status)
 }
 
 export async function prepareReplayDataset(contract: string, marketDate: string): Promise<JobRecord> {
@@ -166,7 +159,15 @@ export async function fetchJob(jobId: string): Promise<JobRecord> {
 }
 
 export async function fetchActiveJobs(): Promise<JobRecord[]> {
-  return request<JobRecord[]>("/jobs")
+  return request<JobRecord[]>("/jobs?active=true")
+}
+
+export async function fetchRecentJobs(limit = 25): Promise<JobRecord[]> {
+  return request<JobRecord[]>(`/jobs?active=false&limit=${limit}`)
+}
+
+export async function fetchMarketDayJobs(day: MarketDay, limit = 25): Promise<JobRecord[]> {
+  return request<JobRecord[]>(`${marketDayPath(day, "jobs")}?active=false&limit=${limit}`)
 }
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
@@ -209,109 +210,94 @@ async function errorMessage(response: Response) {
   }
 }
 
-function mapMarketDay(record: ApiMarketDayRecord, status: ApiReplayDatasetStatus | null): MarketDay {
-  const marketDay = record.market_day
+function mapMarketDay(record: ApiDataCenterMarketDay): MarketDay {
   const rawData = rawSummary(record.raw)
-  const replayDataset = datasetSummary(record, status)
+  const replayDataset = datasetSummary(record)
 
   return {
-    id: marketDay.id,
-    symbol: marketDay.root === "ES" ? "ES" : "ES",
-    contract: marketDay.contract_symbol,
-    marketDate: marketDay.market_date,
-    sessionStart: formatNs(marketDay.data_start_ns),
-    sessionEnd: formatNs(marketDay.data_end_ns),
+    id: record.id,
+    symbol: record.root === "ES" ? "ES" : "ES",
+    contract: record.contract,
+    marketDate: record.market_date,
+    sessionStart: formatIso(record.data_start_iso),
+    sessionEnd: formatIso(record.data_end_iso),
     source: "Databento",
-    status: statusToViewStatus(record, status),
+    status: statusToViewStatus(record),
     rawData,
     replayDataset,
   }
 }
 
-function statusToViewStatus(record: ApiMarketDayRecord, status: ApiReplayDatasetStatus | null): MarketDayStatus {
-  if (record.market_day.status === "downloading" || record.market_day.status === "preprocessing") return "loading"
-  if (record.last_validation?.status === "invalid" || record.replay_dataset?.status === "invalid") return "invalid"
-  if (record.last_validation?.status === "warning") return "warning"
-  if (record.last_validation?.status === "valid") return "ready"
-  if (status?.replay_objects_valid) return "ready"
-  if (record.replay_dataset?.status === "available") return "replay"
-  if (record.raw?.status === "available") return "raw"
+function statusToViewStatus(record: ApiDataCenterMarketDay): MarketDayStatus {
+  const validation = record.replay_dataset.validation
+  if (record.market_day_status === "downloading" || record.market_day_status === "preprocessing") return "loading"
+  if (validation?.status === "invalid" || record.replay_dataset.status === "invalid") return "invalid"
+  if (validation?.status === "warning") return "warning"
+  if (validation?.status === "valid") return "ready"
+  if (record.replay_dataset.objects_valid) return "ready"
+  if (record.replay_dataset.status === "available") return "replay"
+  if (record.raw.status === "available") return "raw"
   return "missing"
 }
 
-function rawSummary(raw: ApiRawMarketDataRecord | null): RawDataSummary {
-  if (!raw) {
-    return {
-      status: "missing",
-      provider: null,
-      dataset: null,
-      schema: null,
-      sourceSymbol: null,
-      remoteKey: null,
-      size: null,
-      sha256: null,
-      updatedAt: null,
-    }
-  }
-
+function rawSummary(raw: ApiRawDataLayer): RawDataSummary {
   return {
     status: raw.status,
     provider: raw.provider,
     dataset: raw.dataset,
     schema: raw.schema,
     sourceSymbol: raw.source_symbol,
-    remoteKey: raw.object.remote_key,
-    size: formatBytes(raw.object.size_bytes),
-    sha256: raw.object.content_sha256,
-    updatedAt: formatNs(raw.updated_at_ns),
+    remoteKey: raw.object?.remote_key ?? null,
+    size: formatBytes(raw.object?.size_bytes ?? null),
+    sha256: raw.object?.content_sha256 ?? null,
+    updatedAt: formatIso(raw.updated_at_iso),
   }
 }
 
-function datasetSummary(record: ApiMarketDayRecord, status: ApiReplayDatasetStatus | null): ReplayDatasetSummary {
-  const artifacts = artifactMap(status)
-  const counts = record.last_validation?.report_json.counts
-  const warnings = record.last_validation?.report_json.warnings ?? []
+function datasetSummary(record: ApiDataCenterMarketDay): ReplayDatasetSummary {
   const replayDataset = record.replay_dataset
+  const validation = replayDataset.validation
 
   return {
-    status: replayDataset?.status ?? "missing",
-    id: replayDataset?.id ?? null,
-    rawObjectKey: replayDataset?.raw_object_remote_key ?? null,
-    eventCount: counts?.event_count ?? null,
-    batchCount: counts?.batch_count ?? null,
-    tradeCount: counts?.trade_count ?? null,
+    status: replayDataset.status,
+    id: replayDataset.id,
+    rawObjectKey: replayDataset.raw_object_key,
+    eventCount: validation?.event_count ?? null,
+    batchCount: validation?.batch_count ?? null,
+    tradeCount: validation?.trade_count ?? null,
     firstEventTime: null,
     lastEventTime: null,
-    lastValidatedAt: record.last_validation ? formatNs(record.last_validation.created_at_ns) : null,
-    trustSummary: trustSummary(record, status),
-    warnings,
-    artifacts,
+    lastValidatedAt: formatIso(validation?.created_at_iso ?? null),
+    trustSummary: trustSummary(record),
+    warnings: validation?.warnings ?? [],
+    artifacts: artifactMap(replayDataset.artifacts),
   }
 }
 
-function trustSummary(record: ApiMarketDayRecord, status: ApiReplayDatasetStatus | null) {
-  if (record.last_validation?.status === "valid") return "ReplayDataset has a persisted validation report."
-  if (record.last_validation?.status === "warning") return "ReplayDataset is usable but has validation warnings."
-  if (record.replay_dataset?.status === "available") {
-    return status?.replay_objects_valid
+function trustSummary(record: ApiDataCenterMarketDay) {
+  const validation = record.replay_dataset.validation
+  if (validation?.status === "valid") return "ReplayDataset has a persisted validation report."
+  if (validation?.status === "warning") return "ReplayDataset is usable but has validation warnings."
+  if (record.replay_dataset.status === "available") {
+    return record.replay_dataset.objects_valid
       ? "ReplayDataset artifacts are durable in R2 and available for validation or replay-session staging."
       : "ReplayDataset artifact metadata exists, but one or more R2 objects failed verification."
   }
-  if (record.raw?.status === "available") return "Raw market data is durable in R2. ReplayDataset can be built without redownloading."
+  if (record.raw.status === "available") return "Raw market data is durable in R2. ReplayDataset can be built without redownloading."
   return "No raw market data or replay dataset is available for this MarketDay."
 }
 
-function artifactMap(status: ApiReplayDatasetStatus | null): Record<ArtifactKey, ReplayArtifact> {
+function artifactMap(artifacts: ApiReplayArtifact[]): Record<ArtifactKey, ReplayArtifact> {
   return {
-    events: artifactFromStatus(status, "event_store"),
-    batches: artifactFromStatus(status, "batch_index"),
-    trades: artifactFromStatus(status, "trade_index"),
-    bookCheck: artifactFromStatus(status, "book_check"),
+    events: artifactFromStatus(artifacts, "event_store"),
+    batches: artifactFromStatus(artifacts, "batch_index"),
+    trades: artifactFromStatus(artifacts, "trade_index"),
+    bookCheck: artifactFromStatus(artifacts, "book_check"),
   }
 }
 
-function artifactFromStatus(status: ApiReplayDatasetStatus | null, kind: StorageKind): ReplayArtifact {
-  const object = status?.objects.find((item) => item.kind === kind)
+function artifactFromStatus(artifacts: ApiReplayArtifact[], kind: StorageKind): ReplayArtifact {
+  const object = artifacts.find((item) => item.kind === kind)
   if (!object) return artifact("missing", null, null, null, null)
   if (object.object_valid) {
     return artifact("valid", object.remote_key, null, object.size_bytes, object.content_sha256)
@@ -356,9 +342,10 @@ function formatBytes(bytes: number | null) {
   }).format(bytes)
 }
 
-function formatNs(ns: number) {
-  if (!Number.isFinite(ns) || ns <= 0) return "-"
-  const date = new Date(Math.floor(ns / 1_000_000))
+function formatIso(iso: string | null) {
+  if (!iso) return "-"
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return "-"
   return new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York",
     year: "numeric",

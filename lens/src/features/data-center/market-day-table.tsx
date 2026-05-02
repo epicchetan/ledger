@@ -1,4 +1,6 @@
-import { Database, MoreVertical, RefreshCw, ShieldCheck, Trash2 } from "lucide-react"
+import type { Column, ColumnDef } from "@tanstack/react-table"
+import { ArrowUpDown, Database, MoreVertical, RefreshCw, ScrollText, ShieldCheck, Trash2 } from "lucide-react"
+import { useMemo } from "react"
 
 import { Button } from "@/components/ui/button"
 import {
@@ -9,6 +11,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card"
+import { DataTable } from "@/features/data-center/data-table"
 import { DatasetStatusBadge } from "@/features/data-center/dataset-status-badge"
 import { statusLabel } from "@/features/data-center/status-labels"
 import type { ArtifactKey, DatasetAction, MarketDay, RawDataSummary, ReplayArtifact } from "@/features/data-center/types"
@@ -31,69 +34,96 @@ function formatCount(value: number | null) {
 }
 
 export function MarketDayTable({ days, activeJobDayIds, onAction }: MarketDayTableProps) {
+  const columns = useMemo<ColumnDef<MarketDay>[]>(
+    () => [
+      {
+        id: "marketDate",
+        accessorFn: (day) => day.marketDate,
+        header: ({ column }) => <SortableHeader column={column} label="Date" />,
+        cell: ({ row }) => (
+          <div>
+            <div className="font-medium text-foreground">{row.original.marketDate}</div>
+            <div className="text-[0.68rem] text-muted-foreground">{row.original.sessionStart}</div>
+          </div>
+        ),
+      },
+      {
+        id: "contract",
+        accessorFn: (day) => day.contract,
+        header: ({ column }) => <SortableHeader column={column} label="Contract" />,
+        cell: ({ row }) => <div className="text-muted-foreground">{row.original.contract}</div>,
+      },
+      {
+        id: "rawData",
+        accessorFn: (day) => day.rawData.status,
+        header: ({ column }) => <SortableHeader column={column} label="Raw Data" />,
+        cell: ({ row }) => <RawHover raw={row.original.rawData} />,
+      },
+      {
+        id: "replayDataset",
+        accessorFn: (day) => day.replayDataset.status,
+        header: ({ column }) => <SortableHeader column={column} label="Replay Dataset" />,
+        cell: ({ row }) => <ReplayHover day={row.original} />,
+      },
+      ...artifactColumns.map<ColumnDef<MarketDay>>((artifactColumn) => ({
+        id: artifactColumn.key,
+        header: artifactColumn.label,
+        enableSorting: false,
+        cell: ({ row }) => (
+          <ArtifactHover label={artifactColumn.label} artifact={row.original.replayDataset.artifacts[artifactColumn.key]} />
+        ),
+      })),
+      {
+        id: "events",
+        accessorFn: (day) => day.replayDataset.eventCount ?? -1,
+        header: ({ column }) => <SortableHeader column={column} label="Events" />,
+        cell: ({ row }) => (
+          <div className="text-muted-foreground">{formatCount(row.original.replayDataset.eventCount)}</div>
+        ),
+      },
+      {
+        id: "validation",
+        accessorFn: (day) => day.replayDataset.lastValidatedAt ?? "",
+        header: ({ column }) => <SortableHeader column={column} label="Validation" />,
+        cell: ({ row }) => <ValidationCell day={row.original} />,
+      },
+      {
+        id: "actions",
+        header: "",
+        enableSorting: false,
+        cell: ({ row }) => (
+          <div className="text-right">
+            <RowActions day={row.original} active={activeJobDayIds.has(row.original.id)} onAction={onAction} />
+          </div>
+        ),
+      },
+    ],
+    [activeJobDayIds, onAction],
+  )
+
   return (
     <div className="min-h-0 overflow-hidden border border-border bg-card/40">
-      <div className="grid grid-cols-[1fr_auto] items-center border-b border-border px-3 py-2">
-        <div>
-          <h2 className="text-sm font-semibold">Market Days</h2>
-          <p className="text-xs text-muted-foreground">Layer 1 raw data and Layer 2 replay datasets in durable R2 storage.</p>
-        </div>
-        <div className="text-xs text-muted-foreground">{days.length} days</div>
-      </div>
-
-      <div className="thin-scrollbar max-h-[calc(100svh-12.5rem)] overflow-auto">
-        <table className="w-full min-w-[1120px] border-collapse text-left text-xs">
-          <thead className="sticky top-0 z-10 bg-card text-[0.68rem] uppercase text-muted-foreground">
-            <tr className="[&_th]:border-b [&_th]:border-border [&_th]:px-3 [&_th]:py-2 [&_th]:font-medium">
-              <th>Date</th>
-              <th>Contract</th>
-              <th>Raw Data</th>
-              <th>Replay Dataset</th>
-              {artifactColumns.map((column) => (
-                <th key={column.key}>{column.label}</th>
-              ))}
-              <th>Events</th>
-              <th>Validation</th>
-              <th className="w-10" />
-            </tr>
-          </thead>
-          <tbody>
-            {days.map((day) => (
-              <tr key={day.id} className="border-b border-border/70 transition-colors hover:bg-muted/35">
-                <td className="px-3 py-2.5 align-middle">
-                  <div className="font-medium text-foreground">{day.marketDate}</div>
-                  <div className="text-[0.68rem] text-muted-foreground">{day.sessionStart}</div>
-                </td>
-                <td className="px-3 py-2.5 align-middle text-muted-foreground">{day.contract}</td>
-                <td className="px-3 py-2.5 align-middle">
-                  <RawHover raw={day.rawData} />
-                </td>
-                <td className="px-3 py-2.5 align-middle">
-                  <ReplayHover day={day} />
-                </td>
-                {artifactColumns.map((column) => {
-                  const artifact = day.replayDataset.artifacts[column.key]
-                  return (
-                    <td key={column.key} className="px-3 py-2.5 align-middle">
-                      <ArtifactHover label={column.label} artifact={artifact} />
-                    </td>
-                  )
-                })}
-                <td className="px-3 py-2.5 align-middle text-muted-foreground">
-                  {formatCount(day.replayDataset.eventCount)}
-                </td>
-                <td className="px-3 py-2.5 align-middle">
-                  <ValidationCell day={day} />
-                </td>
-                <td className="px-3 py-2.5 align-middle text-right">
-                  <RowActions day={day} active={activeJobDayIds.has(day.id)} onAction={onAction} />
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <DataTable
+        columns={columns}
+        data={days}
+        emptyMessage="No market days found."
+        getRowId={(day) => day.id}
+        initialSorting={[{ id: "marketDate", desc: true }]}
+      />
     </div>
+  )
+}
+
+function SortableHeader<TData, TValue>({ column, label }: { column: Column<TData, TValue>; label: string }) {
+  return (
+    <button
+      type="button"
+      className="-ml-1 inline-flex h-6 items-center gap-1 px-1 text-[0.68rem] uppercase text-muted-foreground transition-colors hover:text-foreground"
+      onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
+    >
+      {label}
+      <ArrowUpDown className="size-3" />
+    </button>
   )
 }
 
@@ -222,6 +252,10 @@ function RowActions({
         <DropdownMenuItem disabled={!hasReplay} onSelect={() => onAction(day, "validate")}>
           <ShieldCheck className="size-3.5" />
           Validate Full
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => onAction(day, "history")}>
+          <ScrollText className="size-3.5" />
+          Job History
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem disabled={!hasReplay} className="text-red-300 focus:text-red-200" onSelect={() => onAction(day, "deleteReplay")}>

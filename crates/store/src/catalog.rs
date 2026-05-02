@@ -1194,9 +1194,33 @@ impl SqliteCatalog {
         Ok(job)
     }
 
-    pub fn jobs(&self, active_only: bool) -> Result<Vec<LedgerJobRecord>> {
+    pub fn active_job_for_market_day(
+        &self,
+        market_day_id: &str,
+    ) -> Result<Option<LedgerJobRecord>> {
         let conn = self.conn.lock().unwrap();
-        let sql = if active_only {
+        let mut job = conn
+            .query_row(
+                "SELECT id, kind, status, market_day_id, created_at_ns, started_at_ns,
+                        finished_at_ns, request_json, result_json, error
+                 FROM jobs
+                 WHERE market_day_id = ?1 AND status IN ('queued', 'running')
+                 ORDER BY created_at_ns DESC
+                 LIMIT 1",
+                params![market_day_id],
+                row_to_job_record,
+            )
+            .optional()?;
+        drop(conn);
+        if let Some(job) = &mut job {
+            job.events = self.job_events(&job.id)?;
+        }
+        Ok(job)
+    }
+
+    pub fn jobs(&self, active_only: bool, limit: Option<usize>) -> Result<Vec<LedgerJobRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let base = if active_only {
             "SELECT id, kind, status, market_day_id, created_at_ns, started_at_ns,
                     finished_at_ns, request_json, result_json, error
              FROM jobs WHERE status IN ('queued', 'running')
@@ -1206,10 +1230,56 @@ impl SqliteCatalog {
                     finished_at_ns, request_json, result_json, error
              FROM jobs ORDER BY created_at_ns DESC"
         };
-        let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map([], row_to_job_record)?;
-        let mut jobs = rows.collect::<std::result::Result<Vec<_>, _>>()?;
-        drop(stmt);
+        let mut jobs = if let Some(limit) = limit {
+            let sql = format!("{base} LIMIT ?1");
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params![clamp_job_limit(limit)], row_to_job_record)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            let mut stmt = conn.prepare(base)?;
+            let rows = stmt.query_map([], row_to_job_record)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        drop(conn);
+        for job in &mut jobs {
+            job.events = self.job_events(&job.id)?;
+        }
+        Ok(jobs)
+    }
+
+    pub fn jobs_for_market_day(
+        &self,
+        market_day_id: &str,
+        active_only: bool,
+        limit: Option<usize>,
+    ) -> Result<Vec<LedgerJobRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let base = if active_only {
+            "SELECT id, kind, status, market_day_id, created_at_ns, started_at_ns,
+                    finished_at_ns, request_json, result_json, error
+             FROM jobs
+             WHERE market_day_id = ?1 AND status IN ('queued', 'running')
+             ORDER BY created_at_ns DESC"
+        } else {
+            "SELECT id, kind, status, market_day_id, created_at_ns, started_at_ns,
+                    finished_at_ns, request_json, result_json, error
+             FROM jobs
+             WHERE market_day_id = ?1
+             ORDER BY created_at_ns DESC"
+        };
+        let mut jobs = if let Some(limit) = limit {
+            let sql = format!("{base} LIMIT ?2");
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                params![market_day_id, clamp_job_limit(limit)],
+                row_to_job_record,
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            let mut stmt = conn.prepare(base)?;
+            let rows = stmt.query_map(params![market_day_id], row_to_job_record)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
         drop(conn);
         for job in &mut jobs {
             job.events = self.job_events(&job.id)?;
@@ -1218,7 +1288,7 @@ impl SqliteCatalog {
     }
 
     pub fn mark_stale_jobs_failed(&self, message: &str) -> Result<usize> {
-        let stale = self.jobs(true)?;
+        let stale = self.jobs(true, None)?;
         let mut count = 0;
         for job in stale {
             self.fail_job(&job.id, message)?;
@@ -1476,6 +1546,10 @@ fn row_to_job_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<LedgerJobRecor
         error: row.get(9)?,
         events: Vec::new(),
     })
+}
+
+fn clamp_job_limit(limit: usize) -> i64 {
+    limit.clamp(1, 100) as i64
 }
 
 fn row_to_job_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<LedgerJobEvent> {

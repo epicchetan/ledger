@@ -1,4 +1,5 @@
 import { AlertTriangle, RefreshCw, Send } from "lucide-react"
+import type { ReactNode } from "react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { toast } from "sonner"
 
@@ -10,16 +11,22 @@ import {
   fetchActiveJobs,
   fetchMarketDays,
   fetchMarketDayStatus,
+  fetchMarketDayJobs,
   fetchJob,
+  fetchRecentJobs,
   prepareReplayDataset,
   rebuildReplayDataset,
   validateReplayDataset,
 } from "@/features/data-center/api"
+import { ActiveJobTable, JobHistoryTable } from "@/features/data-center/job-table"
 import { MarketDayTable } from "@/features/data-center/market-day-table"
 import type { DataCenterLoadState, DatasetAction, JobRecord, MarketDay, MarketDayStatus } from "@/features/data-center/types"
 
 const JOB_POLL_MS = 1_500
 const JOB_IDLE_POLL_MS = 5_000
+const JOB_HISTORY_LIMIT = 25
+
+type DataCenterTab = "dataCenter" | "jobs"
 
 function updateDay(days: MarketDay[], nextDay: MarketDay) {
   return days.map((day) => (day.id === nextDay.id ? nextDay : day))
@@ -31,10 +38,14 @@ function errorMessage(error: unknown) {
 
 export function DataCenter() {
   const [days, setDays] = useState<MarketDay[]>([])
+  const [activeTab, setActiveTab] = useState<DataCenterTab>("dataCenter")
   const [pendingPrepare, setPendingPrepare] = useState(false)
   const [prepareContract, setPrepareContract] = useState("ESH6")
   const [prepareDate, setPrepareDate] = useState("")
   const [jobs, setJobs] = useState<JobRecord[]>([])
+  const [recentJobs, setRecentJobs] = useState<JobRecord[]>([])
+  const [historyScope, setHistoryScope] = useState<{ title: string; jobs: JobRecord[] } | null>(null)
+  const [historyLoading, setHistoryLoading] = useState(false)
   const refreshGeneration = useRef(0)
   const hadActiveJobs = useRef(false)
   const [loadState, setLoadState] = useState<DataCenterLoadState>({
@@ -48,18 +59,28 @@ export function DataCenter() {
     return activeJobs
   }, [])
 
+  const replaceRecentJobs = useCallback((nextJobs: JobRecord[]) => {
+    const completedJobs = nextJobs.filter((job) => !isActiveJob(job)).slice(0, 10)
+    setRecentJobs(completedJobs)
+    return completedJobs
+  }, [])
+
   const refresh = useCallback(async () => {
     const generation = refreshGeneration.current + 1
     refreshGeneration.current = generation
     setLoadState({ kind: "loading", message: "Loading cataloged market days from Ledger API." })
 
     try {
-      const nextDays = await fetchMarketDays()
-      const activeJobs = await fetchActiveJobs()
+      const [nextDays, activeJobs, recentJobs] = await Promise.all([
+        fetchMarketDays(),
+        fetchActiveJobs(),
+        fetchRecentJobs(JOB_HISTORY_LIMIT),
+      ])
       if (refreshGeneration.current !== generation) return
 
       setDays(nextDays)
       replaceActiveJobs(activeJobs)
+      replaceRecentJobs(recentJobs)
 
       if (nextDays.length === 0) {
         setLoadState({
@@ -83,7 +104,7 @@ export function DataCenter() {
         description: "Start ledger-api on 127.0.0.1:3001 or set VITE_LEDGER_API_URL.",
       })
     }
-  }, [replaceActiveJobs])
+  }, [replaceActiveJobs, replaceRecentJobs])
 
   function hydrateStatuses(nextDays: MarketDay[], generation: number) {
     for (const day of nextDays) {
@@ -187,6 +208,8 @@ export function DataCenter() {
     try {
       if (action === "prepare") {
         await prepareMarketDay(day.contract, day.marketDate)
+      } else if (action === "history") {
+        await loadJobHistory(day)
       } else {
         const job = await startDatasetAction(day, action)
         toast.success(`${actionLabel(action)} job started`, {
@@ -202,9 +225,27 @@ export function DataCenter() {
     }
   }
 
+  async function loadJobHistory(day: MarketDay) {
+    setHistoryLoading(true)
+    setActiveTab("jobs")
+    setHistoryScope({ title: `${day.contract} ${day.marketDate} Job History`, jobs: [] })
+    try {
+      const jobs = await fetchMarketDayJobs(day, JOB_HISTORY_LIMIT)
+      setHistoryScope({ title: `${day.contract} ${day.marketDate} Job History`, jobs })
+    } catch (error) {
+      setHistoryScope(null)
+      toast.error("Job history failed", {
+        description: errorMessage(error),
+      })
+    } finally {
+      setHistoryLoading(false)
+    }
+  }
+
   const activeJobs = jobs.filter(isActiveJob)
   const activeJobsByDayId = useMemo(() => jobsByDayId(activeJobs), [activeJobs])
   const activeJobDayIds = useMemo(() => new Set(activeJobsByDayId.keys()), [activeJobsByDayId])
+  const visibleHistory = historyScope ?? { title: "Recent Activity", jobs: recentJobs }
   const displayDays = useMemo(
     () =>
       days.map((day) => {
@@ -216,34 +257,52 @@ export function DataCenter() {
 
   return (
     <div className="flex h-svh flex-col bg-background text-foreground">
-      <header className="flex h-10 shrink-0 items-center justify-between border-b-2 border-[rgba(255,255,255,0.15)] px-3">
+      <header className="flex min-h-10 shrink-0 flex-wrap items-center justify-between gap-2 border-b-2 border-[rgba(255,255,255,0.15)] px-3 py-1">
         <div className="flex min-w-0 items-center gap-3">
           <div className="text-sm font-semibold">Ledger</div>
           <div className="h-4 w-px bg-border" />
-          <div className="truncate text-xs text-muted-foreground">Data Center</div>
-          <ConnectionBadge state={loadState} />
+          <nav className="flex min-w-0 items-center gap-1">
+            <HeaderTab active={activeTab === "dataCenter"} onClick={() => setActiveTab("dataCenter")}>
+              Data Center
+            </HeaderTab>
+            <HeaderTab active={activeTab === "jobs"} onClick={() => setActiveTab("jobs")}>
+              Jobs
+            </HeaderTab>
+          </nav>
         </div>
-        <Button type="button" variant="ghost" size="sm" onClick={() => void refresh()} disabled={loadState.kind === "loading"}>
-          <RefreshCw className={loadState.kind === "loading" ? "size-3.5 animate-spin" : "size-3.5"} />
-          Refresh
-        </Button>
+        {activeTab === "dataCenter" ? (
+          <PrepareControls
+            contract={prepareContract}
+            marketDate={prepareDate}
+            pending={pendingPrepare}
+            onContractChange={setPrepareContract}
+            onDateChange={setPrepareDate}
+            onPrepare={() => void prepareMarketDay(prepareContract, prepareDate)}
+          />
+        ) : null}
       </header>
 
-      <PrepareBar
-        contract={prepareContract}
-        marketDate={prepareDate}
-        pending={pendingPrepare}
-        onContractChange={setPrepareContract}
-        onDateChange={setPrepareDate}
-        onPrepare={() => void prepareMarketDay(prepareContract, prepareDate)}
-      />
-
       <main className="flex min-h-0 flex-1 flex-col gap-3 p-3">
-        {activeJobs.length > 0 ? <JobActivity jobs={activeJobs} /> : null}
-        {loadState.kind === "error" || loadState.kind === "empty" ? (
-          <DataCenterStatePanel title={loadState.kind === "error" ? "API Error" : "No Market Days"} message={loadState.message} onRetry={loadState.kind === "error" ? refresh : undefined} />
+        {activeTab === "dataCenter" ? (
+          <>
+            {activeJobs.length > 0 ? <ActiveJobTable jobs={activeJobs} /> : null}
+            {loadState.kind === "error" || loadState.kind === "empty" ? (
+              <DataCenterStatePanel
+                title={loadState.kind === "error" ? "API Error" : "No Market Days"}
+                message={loadState.message}
+                onRetry={loadState.kind === "error" ? refresh : undefined}
+              />
+            ) : (
+              <MarketDayTable days={displayDays} activeJobDayIds={activeJobDayIds} onAction={runAction} />
+            )}
+          </>
         ) : (
-          <MarketDayTable days={displayDays} activeJobDayIds={activeJobDayIds} onAction={runAction} />
+          <JobsTab
+            activeJobs={activeJobs}
+            history={visibleHistory}
+            historyLoading={historyLoading}
+            onClearHistory={historyScope ? () => setHistoryScope(null) : undefined}
+          />
         )}
       </main>
     </div>
@@ -287,6 +346,8 @@ function actionLabel(action: DatasetAction) {
       return "Delete ReplayDataset"
     case "deleteRaw":
       return "Delete Raw Data"
+    case "history":
+      return "Job History"
   }
 }
 
@@ -302,6 +363,8 @@ function startDatasetAction(day: MarketDay, action: DatasetAction) {
       return deleteReplayDataset(day)
     case "deleteRaw":
       return deleteRawMarketData(day)
+    case "history":
+      throw new Error("Job history is not a mutating dataset action")
   }
 }
 
@@ -313,7 +376,23 @@ function shortJobId(jobId: string) {
   return jobId.slice(0, 8)
 }
 
-function PrepareBar({
+function HeaderTab({ active, onClick, children }: { active: boolean; onClick: () => void; children: ReactNode }) {
+  return (
+    <button
+      type="button"
+      className={`h-8 border-b-2 px-2 text-xs transition-colors ${
+        active
+          ? "border-foreground text-foreground"
+          : "border-transparent text-muted-foreground hover:text-foreground"
+      }`}
+      onClick={onClick}
+    >
+      {children}
+    </button>
+  )
+}
+
+function PrepareControls({
   contract,
   marketDate,
   pending,
@@ -329,8 +408,7 @@ function PrepareBar({
   onPrepare: () => void
 }) {
   return (
-    <section className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border px-3 py-2">
-      <div className="mr-1 text-xs font-medium">Prepare MarketDay</div>
+    <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
       <Input
         className="h-7 w-24 text-xs uppercase"
         value={contract}
@@ -349,49 +427,27 @@ function PrepareBar({
         <Send className={pending ? "size-3.5 animate-pulse" : "size-3.5"} />
         Prepare
       </Button>
-    </section>
+    </div>
   )
 }
 
-function JobActivity({ jobs }: { jobs: JobRecord[] }) {
+function JobsTab({
+  activeJobs,
+  history,
+  historyLoading,
+  onClearHistory,
+}: {
+  activeJobs: JobRecord[]
+  history: { title: string; jobs: JobRecord[] }
+  historyLoading: boolean
+  onClearHistory?: () => void
+}) {
   return (
-    <section className="border border-border bg-card/40">
-      <div className="border-b border-border px-3 py-2">
-        <h2 className="text-sm font-semibold">Jobs</h2>
-      </div>
-      <div className="divide-y divide-border">
-        {jobs.map((job) => {
-          const latest = job.error ?? job.progress.at(-1) ?? "queued"
-          return (
-            <div key={job.id} className="grid grid-cols-[minmax(0,1fr)_auto] gap-3 px-3 py-2 text-xs">
-              <div className="min-w-0">
-                <div className="truncate font-medium">
-                  {job.kind} <span className="text-muted-foreground">{shortJobId(job.id)}</span>
-                </div>
-                <div className="mt-1 truncate text-muted-foreground" title={latest}>
-                  {latest}
-                </div>
-              </div>
-              <div className="self-start border border-border px-1.5 py-0.5 text-[0.68rem] text-muted-foreground">
-                {job.status}
-              </div>
-            </div>
-          )
-        })}
-      </div>
-    </section>
+    <>
+      {activeJobs.length > 0 ? <ActiveJobTable jobs={activeJobs} /> : null}
+      <JobHistoryTable title={history.title} jobs={history.jobs} loading={historyLoading} onClear={onClearHistory} />
+    </>
   )
-}
-
-function ConnectionBadge({ state }: { state: DataCenterLoadState }) {
-  const tone =
-    state.kind === "ready"
-      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
-      : state.kind === "error"
-        ? "border-red-400/35 bg-red-400/10 text-red-300"
-        : "border-border bg-muted/20 text-muted-foreground"
-
-  return <div className={`hidden border px-1.5 py-0.5 text-[0.68rem] sm:block ${tone}`}>{state.kind}</div>
 }
 
 function DataCenterStatePanel({
