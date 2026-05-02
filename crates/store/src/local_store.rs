@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use ledger_domain::{now_ns, MarketDay, StorageKind};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 use tokio::io::AsyncWriteExt;
 
 #[derive(Clone, Debug)]
@@ -18,43 +20,7 @@ impl LocalStore {
     }
 
     pub fn catalog_path(&self) -> PathBuf {
-        self.root.join("catalog.sqlite")
-    }
-
-    pub fn legacy_raw_dbn_path(
-        &self,
-        dataset: &str,
-        schema: &str,
-        root: &str,
-        symbol: &str,
-        market_date: &str,
-    ) -> PathBuf {
-        self.root
-            .join("raw")
-            .join("databento")
-            .join(dataset)
-            .join(schema)
-            .join(root)
-            .join(symbol)
-            .join(format!("{market_date}.dbn.zst"))
-    }
-
-    pub fn replay_dataset_dir(&self, root: &str, symbol: &str, market_date: &str) -> PathBuf {
-        self.root
-            .join("sessions")
-            .join(root)
-            .join(symbol)
-            .join(market_date)
-    }
-
-    pub fn replay_dataset_artifact_path(
-        &self,
-        md: &MarketDay,
-        kind: StorageKind,
-    ) -> Result<PathBuf> {
-        Ok(self
-            .replay_dataset_dir(&md.root, &md.contract_symbol, &md.market_date.to_string())
-            .join(replay_file_name(kind)?))
+        self.root.join("ledger.sqlite")
     }
 
     pub fn ingest_run_dir(&self, md: &MarketDay, run_id: impl ToString) -> PathBuf {
@@ -75,6 +41,31 @@ impl LocalStore {
         self.ingest_run_dir(md, run_id).join("artifacts")
     }
 
+    pub fn validate_run_dir(&self, md: &MarketDay, run_id: impl ToString) -> PathBuf {
+        self.root
+            .join("tmp")
+            .join("validate")
+            .join(&md.root)
+            .join(&md.contract_symbol)
+            .join(md.market_date.to_string())
+            .join(run_id.to_string())
+    }
+
+    pub fn validate_artifact_path(
+        &self,
+        md: &MarketDay,
+        run_id: impl ToString,
+        kind: StorageKind,
+    ) -> Result<PathBuf> {
+        Ok(self
+            .validate_run_dir(md, run_id)
+            .join(replay_file_name(kind)?))
+    }
+
+    pub fn tmp_dir(&self) -> PathBuf {
+        self.root.join("tmp")
+    }
+
     pub fn new_ingest_run_label(&self) -> String {
         now_ns().to_string()
     }
@@ -87,25 +78,25 @@ impl LocalStore {
         Ok(())
     }
 
-    pub async fn commit_file_atomic(&self, source: &Path, dest: &Path) -> Result<()> {
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+    pub async fn cleanup_validate_run(&self, md: &MarketDay, run_id: impl ToString) -> Result<()> {
+        let dir = self.validate_run_dir(md, run_id);
+        if dir.exists() {
+            tokio::fs::remove_dir_all(dir).await?;
         }
-        let tmp = tmp_path(dest);
-        if tmp.exists() {
-            tokio::fs::remove_file(&tmp).await.ok();
-        }
-        tokio::fs::copy(source, &tmp).await.with_context(|| {
-            format!(
-                "copying complete file {} -> {}",
-                source.display(),
-                tmp.display()
-            )
-        })?;
-        tokio::fs::rename(&tmp, dest)
-            .await
-            .with_context(|| format!("renaming {} -> {}", tmp.display(), dest.display()))?;
         Ok(())
+    }
+
+    pub fn cleanup_tmp(&self, older_than: Option<Duration>) -> Result<CleanupTmpReport> {
+        let tmp = self.tmp_dir();
+        let mut report = CleanupTmpReport {
+            root: tmp.clone(),
+            ..Default::default()
+        };
+        if !tmp.exists() {
+            return Ok(report);
+        }
+        cleanup_tmp_entries(&tmp, older_than, &mut report)?;
+        Ok(report)
     }
 
     pub async fn hydrate_atomic<F, Fut>(&self, dest: &Path, hydrate: F) -> Result<()>
@@ -125,27 +116,6 @@ impl LocalStore {
             .await
             .with_context(|| format!("renaming {} -> {}", tmp.display(), dest.display()))?;
         Ok(())
-    }
-
-    pub fn legacy_artifacts_dir(&self, root: &str, symbol: &str, market_date: &str) -> PathBuf {
-        self.root
-            .join("artifacts")
-            .join(root)
-            .join(symbol)
-            .join(market_date)
-    }
-
-    pub fn legacy_artifact_path(&self, md: &MarketDay, kind: StorageKind) -> PathBuf {
-        let file_name = match kind {
-            StorageKind::EventStore => "events.v1.bin",
-            StorageKind::BatchIndex => "batches.v1.bin",
-            StorageKind::TradeIndex => "trades.v1.bin",
-            StorageKind::BookCheck => "book_check.v1.json",
-            StorageKind::RawDbn => "raw.dbn.zst",
-            StorageKind::Other(_) => "artifact.bin",
-        };
-        self.legacy_artifacts_dir(&md.root, &md.contract_symbol, &md.market_date.to_string())
-            .join(file_name)
     }
 
     pub async fn write_atomic(&self, path: &Path, bytes: &[u8]) -> Result<()> {
@@ -180,4 +150,53 @@ pub fn tmp_path(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(".part");
     PathBuf::from(s)
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CleanupTmpReport {
+    pub root: PathBuf,
+    pub deleted_files: usize,
+    pub deleted_dirs: usize,
+    pub bytes_deleted: u64,
+}
+
+fn cleanup_tmp_entries(
+    dir: &Path,
+    older_than: Option<Duration>,
+    report: &mut CleanupTmpReport,
+) -> Result<bool> {
+    let mut empty = true;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            if cleanup_tmp_entries(&path, older_than, report)? && eligible(&metadata, older_than) {
+                std::fs::remove_dir(&path)?;
+                report.deleted_dirs += 1;
+            } else {
+                empty = false;
+            }
+        } else if eligible(&metadata, older_than) {
+            let bytes = metadata.len();
+            std::fs::remove_file(&path)?;
+            report.deleted_files += 1;
+            report.bytes_deleted += bytes;
+        } else {
+            empty = false;
+        }
+    }
+    Ok(empty)
+}
+
+fn eligible(metadata: &std::fs::Metadata, older_than: Option<Duration>) -> bool {
+    let Some(older_than) = older_than else {
+        return true;
+    };
+    let Ok(modified_at) = metadata.modified() else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(modified_at)
+        .is_ok_and(|age| age >= older_than)
 }

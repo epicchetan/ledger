@@ -317,6 +317,25 @@ impl ObjectStore for R2ObjectStore {
         })
     }
 
+    async fn get_bytes(&self, key: &str) -> Result<Vec<u8>> {
+        let client = self.client().await?.clone();
+        let out = client
+            .get_object()
+            .bucket(self.bucket())
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("reading s3://{}/{}", self.bucket(), key))?;
+        let bytes = out
+            .body
+            .collect()
+            .await
+            .with_context(|| format!("collecting s3://{}/{}", self.bucket(), key))?
+            .into_bytes()
+            .to_vec();
+        Ok(bytes)
+    }
+
     async fn head(&self, key: &str) -> Result<Option<RemoteObject>> {
         let client = self.client().await?.clone();
         let res = client
@@ -348,6 +367,50 @@ impl ObjectStore for R2ObjectStore {
                 }
             }
         }
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let client = self.client().await?.clone();
+        let mut continuation_token = None;
+        let mut keys = Vec::new();
+
+        loop {
+            let out = client
+                .list_objects_v2()
+                .bucket(self.bucket())
+                .prefix(prefix)
+                .set_continuation_token(continuation_token)
+                .send()
+                .await
+                .with_context(|| format!("listing s3://{}/{}*", self.bucket(), prefix))?;
+
+            for object in out.contents() {
+                if let Some(key) = object.key() {
+                    keys.push(key.to_string());
+                }
+            }
+
+            if out.is_truncated().unwrap_or(false) {
+                continuation_token = out.next_continuation_token().map(str::to_string);
+            } else {
+                break;
+            }
+        }
+
+        keys.sort();
+        Ok(keys)
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        let client = self.client().await?.clone();
+        client
+            .delete_object()
+            .bucket(self.bucket())
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("deleting s3://{}/{}", self.bucket(), key))?;
+        Ok(())
     }
 
     fn bucket(&self) -> &str {

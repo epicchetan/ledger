@@ -12,72 +12,46 @@ This directory is ignored by git.
 
 ```text
 data/
-  catalog.sqlite
-  sessions/
+  ledger.sqlite
   tmp/
 ```
 
-## `catalog.sqlite`
+## `ledger.sqlite`
 
-`catalog.sqlite` is the local SQLite catalog.
+`ledger.sqlite` is the local Ledger control-plane database.
 
 It records:
 
 ```text
 known market days
-durable R2 objects
-artifact dependencies
-loaded replay dataset files
-ingest runs
+durable R2 object keys, sizes, and hashes
+raw/replay layer records
+validation reports
+job records and job events
 ```
 
-CLI commands like `status` and `list` read this catalog. The catalog is not currently backed up. If it is deleted, R2 blobs remain durable, but Ledger will not automatically rebuild the catalog from R2 in this phase.
+Do not delete this file casually. R2 keeps the large blobs, but SQLite owns the
+catalog that tells Ledger which blobs matter.
 
-## `sessions/`
+## `tmp/`
 
-`sessions/` is the replay dataset cache. The directory name is historical; the
-contents are immutable `ReplayDataset` artifacts, not active `ReplaySession`
-state.
+`tmp/` is disposable job staging.
 
-Example:
+Examples:
 
 ```text
-data/sessions/ES/ESH6/2026-03-12/
+data/tmp/ingest/ES/ESH6/2026-03-12/<run-id>/
+  raw.dbn.zst
+  artifacts/
+
+data/tmp/validate/ES/ESH6/2026-03-12/<run-id>/
   events.v1.bin
   batches.v1.bin
   trades.v1.bin
   book_check.v1.json
 ```
 
-These files are local speed-ups for replay and replay dataset loading. They can
-be removed and later hydrated again from R2 by running:
-
-```bash
-cargo run -p ledger-cli -- session load --symbol ESH6 --date 2026-03-12
-```
-
-To decode the local artifacts, validate their indexes, compare `book_check`, and
-run a small replay probe:
-
-```bash
-cargo run -p ledger-cli -- session validate --symbol ESH6 --date 2026-03-12
-```
-
-Raw DBN files do not belong in `sessions/`.
-
-## `tmp/`
-
-`tmp/` is used during ingest.
-
-Example:
-
-```text
-data/tmp/ingest/ES/ESH6/2026-03-12/<run-id>/
-  raw.dbn.zst
-  artifacts/
-```
-
-Ingest writes incomplete work here first. After successful ingest, replay artifacts are committed into `sessions/` and the ingest temp directory is deleted.
+It is safe to remove `tmp/` when API/jobs are stopped.
 
 ## Commit Hygiene
 

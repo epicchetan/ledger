@@ -31,9 +31,9 @@ MarketDay
   For ES: prior day 18:00 ET → market date 17:00 ET.
 
 ReplayDataset
-  Immutable local replay inputs for a MarketDay.
+  Immutable replay inputs for a MarketDay.
   Formerly called ReplaySession.
-  Contains hydrated/decoded artifacts: events, batches, trades, book-check, and future cached projections.
+  Durable Layer 2 artifacts: events, batches, trades, book-check, and future cached projections.
 
 ReplaySession
   Active mutable replay/training session.
@@ -82,11 +82,13 @@ The first Ledger API should therefore be a small Data Center API:
 ```text
 GET  /health
 GET  /market-days
-GET  /market-days/:symbol/:date/status
-POST /market-days/:symbol/:date/ingest
+GET  /market-days/:symbol/:date
+POST /market-days/:symbol/:date/prepare
+POST /market-days/:symbol/:date/replay/build
+POST /market-days/:symbol/:date/replay/validate
+DELETE /market-days/:symbol/:date/replay
+DELETE /market-days/:symbol/:date/raw
 GET  /jobs/:id
-POST /market-days/:symbol/:date/load
-POST /market-days/:symbol/:date/validate
 ```
 
 Replay controls and WebSockets come after Lens can download, validate, and trust data.
@@ -101,9 +103,8 @@ Recommended top-level statuses:
 
 ```text
 Missing
-Downloaded
-Hydrated
-Validated
+Raw Available
+ReplayDataset Available
 Ready to Train
 Ready with Warnings
 Invalid

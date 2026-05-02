@@ -1,127 +1,78 @@
 # Ledger Store Architecture
 
-Ledger separates durable storage, local catalog queries, replay dataset loading, and ingest staging.
-
-## Responsibilities
-
-`ledger-store` owns four things:
+Ledger storage now separates the local control plane from the durable data
+plane:
 
 ```text
-R2              durable immutable blobs
-SQLite          local operational catalog
-dataset cache   replay artifacts used by Ledger/replay
-tmp/staging     incomplete ingest work
+SQLite = local Ledger control plane
+R2     = durable large-object data plane
+tmp    = disposable job staging
 ```
 
-The important boundary is that the dataset cache is not a generic object cache. It contains only replay artifacts. Raw DBN is staged for ingest and stored durably in R2, but it is not kept as a replay cache file.
+SQLite owns catalog state, object metadata, jobs, validation summaries, and
+future journal/session/study state. R2 stores large immutable blobs. Normal code
+does not use R2 JSON manifests as a catalog.
+
+## Layers
+
+```text
+Layer 1: Raw Market Data
+  raw Databento DBN/ZST object in R2
+  expensive to recreate because it may require a paid download
+
+Layer 2: ReplayDataset
+  event_store, batch_index, trade_index, book_check objects in R2
+  derived from one raw object hash
+  cheap to delete and rebuild from Layer 1
+```
+
+## R2 Layout
+
+```text
+ledger/v1/market-days/ES/ESH6/2026-03-12/raw/databento/GLBX.MDP3/mbo/raw.sha256=<sha>.dbn.zst
+
+ledger/v1/market-days/ES/ESH6/2026-03-12/replay/raw=<raw-sha>/events.v1.bin
+ledger/v1/market-days/ES/ESH6/2026-03-12/replay/raw=<raw-sha>/batches.v1.bin
+ledger/v1/market-days/ES/ESH6/2026-03-12/replay/raw=<raw-sha>/trades.v1.bin
+ledger/v1/market-days/ES/ESH6/2026-03-12/replay/raw=<raw-sha>/book_check.v1.json
+```
+
+SQLite stores the exact R2 keys, sizes, hashes, schema versions, producers, and
+lineage relationships.
 
 ## Local Layout
 
 ```text
 data/
-  catalog.sqlite
-  sessions/
-    ES/ESH6/2026-03-12/
-      events.v1.bin
-      batches.v1.bin
-      trades.v1.bin
-      book_check.v1.json
+  ledger.sqlite
   tmp/
-    ingest/ES/ESH6/2026-03-12/<run-id>/
-      raw.dbn.zst
-      artifacts/
-        events.v1.bin
-        batches.v1.bin
-        trades.v1.bin
-        book_check.v1.json
+    ingest/
+    validate/
 ```
 
-## SQLite Catalog
+`tmp/` is disposable staging. Persistent replay caches are intentionally
+deferred until active replay needs them.
 
-SQLite lives at:
+## Lifecycle
 
 ```text
-data/catalog.sqlite
+prepare
+  -> ensure market_day row exists
+  -> ensure raw DBN exists in R2 and SQLite
+  -> build replay artifacts when missing or rebuild is requested
+  -> upload immutable R2 objects
+  -> write SQLite replay dataset/artifact rows
+  -> run validation
+  -> write SQLite validation report
+
+validate
+  -> look up replay artifact keys from SQLite
+  -> stage artifacts under data/tmp/validate/...
+  -> decode and run validation/probe
+  -> write SQLite validation report
+
+delete replay
+  -> delete Layer 2 objects from R2
+  -> delete replay dataset/artifact/validation rows from SQLite
+  -> preserve Layer 1 raw data
 ```
-
-It records:
-
-```text
-market_days              known MarketDays and readiness
-objects                  durable R2 objects, including raw_dbn
-object_dependencies      artifact lineage
-session_cache_entries    local replay artifact files only
-ingest_runs              local ingest attempts
-```
-
-The catalog is the query surface for CLI and application usage. Commands like `ledger list` and `ledger status` read SQLite.
-
-## R2 Objects
-
-R2 stores immutable blobs under content-addressed keys.
-
-Raw DBN:
-
-```text
-ledger/v1/raw/databento/GLBX.MDP3/mbo/ES/ESH6/2026-03-12/raw.sha256=<sha>.dbn.zst
-```
-
-Replay artifacts:
-
-```text
-ledger/v1/artifacts/ES/ESH6/2026-03-12/<kind>/schema=v1/input=<raw_sha>/producer=<version>/<file>
-```
-
-Ledger verifies uploaded and hydrated objects using size and SHA256 metadata. ETag is not treated as content identity.
-
-## Ingest Lifecycle
-
-```text
-download or hydrate raw DBN into data/tmp/
-  -> preprocess into data/tmp/.../artifacts/
-  -> hash each file
-  -> upload or reuse immutable R2 object
-  -> insert SQLite object rows
-  -> commit replay artifacts into data/sessions/
-  -> insert SQLite session_cache_entries rows
-  -> mark market day ready
-  -> delete ingest tmp directory
-```
-
-Only complete, verified replay artifacts are committed to `data/sessions/`.
-
-## Replay Dataset Loading
-
-`Ledger` loads a replay dataset through `ledger-store`.
-
-```text
-load replay dataset
-  -> query SQLite for ready replay artifacts
-  -> reuse valid data/sessions files when present
-  -> hydrate missing/corrupt artifacts from R2
-  -> validate size and SHA256
-  -> return ReplayDataset with local artifact paths
-```
-
-Callers should not request individual artifact hydration. Loading the replay
-dataset is the abstraction, and `ReplayDataset` can decode those local artifacts
-into an `EventStore`.
-
-`ledger-cli session validate` composes this loading boundary with local
-artifact decode/index validation, deterministic book-check comparison, and a
-bounded replay simulator probe. It is a validation tool for replay artifacts,
-not the future API/server surface.
-
-## Cache Pruning
-
-The replay dataset cache is pruned by least-recently-used market day. The default limit is:
-
-```text
-LEDGER_CACHE_MAX_SESSIONS=5
-```
-
-Pruning removes whole replay dataset directories under `data/sessions/`. It does not delete R2 objects, SQLite object rows, or raw DBN staging files.
-
-## Catalog Durability
-
-The SQLite catalog is not backed up in this phase. If `catalog.sqlite` is deleted, durable R2 blobs remain, but automatic catalog rebuild from R2 is out of scope. Rerun `ledger ingest` for a session to repopulate the local catalog.

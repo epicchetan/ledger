@@ -17,6 +17,10 @@ impl ObjectKeyBuilder {
         Self { prefix }
     }
 
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
     pub fn raw_dbn_logical_key(&self, md: &MarketDay, dataset: &str, schema: &str) -> String {
         format!(
             "raw:databento:{dataset}:{schema}:{}:{}:{}",
@@ -26,8 +30,8 @@ impl ObjectKeyBuilder {
 
     pub fn raw_dbn_key(&self, md: &MarketDay, dataset: &str, schema: &str, sha256: &str) -> String {
         format!(
-            "{}/raw/databento/{}/{}/{}/{}/{}/raw.sha256={}.dbn.zst",
-            self.prefix, dataset, schema, md.root, md.contract_symbol, md.market_date, sha256
+            "{}/market-days/{}/{}/{}/raw/databento/{}/{}/raw.sha256={}.dbn.zst",
+            self.prefix, md.root, md.contract_symbol, md.market_date, dataset, schema, sha256
         )
     }
 
@@ -41,23 +45,22 @@ impl ObjectKeyBuilder {
     pub fn artifact_key(
         &self,
         md: &MarketDay,
-        kind: &str,
-        schema_version: i64,
+        _kind: &str,
+        _schema_version: i64,
         input_sha256: &str,
-        producer_version: &str,
+        _producer_version: &str,
         file_name: &str,
     ) -> String {
         format!(
-            "{}/artifacts/{}/{}/{}/{}/schema=v{}/input={}/producer={}/{}",
-            self.prefix,
-            md.root,
-            md.contract_symbol,
-            md.market_date,
-            kind,
-            schema_version,
-            input_sha256,
-            sanitize_path_component(producer_version),
-            file_name
+            "{}/market-days/{}/{}/{}/replay/raw={}/{}",
+            self.prefix, md.root, md.contract_symbol, md.market_date, input_sha256, file_name
+        )
+    }
+
+    pub fn market_day_dir(&self, md: &MarketDay) -> String {
+        format!(
+            "{}/market-days/{}/{}/{}/",
+            self.prefix, md.root, md.contract_symbol, md.market_date
         )
     }
 }
@@ -84,11 +87,11 @@ mod tests {
         let keys = ObjectKeyBuilder::default();
         assert_eq!(
             keys.raw_dbn_key(&md, "GLBX.MDP3", "mbo", "abc"),
-            "ledger/v1/raw/databento/GLBX.MDP3/mbo/ES/ESH6/2026-03-12/raw.sha256=abc.dbn.zst"
+            "ledger/v1/market-days/ES/ESH6/2026-03-12/raw/databento/GLBX.MDP3/mbo/raw.sha256=abc.dbn.zst"
         );
         assert_eq!(
             keys.artifact_key(&md, "event_store", 1, "raw", "dev", "events.v1.bin"),
-            "ledger/v1/artifacts/ES/ESH6/2026-03-12/event_store/schema=v1/input=raw/producer=dev/events.v1.bin"
+            "ledger/v1/market-days/ES/ESH6/2026-03-12/replay/raw=raw/events.v1.bin"
         );
     }
 }

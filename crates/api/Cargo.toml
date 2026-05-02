@@ -1,19 +1,26 @@
 [package]
-name = "ledger"
+name = "ledger-api"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "ledger-api"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 chrono.workspace = true
-ledger-book = { path = "../book" }
+dotenvy.workspace = true
+ledger = { path = "../ledger" }
 ledger-domain = { path = "../domain" }
-ledger-ingest = { path = "../ingest" }
-ledger-replay = { path = "../replay" }
 ledger-store = { path = "../store" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tower-http.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tower.workspace = true

@@ -19,11 +19,10 @@ market day into the replay artifacts that the rest of Ledger can load.
 ## Boundaries
 
 This crate should not own persistence policy. R2 uploads, SQLite catalog state,
-replay-dataset cache paths, temp directory layout, and cache pruning belong to
-`ledger-store`.
+staging paths, and temp directory layout belong to `ledger-store`.
 
-This crate should not expose application or replay APIs. Loading a ready
-`ReplayDataset` for replay belongs to `ledger`, and execution simulation belongs to
+This crate should not expose application or replay APIs. Staging a ready
+`ReplayDataset` for validation or replay belongs to `ledger`, and execution simulation belongs to
 `ledger-replay`.
 
 ## Main Modules
@@ -39,14 +38,13 @@ This crate should not expose application or replay APIs. Loading a ready
 `IngestPipeline::ingest_market_day` resolves a `MarketDay`, reuses a ready
 `ReplayDataset` when possible, otherwise stages raw input, preprocesses replay
 artifacts, uploads and registers durable objects through `ledger-store`, runs
-book-check, commits the replay dataset, and returns an `IngestReport`.
+book-check, catalogs the replay dataset, and returns an `IngestReport`.
 
 Raw DBN files are ingest inputs. They are staged through `ledger-store` and kept
-durable in R2, but they are not replay dataset cache files.
+durable in R2 as Layer 1 data.
 
 ## Testing
 
 Use fake providers and `SyntheticPreprocessor` for deterministic tests. Tests in
-this crate should verify provider reuse, resumable ingest behavior, artifact
-production, and that raw DBN files are not written into replay dataset cache
-directories.
+this crate should verify provider reuse, resumable ingest behavior, and artifact
+production.

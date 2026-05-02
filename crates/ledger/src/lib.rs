@@ -2,18 +2,32 @@
 //!
 //! This crate is the boundary a UI, API, or command adapter should use when it
 //! needs to inspect or load replay inputs. It delegates persistence and cache
-//! behavior to `ledger-store`, hydrates local replay artifacts into domain
-//! event stores, and leaves replay simulation to `ledger-replay`.
+//! behavior to `ledger-store`, materializes replay artifacts into domain
+//! event stores, validates replay readiness, and composes replay simulator
+//! smoke tests while keeping transport concerns in CLI/API adapters.
 
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use ledger_domain::{decode_batches, decode_events, decode_trades, EventStore, MarketDay};
+use ledger_ingest::{
+    DatabentoProvider, DbnPreprocessor, IngestConfig, IngestPipeline, IngestProgressEvent,
+    IngestProgressSink, IngestReport,
+};
 use ledger_store::{
-    LedgerStore, LoadedReplayDataset, MarketDayFilter, MarketDayRecord, ObjectStore, R2LedgerStore,
-    ReplayDatasetStatus,
+    DeleteRawMarketDataReport, DeleteReplayDatasetReport, LedgerStore, LoadedReplayDataset,
+    MarketDayFilter, MarketDayRecord, R2LedgerStore, ReplayDatasetStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
+
+mod progress;
+mod validation;
+
+pub use ledger_store::ObjectStore;
+pub use progress::*;
+pub use validation::*;
 
 #[derive(Clone)]
 pub struct Ledger<S: ObjectStore + 'static> {
@@ -22,6 +36,7 @@ pub struct Ledger<S: ObjectStore + 'static> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayDataset {
+    pub replay_dataset_id: String,
     pub market_day: MarketDay,
     pub events_path: PathBuf,
     pub batches_path: PathBuf,
@@ -31,25 +46,79 @@ pub struct ReplayDataset {
 
 impl ReplayDataset {
     pub async fn event_store(&self) -> Result<EventStore> {
+        self.event_store_with_progress(None).await
+    }
+
+    pub async fn event_store_with_progress(
+        &self,
+        progress: Option<&LedgerProgress>,
+    ) -> Result<EventStore> {
+        if let Some(progress) = progress {
+            progress.step(format!(
+                "reading events artifact {}",
+                self.events_path.display()
+            ));
+        }
+        let started_at = Instant::now();
         let events_bytes = read_artifact("events", &self.events_path).await?;
+        if let Some(progress) = progress {
+            progress.done("events artifact read", started_at);
+            progress.step(format!(
+                "reading batches artifact {}",
+                self.batches_path.display()
+            ));
+        }
+        let started_at = Instant::now();
         let batches_bytes = read_artifact("batches", &self.batches_path).await?;
+        if let Some(progress) = progress {
+            progress.done("batches artifact read", started_at);
+            progress.step(format!(
+                "reading trades artifact {}",
+                self.trades_path.display()
+            ));
+        }
+        let started_at = Instant::now();
         let trades_bytes = read_artifact("trades", &self.trades_path).await?;
 
+        if let Some(progress) = progress {
+            progress.done("trades artifact read", started_at);
+            progress.step("decoding event artifact");
+        }
+        let started_at = Instant::now();
+        let events = decode_events(&events_bytes)
+            .with_context(|| format!("decoding events artifact {}", self.events_path.display()))?;
+        if let Some(progress) = progress {
+            progress.done(format!("decoded {} events", events.len()), started_at);
+            progress.step("decoding batch artifact");
+        }
+        let started_at = Instant::now();
+        let batches = decode_batches(&batches_bytes).with_context(|| {
+            format!("decoding batches artifact {}", self.batches_path.display())
+        })?;
+        if let Some(progress) = progress {
+            progress.done(format!("decoded {} batches", batches.len()), started_at);
+            progress.step("decoding trade artifact");
+        }
+        let started_at = Instant::now();
+        let trades = decode_trades(&trades_bytes)
+            .with_context(|| format!("decoding trades artifact {}", self.trades_path.display()))?;
+        if let Some(progress) = progress {
+            progress.done(format!("decoded {} trades", trades.len()), started_at);
+            progress.step("validating event, batch, and trade indexes");
+        }
+        let started_at = Instant::now();
         let store = EventStore {
-            events: decode_events(&events_bytes).with_context(|| {
-                format!("decoding events artifact {}", self.events_path.display())
-            })?,
-            batches: decode_batches(&batches_bytes).with_context(|| {
-                format!("decoding batches artifact {}", self.batches_path.display())
-            })?,
-            trades: decode_trades(&trades_bytes).with_context(|| {
-                format!("decoding trades artifact {}", self.trades_path.display())
-            })?,
+            events,
+            batches,
+            trades,
         };
 
         store
             .validate()
             .with_context(|| format!("validating replay dataset {}", self.market_day.id))?;
+        if let Some(progress) = progress {
+            progress.done("event indexes validated", started_at);
+        }
         Ok(store)
     }
 }
@@ -74,8 +143,18 @@ impl<S: ObjectStore + 'static> Ledger<S> {
         self.store.replay_dataset_status(symbol, date).await
     }
 
-    pub fn list(&self, filter: MarketDayFilter) -> Result<Vec<MarketDayRecord>> {
-        self.store.list_market_days(filter)
+    pub async fn verified_status(
+        &self,
+        symbol: &str,
+        date: NaiveDate,
+    ) -> Result<ReplayDatasetStatus> {
+        self.store
+            .verified_replay_dataset_status(symbol, date)
+            .await
+    }
+
+    pub async fn list(&self, filter: MarketDayFilter) -> Result<Vec<MarketDayRecord>> {
+        self.store.list_market_days(filter).await
     }
 
     pub async fn load_replay_dataset(
@@ -85,6 +164,7 @@ impl<S: ObjectStore + 'static> Ledger<S> {
     ) -> Result<ReplayDataset> {
         let dataset: LoadedReplayDataset = self.store.load_replay_dataset(symbol, date).await?;
         Ok(ReplayDataset {
+            replay_dataset_id: dataset.replay_dataset_id,
             market_day: dataset.market_day,
             events_path: dataset.events_path,
             batches_path: dataset.batches_path,
@@ -92,12 +172,142 @@ impl<S: ObjectStore + 'static> Ledger<S> {
             book_check_path: dataset.book_check_path,
         })
     }
+
+    pub async fn delete_remote_replay_dataset(
+        &self,
+        symbol: &str,
+        date: NaiveDate,
+        include_raw: bool,
+    ) -> Result<DeleteReplayDatasetReport> {
+        self.store
+            .delete_remote_replay_dataset(symbol, date, include_raw)
+            .await
+    }
+
+    pub async fn delete_raw_market_data(
+        &self,
+        symbol: &str,
+        date: NaiveDate,
+        cascade: bool,
+    ) -> Result<DeleteRawMarketDataReport> {
+        self.store
+            .delete_raw_market_data(symbol, date, cascade)
+            .await
+    }
+}
+
+impl Ledger<ledger_store::R2ObjectStore> {
+    pub async fn ingest_market_day(&self, symbol: &str, date: NaiveDate) -> Result<IngestReport> {
+        self.ingest_market_day_with_progress(symbol, date, None)
+            .await
+    }
+
+    pub async fn ingest_market_day_with_progress(
+        &self,
+        symbol: &str,
+        date: NaiveDate,
+        progress_sink: Option<LedgerProgressSink>,
+    ) -> Result<IngestReport> {
+        let pipeline = IngestPipeline::new(
+            DatabentoProvider,
+            DbnPreprocessor,
+            self.store.clone(),
+            IngestConfig::default(),
+        );
+        pipeline
+            .ingest_market_day_with_progress(
+                symbol,
+                date,
+                progress_sink.map(ingest_progress_adapter),
+            )
+            .await
+    }
+
+    pub async fn prepare_replay_dataset(
+        &self,
+        request: PrepareReplayDatasetRequest,
+    ) -> Result<PrepareReplayDatasetReport> {
+        self.prepare_replay_dataset_with_progress(request, None)
+            .await
+    }
+
+    pub async fn prepare_replay_dataset_with_progress(
+        &self,
+        request: PrepareReplayDatasetRequest,
+        progress_sink: Option<LedgerProgressSink>,
+    ) -> Result<PrepareReplayDatasetReport> {
+        let progress = LedgerProgress::new(progress_sink.clone());
+        progress.step(format!(
+            "preparing replay dataset {} {}",
+            request.symbol, request.market_date
+        ));
+        if request.rebuild_replay {
+            progress.step(
+                "rebuild requested; deleting existing replay dataset while preserving raw data",
+            );
+            self.delete_remote_replay_dataset(&request.symbol, request.market_date, false)
+                .await
+                .with_context(|| {
+                    format!(
+                        "deleting existing replay dataset {} {}",
+                        request.symbol, request.market_date
+                    )
+                })?;
+        }
+        progress.step(
+            "running ingest/preprocess pipeline; this may materialize raw data and rebuild artifacts",
+        );
+        let ingest_started_at = Instant::now();
+        let ingest = self
+            .ingest_market_day_with_progress(
+                &request.symbol,
+                request.market_date,
+                progress_sink.clone(),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "ingesting market day {} {}",
+                    request.symbol, request.market_date
+                )
+            })?;
+        progress.done("ingest/preprocess pipeline completed", ingest_started_at);
+        progress.step("ingest and preprocessing completed; validating prepared replay dataset");
+        let validation = self
+            .validate_replay_dataset_with_progress(
+                ValidateReplayDatasetRequest {
+                    symbol: request.symbol,
+                    market_date: request.market_date,
+                    // Prepare should establish readiness, not perform an audit
+                    // book-check pass unless explicitly requested later.
+                    skip_book_check: request.skip_book_check,
+                    replay_batches: request.replay_batches,
+                    replay_all: request.replay_all,
+                },
+                progress_sink,
+            )
+            .await?;
+        Ok(PrepareReplayDatasetReport { ingest, validation })
+    }
 }
 
 async fn read_artifact(kind: &str, path: &Path) -> Result<Vec<u8>> {
     tokio::fs::read(path)
         .await
         .with_context(|| format!("reading {kind} artifact {}", path.display()))
+}
+
+fn ingest_progress_adapter(sink: LedgerProgressSink) -> IngestProgressSink {
+    Arc::new(move |event| match event {
+        IngestProgressEvent::Step { message } => sink(LedgerProgressEvent::Step { message }),
+        IngestProgressEvent::Done {
+            message,
+            elapsed_ms,
+        } => sink(LedgerProgressEvent::Done {
+            message,
+            elapsed_ms,
+        }),
+    })
 }
 
 #[cfg(test)]
@@ -125,6 +335,7 @@ mod tests {
 
     fn replay_dataset(dir: &Path) -> ReplayDataset {
         ReplayDataset {
+            replay_dataset_id: "test-replay-dataset".to_string(),
             market_day: MarketDay::resolve_es(
                 "ESH6",
                 NaiveDate::from_ymd_opt(2026, 3, 12).unwrap(),

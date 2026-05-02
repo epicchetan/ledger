@@ -13,9 +13,6 @@ clap.workspace = true
 chrono.workspace = true
 dotenvy.workspace = true
 ledger-domain = { path = "../domain" }
-ledger-ingest = { path = "../ingest" }
-ledger-book = { path = "../book" }
-ledger-replay = { path = "../replay" }
 ledger = { path = "../ledger" }
 ledger-store = { path = "../store" }
 tokio.workspace = true

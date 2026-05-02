@@ -6,7 +6,7 @@
 
 - CLI argument parsing with `clap`.
 - `.env` loading with `dotenvy`.
-- Construction of `ledger-store`, `ledger-ingest`, and `ledger`.
+- Construction of `ledger`.
 - JSON output for command results.
 - Progress output on stderr.
 
@@ -15,7 +15,7 @@
 - Databento request logic.
 - DBN decoding or preprocessing.
 - SQLite schema and R2 persistence.
-- Replay dataset cache policy.
+- R2 object persistence or local materialization policy.
 - Order-book or replay simulation logic.
 
 ## Commands
@@ -27,24 +27,23 @@ resolve
 ingest
 status
 list
-session load
 session validate
-cache prune
+storage cleanup-tmp
 ```
 
 `download` is kept as a hidden alias for `ingest`.
 
-The `session` command namespace is still the current CLI surface, but `session
-load` and `session validate` operate on immutable `ReplayDataset` artifacts.
-The active mutable `ReplaySession` controller is future work.
+`session validate` operates on immutable `ReplayDataset` artifacts and delegates
+shared validation composition to `ledger`. `storage cleanup-tmp` removes
+disposable staging files left by failed or interrupted jobs. The active mutable
+`ReplaySession` controller is future work.
 
 ## Boundary
 
 Keep this crate thin. If a command needs meaningful behavior beyond parsing
 arguments and printing a result, that behavior belongs in one of the library
-crates. `session validate` is intentionally a local validation adapter that
-composes replay dataset hydration, book-check comparison, and a small replay
-simulator probe before API/server work begins.
+crates. `session validate` delegates shared validation composition to `ledger`,
+so CLI and API validation stay aligned.
 
 ## Tests
 

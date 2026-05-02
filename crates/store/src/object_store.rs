@@ -53,7 +53,10 @@ pub trait ObjectStore: Send + Sync {
         metadata: &ObjectMetadata,
     ) -> Result<RemoteObject>;
     async fn get_to_path(&self, key: &str, dest: &Path) -> Result<RemoteObject>;
+    async fn get_bytes(&self, key: &str) -> Result<Vec<u8>>;
     async fn head(&self, key: &str) -> Result<Option<RemoteObject>>;
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>>;
+    async fn delete(&self, key: &str) -> Result<()>;
     async fn put_bytes(
         &self,
         key: &str,
@@ -114,6 +117,17 @@ impl ObjectStore for MemoryObjectStore {
         })
     }
 
+    async fn get_bytes(&self, key: &str) -> Result<Vec<u8>> {
+        let (bytes, _) = self
+            .objects
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("missing object key {key}"))?;
+        Ok(bytes)
+    }
+
     async fn head(&self, key: &str) -> Result<Option<RemoteObject>> {
         Ok(self
             .objects
@@ -128,6 +142,24 @@ impl ObjectStore for MemoryObjectStore {
                 etag: None,
                 metadata: metadata.user_metadata.clone(),
             }))
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut keys = self
+            .objects
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|key| key.starts_with(prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        Ok(keys)
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.objects.lock().unwrap().remove(key);
+        Ok(())
     }
 
     async fn put_bytes(

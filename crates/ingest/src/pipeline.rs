@@ -2,11 +2,51 @@ use anyhow::{anyhow, Context, Result};
 use chrono::NaiveDate;
 use ledger_domain::{MarketDay, MarketDayStatus, StorageKind};
 use ledger_store::{
-    IngestStaging, LedgerStore, LoadedReplayDataset, ObjectStore, PutFileRequest, StoredObject,
+    IngestStaging, LedgerStore, LoadedReplayDataset, ObjectStore, PutFileRequest,
+    ReplayDatasetRecordStatus, StoredObject,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::time::Instant;
 
 use crate::{run_book_check, BookCheckReport, MarketDataProvider, Preprocessor};
+
+pub type IngestProgressSink = Arc<dyn Fn(IngestProgressEvent) + Send + Sync>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum IngestProgressEvent {
+    Step { message: String },
+    Done { message: String, elapsed_ms: u128 },
+}
+
+#[derive(Clone, Default)]
+pub struct IngestProgress {
+    sink: Option<IngestProgressSink>,
+}
+
+impl IngestProgress {
+    pub fn new(sink: Option<IngestProgressSink>) -> Self {
+        Self { sink }
+    }
+
+    pub fn step(&self, message: impl Into<String>) {
+        if let Some(sink) = &self.sink {
+            sink(IngestProgressEvent::Step {
+                message: message.into(),
+            });
+        }
+    }
+
+    pub fn done(&self, message: impl Into<String>, started_at: Instant) {
+        if let Some(sink) = &self.sink {
+            sink(IngestProgressEvent::Done {
+                message: message.into(),
+                elapsed_ms: started_at.elapsed().as_millis(),
+            });
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct IngestConfig {
@@ -71,27 +111,53 @@ where
     }
 
     pub async fn ingest_market_day(&self, symbol: &str, date: NaiveDate) -> Result<IngestReport> {
-        let md = MarketDay::resolve_es(symbol, date)?;
-        if let Some(record) = self.store.catalog.market_day(&md.id)? {
-            if record.ready {
-                let loaded = self.store.load_replay_dataset(symbol, date).await?;
-                return self
-                    .report_from_loaded_replay_dataset(
-                        loaded,
-                        vec!["ready_replay_dataset".to_string()],
-                    )
-                    .await;
-            }
-        }
+        self.ingest_market_day_with_progress(symbol, date, None)
+            .await
+    }
 
+    pub async fn ingest_market_day_with_progress(
+        &self,
+        symbol: &str,
+        date: NaiveDate,
+        progress_sink: Option<IngestProgressSink>,
+    ) -> Result<IngestReport> {
+        let progress = IngestProgress::new(progress_sink);
+        let md = MarketDay::resolve_es(symbol, date)?;
+
+        progress.step("checking replay dataset status");
+        let status_started_at = Instant::now();
+        if self
+            .store
+            .replay_dataset_status(symbol, date)
+            .await?
+            .replay_dataset
+            .as_ref()
+            .is_some_and(|dataset| dataset.status == ReplayDatasetRecordStatus::Available)
+        {
+            progress.done("ready replay dataset found", status_started_at);
+            let loaded = self.store.load_replay_dataset(symbol, date).await?;
+            return self
+                .report_from_loaded_replay_dataset(loaded, vec!["ready_replay_dataset".to_string()])
+                .await;
+        }
+        progress.done("replay dataset status checked", status_started_at);
+
+        progress.step("creating ingest staging workspace");
+        let staging_started_at = Instant::now();
         let staging = self.store.begin_ingest(&md).await?;
-        let result = self.ingest_with_staging(md, &staging).await;
+        progress.done("ingest staging workspace ready", staging_started_at);
+
+        let result = self.ingest_with_staging(md, &staging, &progress).await;
         match result {
             Ok(report) => {
+                progress.step("recording ingest run success");
                 self.store.finish_ingest(&staging, "ready")?;
+                progress.step("cleaning ingest staging workspace");
+                let cleanup_started_at = Instant::now();
                 self.store
                     .cleanup_ingest(&report.market_day, &staging)
                     .await?;
+                progress.done("ingest staging workspace cleaned", cleanup_started_at);
                 Ok(report)
             }
             Err(err) => {
@@ -105,24 +171,43 @@ where
         &self,
         mut md: MarketDay,
         staging: &IngestStaging,
+        progress: &IngestProgress,
     ) -> Result<IngestReport> {
         let mut reused = Vec::new();
         let mut created = Vec::new();
 
         self.store
-            .mark_market_day_status(&mut md, MarketDayStatus::Downloading, false)?;
-        let raw = self
-            .ensure_raw(&md, staging, &mut reused, &mut created)
+            .mark_market_day_status(&mut md, MarketDayStatus::Downloading, false)
             .await?;
+        progress.step("checking raw catalog and staging raw DBN");
+        let raw_started_at = Instant::now();
+        let raw = self
+            .ensure_raw(&md, staging, &mut reused, &mut created, progress)
+            .await?;
+        progress.done("raw DBN ready for preprocessing", raw_started_at);
 
         self.store
-            .mark_market_day_status(&mut md, MarketDayStatus::Preprocessing, false)?;
+            .mark_market_day_status(&mut md, MarketDayStatus::Preprocessing, false)
+            .await?;
+        progress.step("decoding raw DBN and building replay artifact files");
+        let preprocess_started_at = Instant::now();
         let preprocessed = self
             .preprocessor
             .preprocess(&staging.raw_path, &staging.artifacts_dir, &self.store.local)
             .await
             .context("preprocessing raw DBN")?;
+        progress.done(
+            format!(
+                "built {} events, {} batches, {} trades",
+                preprocessed.event_store.events.len(),
+                preprocessed.event_store.batches.len(),
+                preprocessed.event_store.trades.len()
+            ),
+            preprocess_started_at,
+        );
 
+        progress.step("uploading events artifact");
+        let upload_started_at = Instant::now();
         let events = self
             .put_artifact(
                 &md,
@@ -133,8 +218,11 @@ where
                 serde_json::json!({"event_count": preprocessed.event_store.events.len()}),
             )
             .await?;
+        progress.done("events artifact uploaded", upload_started_at);
         created.push("event_store".to_string());
 
+        progress.step("uploading batches artifact");
+        let upload_started_at = Instant::now();
         let batches = self
             .put_artifact(
                 &md,
@@ -145,8 +233,11 @@ where
                 serde_json::json!({"batch_count": preprocessed.event_store.batches.len()}),
             )
             .await?;
+        progress.done("batches artifact uploaded", upload_started_at);
         created.push("batch_index".to_string());
 
+        progress.step("uploading trades artifact");
+        let upload_started_at = Instant::now();
         let trades = self
             .put_artifact(
                 &md,
@@ -157,9 +248,13 @@ where
                 serde_json::json!({"trade_count": preprocessed.event_store.trades.len()}),
             )
             .await?;
+        progress.done("trades artifact uploaded", upload_started_at);
         created.push("trade_index".to_string());
 
+        progress.step("running book-check report");
+        let book_check_started_at = Instant::now();
         let book_check_report = run_book_check(&preprocessed.event_store)?;
+        progress.done("book-check report completed", book_check_started_at);
         let book_check_path = staging.artifacts_dir.join("book_check.v1.json");
         self.store
             .local
@@ -168,36 +263,57 @@ where
                 &serde_json::to_vec_pretty(&book_check_report)?,
             )
             .await?;
+        progress.step("uploading book-check artifact");
+        let upload_started_at = Instant::now();
         let book_check = self
             .put_artifact(
                 &md,
                 StorageKind::BookCheck,
                 &book_check_path,
                 "json",
-                &events.content_sha256,
+                &raw.content_sha256,
                 serde_json::json!({"input_kind": "event_store"}),
             )
             .await?;
+        progress.done("book-check artifact uploaded", upload_started_at);
         created.push("book_check".to_string());
 
+        progress.step("recording replay dataset metadata");
+        let metadata_started_at = Instant::now();
         self.store.add_dependency(&events, &raw, "derived_from")?;
         self.store.add_dependency(&batches, &raw, "derived_from")?;
         self.store.add_dependency(&trades, &raw, "derived_from")?;
         self.store
             .add_dependency(&book_check, &events, "validates")?;
+        self.store
+            .register_replay_dataset(
+                &md,
+                &raw,
+                &[
+                    events.clone(),
+                    batches.clone(),
+                    trades.clone(),
+                    book_check.clone(),
+                ],
+            )
+            .await?;
+        progress.done("replay dataset metadata recorded", metadata_started_at);
 
         self.store
-            .mark_market_day_status(&mut md, MarketDayStatus::Ready, true)?;
-        let loaded = self
-            .store
-            .load_replay_dataset(&md.contract_symbol, md.market_date)
+            .mark_market_day_status(&mut md, MarketDayStatus::Ready, true)
             .await?;
-        let mut report = self
-            .report_from_loaded_replay_dataset(loaded, reused)
-            .await
-            .context("building ingest report")?;
-        report.created = created;
-        Ok(report)
+        Ok(IngestReport {
+            market_day: md,
+            raw,
+            event_store: events,
+            batch_index: batches,
+            trade_index: trades,
+            book_check,
+            book_check_report,
+            reused,
+            created,
+            ready: true,
+        })
     }
 
     async fn ensure_raw(
@@ -206,36 +322,31 @@ where
         staging: &IngestStaging,
         reused: &mut Vec<String>,
         created: &mut Vec<String>,
+        progress: &IngestProgress,
     ) -> Result<StoredObject> {
-        if let Some(raw) = self.store.raw_object(md)? {
+        progress.step("checking raw catalog");
+        if let Some(raw) = self.store.raw_object(md).await? {
+            progress.step("staging existing raw DBN from R2");
+            let started_at = Instant::now();
             self.store
                 .stage_raw_for_ingest(&raw, &staging.raw_path)
                 .await?;
+            progress.done("existing raw DBN staged", started_at);
             reused.push("raw_dbn_remote".to_string());
             return Ok(raw);
         }
 
-        let legacy_raw_path = self.store.local.legacy_raw_dbn_path(
-            &self.config.dataset,
-            &self.config.schema,
-            &md.root,
-            &md.contract_symbol,
-            &md.market_date.to_string(),
-        );
-        if legacy_raw_path.exists() {
-            self.store
-                .local
-                .commit_file_atomic(&legacy_raw_path, &staging.raw_path)
-                .await?;
-            reused.push("legacy_local_raw_file".to_string());
-        } else {
-            self.provider
-                .download_mbo(md, &staging.raw_path)
-                .await
-                .context("downloading raw Databento MBO")?;
-            created.push("raw_dbn_download".to_string());
-        }
+        progress.step("downloading raw Databento MBO");
+        let started_at = Instant::now();
+        self.provider
+            .download_mbo(md, &staging.raw_path)
+            .await
+            .context("downloading raw Databento MBO")?;
+        progress.done("raw Databento MBO downloaded", started_at);
+        created.push("raw_dbn_download".to_string());
 
+        progress.step("uploading raw DBN object");
+        let started_at = Instant::now();
         let raw = self
             .store
             .register_raw_object(PutFileRequest {
@@ -262,6 +373,7 @@ where
                 }),
             })
             .await?;
+        progress.done("raw DBN object recorded", started_at);
         Ok(raw)
     }
 
@@ -301,7 +413,8 @@ where
     ) -> Result<IngestReport> {
         let raw = self
             .store
-            .raw_object(&loaded.market_day)?
+            .raw_object(&loaded.market_day)
+            .await?
             .ok_or_else(|| anyhow!("ready market day missing raw_dbn"))?;
         let event_store = object_of(&loaded.objects, StorageKind::EventStore)?;
         let batch_index = object_of(&loaded.objects, StorageKind::BatchIndex)?;
@@ -309,7 +422,7 @@ where
         let book_check = object_of(&loaded.objects, StorageKind::BookCheck)?;
         let book_check_report =
             serde_json::from_slice(&tokio::fs::read(&loaded.book_check_path).await?)?;
-        Ok(IngestReport {
+        let report = IngestReport {
             market_day: loaded.market_day,
             raw,
             event_store,
@@ -320,7 +433,11 @@ where
             reused,
             created: Vec::new(),
             ready: true,
-        })
+        };
+        if let Some(staging_dir) = loaded.events_path.parent() {
+            tokio::fs::remove_dir_all(staging_dir).await.ok();
+        }
+        Ok(report)
     }
 }
 

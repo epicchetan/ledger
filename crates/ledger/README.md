@@ -1,43 +1,48 @@
 # ledger
 
-`ledger` is the application-facing layer for replay readiness and replay
-dataset loading. It is the crate that exposes the public `Ledger` and
-`ReplayDataset` model used by API, CLI, and future active replay-session work.
+`ledger` is the backend application core for raw data/replay dataset lifecycle,
+validation composition, ingest orchestration, and future active replay-session
+work. It exposes the public `Ledger` and `ReplayDataset` model used by API and
+CLI adapters.
 
 ## Owns
 
-- Status checks for cataloged market days.
-- Listing cataloged market days through `ledger-store`.
-- Loading replay datasets for a ready market day.
-- Returning local paths to replay artifacts:
-  - `events.v1.bin`
-  - `batches.v1.bin`
-  - `trades.v1.bin`
-  - `book_check.v1.json`
-- Hydrating local replay artifacts into `ledger-domain::EventStore`.
+- Status checks for SQLite-cataloged market days.
+- Listing market days through `ledger-store`.
+- Preparing replay datasets by ensuring Layer 1 raw data and Layer 2 replay artifacts.
+- Validating replay datasets with one shared report shape for CLI/API.
+- Deleting durable replay datasets or raw market data through store primitives.
+- Running deterministic book-check comparison and replay simulator probes.
+- Orchestrating market-day ingest through `ledger-ingest`.
+- Staging replay artifacts from R2 into `tmp` for validation.
+- Hydrating staged replay artifacts into `ledger-domain::EventStore`.
 
 ## Does Not Own
 
-- Databento download or DBN preprocessing.
-- SQLite schema or R2 object behavior.
+- R2 object mechanics or SQLite schemas.
 - Order-book mutation logic.
-- Replay/execution simulation.
+- Low-level order-book or replay/execution mechanics.
 - CLI argument parsing or printing.
+- HTTP/WebSocket transport.
 
 ## Main Types
 
 - `Ledger<S>` wraps a `ledger-store::LedgerStore<S>`.
-- `ReplayDataset` is the immutable loaded replay-artifact context for one
+- `ReplayDataset` is the immutable staged replay-artifact context for one
   `MarketDay`.
+- `ReplayDatasetValidationReport` is the shared validation/trust report used by
+  CLI and API.
+- `PrepareReplayDatasetReport` combines the ingest/preprocess report with a
+  readiness validation report for job-backed API work.
 
 ## Boundary
 
-Callers should ask `Ledger` to load a replay dataset, not hydrate individual
-files. The store decides whether artifacts are already local or need to be
-fetched from R2. `ReplayDataset::event_store` decodes and validates the local
-artifacts before handing them to replay.
+Callers should ask `Ledger` to prepare and validate replay datasets, not hydrate
+individual files or rebuild validation reports themselves. The store decides how
+to stage R2-backed artifacts for validation. Opening a future active
+`ReplaySession` will be a separate use case.
 
 ## Tests
 
-`ledger` tests should cover replay artifact hydration and the bridge from a
-loaded `ReplayDataset` into `ledger-replay`.
+`ledger` tests should cover replay artifact hydration, shared validation
+composition, and the bridge from a staged `ReplayDataset` into `ledger-replay`.
