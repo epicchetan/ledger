@@ -8,11 +8,16 @@
 use anyhow::Result;
 use chrono::NaiveDate;
 use clap::{Args, Parser, Subcommand};
+use ledger::projection::{base_projection_registry, resolve_projection_graph};
 use ledger::{
-    Ledger, LedgerProgressEvent, LedgerProgressSink, ReplayRunRequest,
+    Ledger, LedgerProgressEvent, LedgerProgressSink, ProjectionRunRequest, ReplayRunRequest,
     ValidateReplayDatasetRequest, ValidationTrigger,
 };
+use ledger_domain::{ProjectionId, ProjectionSpec, ProjectionVersion};
 use ledger_store::MarketDayFilter;
+use serde_json::Value;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -45,6 +50,7 @@ enum Command {
     Storage(StorageCommand),
     Session(SessionCommand),
     Replay(ReplayCommand),
+    Projection(ProjectionCommand),
 }
 
 #[derive(Subcommand)]
@@ -85,6 +91,20 @@ struct ReplayCommand {
     command: ReplaySubcommand,
 }
 
+#[derive(Subcommand)]
+enum ProjectionSubcommand {
+    List,
+    Manifest(ProjectionManifestArgs),
+    Graph(ProjectionGraphArgs),
+    Run(ProjectionRunArgs),
+}
+
+#[derive(Args)]
+struct ProjectionCommand {
+    #[command(subcommand)]
+    command: ProjectionSubcommand,
+}
+
 #[derive(Args, Clone)]
 struct MarketDayArgs {
     #[arg(long)]
@@ -118,6 +138,51 @@ struct ReplayRunArgs {
 
     #[arg(long)]
     start_ts_ns: Option<u64>,
+
+    #[arg(long)]
+    truth_visibility: bool,
+}
+
+#[derive(Args, Clone)]
+struct ProjectionManifestArgs {
+    #[arg(long)]
+    id: String,
+
+    #[arg(long)]
+    version: u16,
+}
+
+#[derive(Args, Clone)]
+struct ProjectionGraphArgs {
+    #[arg(long)]
+    projection: String,
+
+    #[arg(long, default_value = "{}")]
+    params: String,
+}
+
+#[derive(Args, Clone)]
+struct ProjectionRunArgs {
+    #[command(flatten)]
+    market_day: MarketDayArgs,
+
+    #[arg(long)]
+    projection: String,
+
+    #[arg(long, default_value = "{}")]
+    params: String,
+
+    #[arg(long)]
+    batches: usize,
+
+    #[arg(long)]
+    start_ts_ns: Option<u64>,
+
+    #[arg(long)]
+    jsonl: Option<PathBuf>,
+
+    #[arg(long)]
+    digest: bool,
 
     #[arg(long)]
     truth_visibility: bool,
@@ -259,6 +324,56 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
         },
+        Command::Projection(projection) => match projection.command {
+            ProjectionSubcommand::List => {
+                let output = projection_list_output()?;
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            }
+            ProjectionSubcommand::Manifest(args) => {
+                let output = projection_manifest_output(&args.id, args.version)?;
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            }
+            ProjectionSubcommand::Graph(args) => {
+                let spec = parse_projection_arg(&args.projection, &args.params)?;
+                let output = projection_graph_output(spec)?;
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            }
+            ProjectionSubcommand::Run(args) => {
+                let date = parse_date(&args.market_day.date)?;
+                let spec = parse_projection_arg(&args.projection, &args.params)?;
+                progress.step(format!(
+                    "running projection {} over {} {}",
+                    spec.id, args.market_day.symbol, date
+                ));
+                let ledger = Ledger::from_env(&cli.data_dir, &cli.r2_prefix).await?;
+                let cache = ledger
+                    .replay_cache_status(&args.market_day.symbol, date)
+                    .await?;
+                if cache.cached {
+                    progress.step("replay cache hit; using local ReplayDataset artifacts");
+                } else {
+                    progress.step("replay cache miss; hydrating ReplayDataset artifacts from R2");
+                }
+                let started_at = Instant::now();
+                let report = ledger
+                    .run_projection(ProjectionRunRequest {
+                        symbol: args.market_day.symbol,
+                        market_date: date,
+                        start_ts_ns: args.start_ts_ns,
+                        projection: spec,
+                        batches: args.batches,
+                        digest: args.digest,
+                        truth_visibility: args.truth_visibility,
+                    })
+                    .await?;
+                if let Some(path) = args.jsonl {
+                    write_projection_jsonl(&path, &report.frames)?;
+                    progress.step(format!("wrote projection frames to {}", path.display()));
+                }
+                progress.done("projection run completed", started_at);
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+        },
     }
 
     Ok(())
@@ -266,6 +381,46 @@ async fn main() -> Result<()> {
 
 fn parse_date(date: &str) -> Result<NaiveDate> {
     Ok(NaiveDate::parse_from_str(date, "%Y-%m-%d")?)
+}
+
+fn parse_projection_arg(projection: &str, params: &str) -> Result<ProjectionSpec> {
+    let (id, version) = parse_projection_ref(projection)?;
+    let params = serde_json::from_str::<Value>(params)?;
+    ProjectionSpec::new(id, version, params)
+}
+
+fn parse_projection_ref(projection: &str) -> Result<(String, u16)> {
+    let (id, version) = projection
+        .rsplit_once(":v")
+        .ok_or_else(|| anyhow::anyhow!("projection must use `<id>:v<version>` format"))?;
+    Ok((id.to_string(), version.parse::<u16>()?))
+}
+
+fn projection_list_output() -> Result<Vec<ledger_domain::ProjectionManifest>> {
+    Ok(base_projection_registry()?.list_manifests())
+}
+
+fn projection_manifest_output(id: &str, version: u16) -> Result<ledger_domain::ProjectionManifest> {
+    let registry = base_projection_registry()?;
+    Ok(registry
+        .manifest(&ProjectionId::new(id)?, ProjectionVersion::new(version)?)?
+        .clone())
+}
+
+fn projection_graph_output(spec: ProjectionSpec) -> Result<ledger::projection::ProjectionGraph> {
+    let registry = base_projection_registry()?;
+    resolve_projection_graph(&registry, spec)
+}
+
+fn write_projection_jsonl(path: &PathBuf, frames: &[ledger_domain::ProjectionFrame]) -> Result<()> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    for frame in frames {
+        serde_json::to_writer(&mut writer, frame)?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -310,5 +465,43 @@ impl Progress {
                 eprintln!("[ledger] {message} ({:.2}s)", elapsed_ms as f64 / 1000.0);
             }
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ledger::projection::{BARS_ID, BBO_ID, CANONICAL_TRADES_ID, CURSOR_ID};
+
+    #[test]
+    fn projection_cli_list_returns_base_manifests() {
+        let manifests = projection_list_output().unwrap();
+        let ids = manifests
+            .iter()
+            .map(|manifest| manifest.id.as_str().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![CURSOR_ID, BBO_ID, CANONICAL_TRADES_ID, BARS_ID]);
+    }
+
+    #[test]
+    fn projection_cli_manifest_returns_requested_manifest() {
+        let manifest = projection_manifest_output(BBO_ID, 1).unwrap();
+
+        assert_eq!(manifest.id.as_str(), BBO_ID);
+        assert_eq!(manifest.version.get(), 1);
+        assert_eq!(manifest.output_schema.name.as_str(), "bbo_v1");
+    }
+
+    #[test]
+    fn projection_cli_graph_resolves_bars_dependency() {
+        let spec = parse_projection_arg("bars:v1", r#"{"seconds":60}"#).unwrap();
+        let graph = projection_graph_output(spec).unwrap();
+
+        assert!(!graph.cycle);
+        assert_eq!(graph.root.id.as_str(), BARS_ID);
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].from.id.as_str(), CANONICAL_TRADES_ID);
+        assert_eq!(graph.edges[0].to.id.as_str(), BARS_ID);
     }
 }

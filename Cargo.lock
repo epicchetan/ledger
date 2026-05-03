@@ -2000,6 +2000,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "hex",
  "indexmap",
  "ledger-book",
  "ledger-domain",
@@ -2008,6 +2009,7 @@ dependencies = [
  "ledger-store",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
 ]

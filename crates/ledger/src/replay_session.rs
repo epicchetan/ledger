@@ -8,8 +8,8 @@ use ledger_replay::ReplaySimulator;
 use serde::{Deserialize, Serialize};
 
 use crate::projection::{
-    base_projection_registry, ProjectionMetrics, ProjectionRegistry, ProjectionRuntime,
-    ProjectionRuntimeConfig, ProjectionRuntimeCursor, ProjectionSubscription,
+    base_projection_registry, projection_frame_digest, ProjectionMetrics, ProjectionRegistry,
+    ProjectionRuntime, ProjectionRuntimeConfig, ProjectionRuntimeCursor, ProjectionSubscription,
     ProjectionSubscriptionId, TruthTick,
 };
 use crate::{Ledger, ObjectStore, ReplayDataset};
@@ -85,6 +85,54 @@ pub struct ReplayRunReport {
     pub requested_batches: usize,
     pub applied_batches: usize,
     pub snapshot: ReplaySessionSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectionRunRequest {
+    pub symbol: String,
+    pub market_date: NaiveDate,
+    pub start_ts_ns: Option<UnixNanos>,
+    pub projection: ProjectionSpec,
+    pub batches: usize,
+    pub digest: bool,
+    pub truth_visibility: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectionRunReport {
+    pub projection: ProjectionRunProjectionSummary,
+    pub dataset: ProjectionRunDatasetSummary,
+    pub run: ProjectionRunSummary,
+    pub passed: bool,
+    #[serde(skip)]
+    pub frames: Vec<ProjectionFrame>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionRunProjectionSummary {
+    pub id: String,
+    pub version: u16,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionRunDatasetSummary {
+    pub symbol: String,
+    pub market_date: String,
+    pub replay_dataset_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionRunSummary {
+    pub requested_batches: usize,
+    pub applied_batches: usize,
+    pub frames: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_cursor_ts_ns: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_cursor_ts_ns: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
 }
 
 pub struct ReplaySession {
@@ -328,6 +376,79 @@ impl<S: ObjectStore + 'static> Ledger<S> {
             requested_batches: step.requested_batches,
             applied_batches: step.applied_batches,
             snapshot: step.snapshot,
+        })
+    }
+
+    pub async fn run_projection(
+        &self,
+        request: ProjectionRunRequest,
+    ) -> Result<ProjectionRunReport> {
+        if request.batches == 0 {
+            bail!("projection run batches must be greater than zero");
+        }
+
+        let visibility_profile = if request.truth_visibility {
+            VisibilityProfile::truth()
+        } else {
+            VisibilityProfile::default()
+        };
+        let mut session = self
+            .open_replay_session(ReplaySessionConfig {
+                session_id: Some("projection-run".to_string()),
+                symbol: request.symbol.clone(),
+                market_date: request.market_date,
+                start_ts_ns: request.start_ts_ns,
+                execution_profile: ExecutionProfile::default(),
+                visibility_profile,
+            })
+            .await?;
+
+        let subscription = session
+            .subscribe_projection(request.projection.clone())
+            .context("subscribing projection for CLI run")?;
+        let projection_key = subscription.key.clone();
+        let mut frames = subscription
+            .initial_frames
+            .into_iter()
+            .filter(|frame| frame.stamp.projection_key == projection_key)
+            .collect::<Vec<_>>();
+
+        let step = session.step_batches(request.batches)?;
+        frames.extend(
+            step.projection_frames
+                .into_iter()
+                .filter(|frame| frame.stamp.projection_key == projection_key),
+        );
+
+        let first_cursor_ts_ns = frames.first().map(|frame| frame.stamp.cursor_ts_ns.clone());
+        let last_cursor_ts_ns = frames.last().map(|frame| frame.stamp.cursor_ts_ns.clone());
+        let digest = if request.digest {
+            Some(projection_frame_digest(&frames)?)
+        } else {
+            None
+        };
+
+        Ok(ProjectionRunReport {
+            projection: ProjectionRunProjectionSummary {
+                id: projection_key.id.as_str().to_string(),
+                version: projection_key.version.get(),
+                key: projection_key.to_string(),
+            },
+            dataset: ProjectionRunDatasetSummary {
+                symbol: step.snapshot.market_day.contract_symbol.clone(),
+                market_date: step.snapshot.market_day.market_date.to_string(),
+                replay_dataset_id: step.snapshot.replay_dataset_id.clone(),
+            },
+            run: ProjectionRunSummary {
+                requested_batches: request.batches,
+                applied_batches: step.applied_batches,
+                frames: frames.len(),
+                first_cursor_ts_ns,
+                last_cursor_ts_ns,
+                digest,
+            },
+            passed: true,
+            frames,
         })
     }
 }

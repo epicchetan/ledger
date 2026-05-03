@@ -5,6 +5,8 @@
 //! active `ReplaySession`.
 
 pub mod base;
+mod digest;
+mod graph;
 mod metrics;
 mod node;
 mod registry;
@@ -12,6 +14,8 @@ mod runtime;
 mod tick;
 
 pub use base::*;
+pub use digest::*;
+pub use graph::*;
 pub use metrics::*;
 pub use node::*;
 pub use registry::*;
