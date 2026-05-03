@@ -5,9 +5,8 @@ use super::{
 use anyhow::{bail, ensure, Context, Result};
 use indexmap::{IndexMap, IndexSet};
 use ledger_domain::{
-    now_ns, ProjectionExecutionType, ProjectionFrame, ProjectionFrameOp, ProjectionFrameStamp,
-    ProjectionKey, ProjectionLagPolicy, ProjectionManifest, ProjectionSpec,
-    ProjectionWakeEventMask, ProjectionWakePolicy, UnixNanos,
+    now_ns, ProjectionFrame, ProjectionFrameOp, ProjectionFrameStamp, ProjectionKey,
+    ProjectionManifest, ProjectionSpec, ProjectionWakeEventMask, ProjectionWakePolicy, UnixNanos,
 };
 use serde_json::Value;
 use std::time::Instant;
@@ -323,7 +322,6 @@ impl ProjectionRuntime {
         stack.pop();
 
         let manifest = factory.manifest().clone();
-        ensure_supported_execution(&key, &manifest)?;
         let node = factory
             .build(spec.clone(), key.clone())
             .with_context(|| format!("building projection node {key}"))?;
@@ -444,13 +442,6 @@ impl ProjectionRuntime {
         Ok(match &entry.manifest.wake_policy {
             ProjectionWakePolicy::EveryTick => true,
             ProjectionWakePolicy::OnEventMask(mask) => wake_masks_intersect(*mask, tick.flags),
-            ProjectionWakePolicy::OnIntervalNs { interval_ns } => {
-                let Some(last_due) = self.last_due_ts_ns.get(key).copied() else {
-                    return Ok(true);
-                };
-                tick.cursor_ts_ns.saturating_sub(last_due) >= *interval_ns
-            }
-            ProjectionWakePolicy::Manual => false,
         })
     }
 
@@ -524,7 +515,6 @@ impl ProjectionRuntime {
                 cursor_ts_ns: cursor_ts_ns.to_string(),
                 source_view: entry.manifest.source_view,
                 temporal_policy: entry.manifest.temporal_policy,
-                execution_type: entry.manifest.execution_type,
                 produced_at_ns: now_ns().to_string(),
                 sequence: self.sequence,
             },
@@ -546,27 +536,6 @@ struct NodeEntry {
     ref_count: usize,
 }
 
-fn ensure_supported_execution(key: &ProjectionKey, manifest: &ProjectionManifest) -> Result<()> {
-    match manifest.execution_type {
-        ProjectionExecutionType::CoreSync
-        | ProjectionExecutionType::InlineSync
-        | ProjectionExecutionType::CoalescedSync => {}
-        ProjectionExecutionType::AsyncLatest
-        | ProjectionExecutionType::AsyncOrdered
-        | ProjectionExecutionType::OfflineArtifact
-        | ProjectionExecutionType::ReviewOnly => {
-            bail!(
-                "projection {key} uses {:?}, which is not supported by the sync projection runtime",
-                manifest.execution_type
-            );
-        }
-    }
-    if matches!(manifest.lag_policy, ProjectionLagPolicy::ReviewOnly) {
-        bail!("projection {key} uses review-only lag policy in the sync projection runtime");
-    }
-    Ok(())
-}
-
 fn wake_masks_intersect(left: ProjectionWakeEventMask, right: ProjectionWakeEventMask) -> bool {
     (left.exchange_events && right.exchange_events)
         || (left.trades && right.trades)
@@ -583,10 +552,9 @@ mod tests {
     use super::*;
     use crate::projection::{resolve_dependency_specs, ProjectionFactory};
     use ledger_domain::{
-        DependencyDecl, DependencyParams, ExpectedCost, MemoryClass, ProjectionCachePolicy,
-        ProjectionCostHint, ProjectionDeliverySemantics, ProjectionFramePolicy, ProjectionId,
-        ProjectionKind, ProjectionLagPolicy, ProjectionOutputSchema, ProjectionUpdateMode,
-        ProjectionVersion, SourceView, TemporalPolicy, TrustTier,
+        DependencyDecl, DependencyParams, ProjectionDeliverySemantics, ProjectionFramePolicy,
+        ProjectionId, ProjectionKind, ProjectionOutputSchema, ProjectionUpdateMode,
+        ProjectionVersion, SourceView, TemporalPolicy,
     };
     use serde_json::{json, Value};
 
@@ -609,21 +577,8 @@ mod tests {
             source_view: Some(SourceView::ExchangeTruth),
             temporal_policy: TemporalPolicy::Causal,
             wake_policy,
-            execution_type: ProjectionExecutionType::InlineSync,
             delivery_semantics: ProjectionDeliverySemantics::ReplaceLatest,
             frame_policy: ProjectionFramePolicy::EmitEveryUpdate,
-            lag_policy: ProjectionLagPolicy::ProhibitedWhenDue,
-            cache_policy: ProjectionCachePolicy::SessionMemory,
-            trust_tier: TrustTier::Core,
-            cost_hint: ProjectionCostHint {
-                expected_cost: ExpectedCost::Tiny,
-                max_inline_us: Some(10),
-                max_output_hz: Some(1000),
-                max_lag_ms: None,
-                memory_class: MemoryClass::SmallState,
-            },
-            visualization: vec![],
-            validation: vec![],
         }
     }
 
@@ -655,7 +610,7 @@ mod tests {
                 manifest: manifest(
                     "double_counter",
                     vec![dep("source_counter")],
-                    ProjectionWakePolicy::Manual,
+                    ProjectionWakePolicy::OnEventMask(ProjectionWakeEventMask::default()),
                 ),
                 kind: CounterKind::Double,
             }
@@ -666,7 +621,7 @@ mod tests {
                 manifest: manifest(
                     "sum_counter",
                     vec![dep("source_counter"), dep("double_counter")],
-                    ProjectionWakePolicy::Manual,
+                    ProjectionWakePolicy::OnEventMask(ProjectionWakeEventMask::default()),
                 ),
                 kind: CounterKind::Sum,
             }
@@ -677,7 +632,7 @@ mod tests {
                 manifest: manifest(
                     "cycle_a",
                     vec![dep("cycle_b")],
-                    ProjectionWakePolicy::Manual,
+                    ProjectionWakePolicy::OnEventMask(ProjectionWakeEventMask::default()),
                 ),
                 kind: CounterKind::Source,
             }
@@ -688,7 +643,7 @@ mod tests {
                 manifest: manifest(
                     "cycle_b",
                     vec![dep("cycle_a")],
-                    ProjectionWakePolicy::Manual,
+                    ProjectionWakePolicy::OnEventMask(ProjectionWakeEventMask::default()),
                 ),
                 kind: CounterKind::Source,
             }

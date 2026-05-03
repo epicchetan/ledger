@@ -56,6 +56,20 @@ impl ProjectionFrameDraft {
         }
     }
 
+    pub fn patch(payload: Value) -> Self {
+        Self {
+            op: ProjectionFrameOp::Patch,
+            payload,
+        }
+    }
+
+    pub fn append(payload: Value) -> Self {
+        Self {
+            op: ProjectionFrameOp::Append,
+            payload,
+        }
+    }
+
     pub fn snapshot(payload: Value) -> Self {
         Self {
             op: ProjectionFrameOp::Snapshot,

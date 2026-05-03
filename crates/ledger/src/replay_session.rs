@@ -8,8 +8,9 @@ use ledger_replay::ReplaySimulator;
 use serde::{Deserialize, Serialize};
 
 use crate::projection::{
-    ProjectionMetrics, ProjectionRegistry, ProjectionRuntime, ProjectionRuntimeConfig,
-    ProjectionRuntimeCursor, ProjectionSubscription, ProjectionSubscriptionId, TruthTick,
+    base_projection_registry, ProjectionMetrics, ProjectionRegistry, ProjectionRuntime,
+    ProjectionRuntimeConfig, ProjectionRuntimeCursor, ProjectionSubscription,
+    ProjectionSubscriptionId, TruthTick,
 };
 use crate::{Ledger, ObjectStore, ReplayDataset};
 
@@ -110,7 +111,7 @@ impl ReplaySession {
             event_store,
             execution_profile,
             visibility_profile,
-            ProjectionRegistry::new(),
+            base_projection_registry().expect("base projection registry must be valid"),
         )
     }
 
@@ -340,12 +341,11 @@ mod tests {
     };
     use chrono::NaiveDate;
     use ledger_domain::{
-        build_batches, build_trade_index, BookAction, BookSide, ExpectedCost, MboEvent,
-        MemoryClass, PriceTicks, ProjectionCachePolicy, ProjectionCostHint,
-        ProjectionDeliverySemantics, ProjectionExecutionType, ProjectionFramePolicy, ProjectionId,
-        ProjectionKey, ProjectionKind, ProjectionLagPolicy, ProjectionManifest,
-        ProjectionOutputSchema, ProjectionUpdateMode, ProjectionVersion, ProjectionWakeEventMask,
-        ProjectionWakePolicy, SourceView, TemporalPolicy, TrustTier,
+        build_batches, build_trade_index, BookAction, BookSide, MboEvent, PriceTicks,
+        ProjectionDeliverySemantics, ProjectionFramePolicy, ProjectionId, ProjectionKey,
+        ProjectionKind, ProjectionManifest, ProjectionOutputSchema, ProjectionUpdateMode,
+        ProjectionVersion, ProjectionWakeEventMask, ProjectionWakePolicy, SourceView,
+        TemporalPolicy,
     };
     use ledger_replay::ReplaySimulator;
     use serde_json::{json, Value};
@@ -438,21 +438,8 @@ mod tests {
             source_view: Some(SourceView::ExchangeTruth),
             temporal_policy: TemporalPolicy::Causal,
             wake_policy,
-            execution_type: ProjectionExecutionType::InlineSync,
             delivery_semantics: ProjectionDeliverySemantics::ReplaceLatest,
             frame_policy: ProjectionFramePolicy::EmitEveryUpdate,
-            lag_policy: ProjectionLagPolicy::ProhibitedWhenDue,
-            cache_policy: ProjectionCachePolicy::SessionMemory,
-            trust_tier: TrustTier::Core,
-            cost_hint: ProjectionCostHint {
-                expected_cost: ExpectedCost::Tiny,
-                max_inline_us: Some(10),
-                max_output_hz: Some(1000),
-                max_lag_ms: None,
-                memory_class: MemoryClass::SmallState,
-            },
-            visualization: vec![],
-            validation: vec![],
         }
     }
 

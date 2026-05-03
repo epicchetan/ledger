@@ -1,4 +1,4 @@
-use ledger_domain::{Bbo, ProjectionWakeEventMask, UnixNanos};
+use ledger_domain::{Bbo, ProjectionWakeEventMask, TradeRecord, UnixNanos};
 use ledger_replay::ReplayStepResult;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +25,7 @@ impl TruthTick {
             exchange: TruthExchangeTick {
                 event_count: 1,
                 trade_count: 0,
+                trades: Vec::new(),
                 bbo_before: None,
                 bbo_after: None,
                 bbo_changed: false,
@@ -58,6 +59,7 @@ impl TruthTick {
             exchange: TruthExchangeTick {
                 event_count: step.event_count,
                 trade_count: step.trades.len(),
+                trades: step.trades.clone(),
                 bbo_before: step.bbo_before,
                 bbo_after: step.bbo_after,
                 bbo_changed: step.bbo_changed,
@@ -76,6 +78,7 @@ impl TruthTick {
 pub struct TruthExchangeTick {
     pub event_count: usize,
     pub trade_count: usize,
+    pub trades: Vec<TradeRecord>,
     pub bbo_before: Option<Bbo>,
     pub bbo_after: Option<Bbo>,
     pub bbo_changed: bool,

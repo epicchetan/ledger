@@ -221,31 +221,28 @@ output schema
 source view
 temporal policy
 wake policy
-execution type
 frame policy
-lag / staleness policy
-cache policy
-trust tier
-validation declarations
-visualization hints
 ```
 
-That contract is what makes agentic development practical. An agent should be able to add `absorption_score:v2` without guessing where to plug it in. It declares what it consumes, what it emits, how it runs, how it is validated, and whether it is safe for training, live, review, or research-only use.
+That current contract is intentionally small. It is enough for deterministic
+replay projections and CLI validation without preloading execution, cache,
+trust, validation, or visualization vocabulary before those features exist.
+
+That contract is what makes agentic development practical. An agent should be
+able to add a base projection without guessing where to plug it in. It declares
+what it consumes, what it emits, and when it wakes. More advanced policy fields
+can return when the platform has the feature pressure and tests to justify them.
 
 ## Execution Policy
 
-Not all projections should run the same way.
+Near-term projections run synchronously inside the active replay session. Core
+truth cannot be stale, and the first product goal is to make cursor, BBO,
+canonical trades, and bars deterministic before introducing worker queues or
+lag semantics.
 
-| Execution type | Behavior |
-| --- | --- |
-| CoreSync | Cannot lag. Must complete before the replay cursor advances. |
-| InlineSync | Runs synchronously when its wake policy fires. |
-| CoalescedSync | Keeps state current but may coalesce visual frames. |
-| AsyncLatest | Never blocks replay. Newest valid result wins; stale results are marked or dropped. |
-| OfflineArtifact | Precomputed artifact revealed only as-of the replay cursor. |
-| ReviewOnly | Hindsight/research output blocked from training/live decision surfaces unless explicitly enabled. |
-
-Core truth cannot be stale. Expensive model or research outputs should not freeze replay. The execution policy makes that explicit instead of hiding it in UI code.
+Future async/offline/model projections will need explicit execution and
+staleness policy. Those fields should be introduced with the feature that uses
+them, not carried as unused schema.
 
 ## Replay Truth, Visibility, and Execution
 

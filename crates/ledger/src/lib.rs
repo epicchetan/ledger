@@ -28,7 +28,7 @@ pub mod projection;
 mod replay_session;
 mod validation;
 
-use projection::ProjectionRegistry;
+use projection::{base_projection_registry, ProjectionRegistry};
 
 pub use ledger_store::ObjectStore;
 pub use progress::*;
@@ -137,7 +137,7 @@ impl Ledger<ledger_store::R2ObjectStore> {
     ) -> Result<Self> {
         Ok(Self {
             store: R2LedgerStore::from_env(data_dir, r2_prefix).await?,
-            projection_registry: ProjectionRegistry::new(),
+            projection_registry: base_projection_registry()?,
         })
     }
 }
@@ -146,7 +146,8 @@ impl<S: ObjectStore + 'static> Ledger<S> {
     pub fn new(store: LedgerStore<S>) -> Self {
         Self {
             store,
-            projection_registry: ProjectionRegistry::new(),
+            projection_registry: base_projection_registry()
+                .expect("base projection registry must be valid"),
         }
     }
 
@@ -429,6 +430,26 @@ mod tests {
             trades: build_trade_index(&events),
             events,
         }
+    }
+
+    #[test]
+    fn ledger_new_contains_base_projection_registry() {
+        let dir = tempdir().unwrap();
+        let store = LedgerStore::new(
+            ledger_store::LocalStore::new(dir.path()),
+            Arc::new(ledger_store::MemoryObjectStore::new("test")),
+            ledger_store::ObjectKeyBuilder::default(),
+        );
+
+        let ledger = Ledger::new(store);
+        let ids = ledger
+            .projection_registry()
+            .list_manifests()
+            .iter()
+            .map(|manifest| manifest.id.as_str().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["cursor", "bbo", "canonical_trades", "bars"]);
     }
 
     #[tokio::test]

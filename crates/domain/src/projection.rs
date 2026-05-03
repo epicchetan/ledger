@@ -263,17 +263,8 @@ pub struct ProjectionManifest {
     pub source_view: Option<SourceView>,
     pub temporal_policy: TemporalPolicy,
     pub wake_policy: ProjectionWakePolicy,
-    pub execution_type: ProjectionExecutionType,
     pub delivery_semantics: ProjectionDeliverySemantics,
     pub frame_policy: ProjectionFramePolicy,
-    pub lag_policy: ProjectionLagPolicy,
-    pub cache_policy: ProjectionCachePolicy,
-    pub trust_tier: TrustTier,
-    pub cost_hint: ProjectionCostHint,
-    #[serde(default)]
-    pub visualization: Vec<VisualizationHint>,
-    #[serde(default)]
-    pub validation: Vec<ValidationDecl>,
 }
 
 impl ProjectionManifest {
@@ -294,25 +285,6 @@ impl ProjectionManifest {
         for dependency in &self.dependencies {
             dependency.validate()?;
         }
-        if matches!(self.execution_type, ProjectionExecutionType::CoreSync) {
-            ensure!(
-                matches!(
-                    self.lag_policy,
-                    ProjectionLagPolicy::Prohibited | ProjectionLagPolicy::ProhibitedWhenDue
-                ),
-                "core sync projection {}:{} cannot allow lag",
-                self.id,
-                self.version
-            );
-        }
-        if matches!(self.execution_type, ProjectionExecutionType::ReviewOnly) {
-            ensure!(
-                matches!(self.trust_tier, TrustTier::ResearchOnly),
-                "review-only projection {}:{} must use research_only trust tier",
-                self.id,
-                self.version
-            );
-        }
         Ok(())
     }
 
@@ -330,20 +302,12 @@ impl ProjectionManifest {
 #[serde(rename_all = "snake_case")]
 pub enum ProjectionKind {
     Base,
-    DerivedStudy,
-    CompositeStudy,
-    ModelStudy,
-    Visual,
-    Journal,
-    Diagnostic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectionUpdateMode {
     Online,
-    Offline,
-    OnlineAndOffline,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -352,17 +316,12 @@ pub enum SourceView {
     ExchangeTruth,
     TraderVisibility,
     ExecutionSimulation,
-    ExternalAsOf,
-    JournalContext,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TemporalPolicy {
     Causal,
-    AsOf,
-    Hindsight,
-    ReviewOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -370,8 +329,6 @@ pub enum TemporalPolicy {
 pub enum ProjectionWakePolicy {
     EveryTick,
     OnEventMask(ProjectionWakeEventMask),
-    OnIntervalNs { interval_ns: u64 },
-    Manual,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -388,18 +345,6 @@ pub struct ProjectionWakeEventMask {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ProjectionExecutionType {
-    CoreSync,
-    InlineSync,
-    CoalescedSync,
-    AsyncLatest,
-    AsyncOrdered,
-    OfflineArtifact,
-    ReviewOnly,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ProjectionDeliverySemantics {
     ReplaceLatest,
     PatchByKey,
@@ -412,65 +357,7 @@ pub enum ProjectionDeliverySemantics {
 pub enum ProjectionFramePolicy {
     EmitEveryUpdate,
     EmitOnChange,
-    CoalesceNs { interval_ns: u64 },
     EmitOnWindowClose,
-    Manual,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProjectionLagPolicy {
-    Prohibited,
-    ProhibitedWhenDue,
-    StateCurrentFramesCoalesced,
-    LatestWins { max_lag_ms: Option<u64> },
-    CatchUpOrdered { max_lag_ms: Option<u64> },
-    ArtifactAsOf,
-    ReviewOnly,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProjectionCachePolicy {
-    None,
-    SessionMemory,
-    LocalReadThrough,
-    DatasetArtifact,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TrustTier {
-    Core,
-    Experimental,
-    ResearchOnly,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectionCostHint {
-    pub expected_cost: ExpectedCost,
-    pub max_inline_us: Option<u64>,
-    pub max_output_hz: Option<u32>,
-    pub max_lag_ms: Option<u64>,
-    pub memory_class: MemoryClass,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExpectedCost {
-    Tiny,
-    Cheap,
-    Medium,
-    Heavy,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MemoryClass {
-    SmallState,
-    RollingWindow,
-    LargeSnapshot,
-    ArtifactBacked,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -517,40 +404,6 @@ pub enum DependencyParams {
     InheritAll,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ValidationDecl {
-    pub kind: ValidationKind,
-    pub name: Option<String>,
-    pub required: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ValidationKind {
-    SyntheticFixture,
-    DeterministicDigest,
-    ProfileBudget,
-    GoldenFrames,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VisualizationHint {
-    pub surface: VisualizationSurface,
-    pub role: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VisualizationSurface {
-    Chart,
-    Dom,
-    Tape,
-    Heatmap,
-    Panel,
-    Journal,
-    Diagnostic,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectionFrame {
     pub stamp: ProjectionFrameStamp,
@@ -569,7 +422,6 @@ pub struct ProjectionFrameStamp {
     pub cursor_ts_ns: String,
     pub source_view: Option<SourceView>,
     pub temporal_policy: TemporalPolicy,
-    pub execution_type: ProjectionExecutionType,
     pub produced_at_ns: String,
     pub sequence: u64,
 }
@@ -580,9 +432,7 @@ pub enum ProjectionFrameOp {
     Replace,
     Patch,
     Append,
-    Delete,
     Snapshot,
-    Heartbeat,
 }
 
 fn canonicalize_json(value: &Value) -> Value {
@@ -674,28 +524,8 @@ mod tests {
                 trades: true,
                 ..Default::default()
             }),
-            execution_type: ProjectionExecutionType::InlineSync,
             delivery_semantics: ProjectionDeliverySemantics::PatchByKey,
             frame_policy: ProjectionFramePolicy::EmitOnWindowClose,
-            lag_policy: ProjectionLagPolicy::ProhibitedWhenDue,
-            cache_policy: ProjectionCachePolicy::SessionMemory,
-            trust_tier: TrustTier::Core,
-            cost_hint: ProjectionCostHint {
-                expected_cost: ExpectedCost::Cheap,
-                max_inline_us: Some(50),
-                max_output_hz: Some(10),
-                max_lag_ms: None,
-                memory_class: MemoryClass::SmallState,
-            },
-            visualization: vec![VisualizationHint {
-                surface: VisualizationSurface::Chart,
-                role: "primary_series".to_string(),
-            }],
-            validation: vec![ValidationDecl {
-                kind: ValidationKind::DeterministicDigest,
-                name: None,
-                required: true,
-            }],
         }
     }
 
@@ -801,7 +631,6 @@ mod tests {
             cursor_ts_ns: "1773266400000000000".to_string(),
             source_view: Some(SourceView::ExchangeTruth),
             temporal_policy: TemporalPolicy::Causal,
-            execution_type: ProjectionExecutionType::CoreSync,
             produced_at_ns: "1773266400000000100".to_string(),
             sequence: 7,
         };
@@ -812,18 +641,6 @@ mod tests {
 
         let decoded: ProjectionFrameStamp = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, stamp);
-    }
-
-    #[test]
-    fn lag_policy_roundtrips_json() {
-        let policy = ProjectionLagPolicy::LatestWins {
-            max_lag_ms: Some(250),
-        };
-
-        let encoded = serde_json::to_value(&policy).unwrap();
-        let decoded: ProjectionLagPolicy = serde_json::from_value(encoded).unwrap();
-
-        assert_eq!(decoded, policy);
     }
 
     #[test]
@@ -838,19 +655,6 @@ mod tests {
         let decoded: ProjectionWakePolicy = serde_json::from_value(encoded).unwrap();
 
         assert_eq!(decoded, policy);
-    }
-
-    #[test]
-    fn manifest_rejects_core_sync_with_lag() {
-        let mut manifest = test_manifest();
-        manifest.execution_type = ProjectionExecutionType::CoreSync;
-        manifest.lag_policy = ProjectionLagPolicy::LatestWins {
-            max_lag_ms: Some(10),
-        };
-
-        let err = manifest.validate().unwrap_err();
-
-        assert!(format!("{err:#}").contains("cannot allow lag"));
     }
 
     #[test]
