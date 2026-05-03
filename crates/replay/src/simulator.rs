@@ -1,8 +1,8 @@
 use anyhow::{bail, Result};
 use ledger_book::OrderBook;
 use ledger_domain::{
-    EventStore, ExecutionProfile, SameTimestampPolicy, SimFill, SimOrderAccepted, SimOrderRequest,
-    VisibilityProfile,
+    Bbo, EventStore, ExecutionProfile, SameTimestampPolicy, SimFill, SimOrderAccepted,
+    SimOrderRequest, TradeRecord, UnixNanos, VisibilityProfile,
 };
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +15,20 @@ pub struct ReplaySimReport {
     pub fills: Vec<SimFill>,
     pub frames: Vec<VisibilityFrame>,
     pub final_book_checksum: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayStepResult {
+    pub applied_batch_idx: usize,
+    pub batch_idx_after: usize,
+    pub cursor_ts_ns: UnixNanos,
+    pub event_count: usize,
+    pub trades: Vec<TradeRecord>,
+    pub bbo_before: Option<Bbo>,
+    pub bbo_after: Option<Bbo>,
+    pub bbo_changed: bool,
+    pub emitted_visibility_frames: usize,
+    pub new_fills: usize,
 }
 
 pub struct ReplaySimulator {
@@ -73,26 +87,42 @@ impl ReplaySimulator {
         Ok(())
     }
 
-    pub fn step_next_exchange_batch(&mut self) -> Result<()> {
+    pub fn step_next_exchange_batch(&mut self) -> Result<ReplayStepResult> {
         if self.batch_idx >= self.store.batches.len() {
             bail!("no more batches");
         }
+        let applied_batch_idx = self.batch_idx;
         let span = self.store.batches[self.batch_idx];
         let events = self.store.batch_events(span);
+        let event_count = events.len();
+        let fill_count_before = self.execution.fills().len();
         let out = self.book.apply_batch(events);
-        self.execution.on_trades(&out.trades);
+        let trades = out.trades.clone();
+        self.execution.on_trades(&trades);
         let depth = self.book.depth(self.visibility.profile.depth_levels);
         self.visibility.on_batch(
             span.ts_event_ns,
             self.batch_idx,
             out.bbo_after,
             depth,
-            out.trades,
+            trades.clone(),
         );
         self.cursor_ts_ns = span.ts_event_ns;
         self.batch_idx += 1;
-        self.visibility.emit_due(self.cursor_ts_ns);
-        Ok(())
+        let emitted_visibility_frames = self.visibility.emit_due(self.cursor_ts_ns).len();
+        let new_fills = self.execution.fills().len() - fill_count_before;
+        Ok(ReplayStepResult {
+            applied_batch_idx,
+            batch_idx_after: self.batch_idx,
+            cursor_ts_ns: self.cursor_ts_ns,
+            event_count,
+            trades,
+            bbo_before: out.bbo_before,
+            bbo_after: out.bbo_after,
+            bbo_changed: out.bbo_before != out.bbo_after,
+            emitted_visibility_frames,
+            new_fills,
+        })
     }
 
     pub fn run_until(&mut self, target_ts_ns: u64) -> Result<ReplaySimReport> {
@@ -223,6 +253,45 @@ mod tests {
             0,
             true,
         )
+    }
+
+    #[test]
+    fn step_result_reports_batch_cursor_and_counts() {
+        let store = store(vec![add(100, 1, BookSide::Bid, 100, 2, 1)]);
+        let mut sim = ReplaySimulator::new(
+            store,
+            ExecutionProfile::default(),
+            VisibilityProfile::truth(),
+        );
+
+        let step = sim.step_next_exchange_batch().unwrap();
+
+        assert_eq!(step.applied_batch_idx, 0);
+        assert_eq!(step.batch_idx_after, 1);
+        assert_eq!(step.cursor_ts_ns, 100);
+        assert_eq!(step.event_count, 1);
+        assert_eq!(step.trades.len(), 0);
+        assert_eq!(step.bbo_before, None);
+        assert_eq!(step.bbo_after.unwrap().bid_price, Some(PriceTicks(100)));
+        assert!(step.bbo_changed);
+        assert_eq!(step.emitted_visibility_frames, 1);
+        assert_eq!(step.new_fills, 0);
+    }
+
+    #[test]
+    fn step_result_reports_trade_batch() {
+        let store = store(vec![trade(100, 1, BookSide::Ask, 100, 3)]);
+        let mut sim = ReplaySimulator::new(
+            store,
+            ExecutionProfile::default(),
+            VisibilityProfile::truth(),
+        );
+
+        let step = sim.step_next_exchange_batch().unwrap();
+
+        assert_eq!(step.trades.len(), 1);
+        assert_eq!(step.trades[0].price, PriceTicks(100));
+        assert_eq!(step.trades[0].size, 3);
     }
 
     #[test]

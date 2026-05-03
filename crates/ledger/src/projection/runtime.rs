@@ -1,6 +1,6 @@
 use super::{
     ProjectionAdvance, ProjectionContext, ProjectionFrameDraft, ProjectionMetrics, ProjectionNode,
-    ProjectionRegistry, ProjectionRuntimeTick,
+    ProjectionRegistry, TruthTick,
 };
 use anyhow::{bail, ensure, Context, Result};
 use indexmap::{IndexMap, IndexSet};
@@ -16,6 +16,7 @@ use std::time::Instant;
 pub struct ProjectionRuntimeConfig {
     pub session_id: String,
     pub replay_dataset_id: String,
+    pub initial_cursor: ProjectionRuntimeCursor,
 }
 
 impl Default for ProjectionRuntimeConfig {
@@ -23,6 +24,22 @@ impl Default for ProjectionRuntimeConfig {
         Self {
             session_id: "synthetic-session".to_string(),
             replay_dataset_id: "synthetic-replay-dataset".to_string(),
+            initial_cursor: ProjectionRuntimeCursor::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProjectionRuntimeCursor {
+    pub batch_idx: u64,
+    pub cursor_ts_ns: UnixNanos,
+}
+
+impl ProjectionRuntimeCursor {
+    pub fn new(batch_idx: u64, cursor_ts_ns: UnixNanos) -> Self {
+        Self {
+            batch_idx,
+            cursor_ts_ns,
         }
     }
 }
@@ -46,6 +63,7 @@ pub struct ProjectionSubscription {
 pub struct ProjectionRuntime {
     registry: ProjectionRegistry,
     config: ProjectionRuntimeConfig,
+    cursor: ProjectionRuntimeCursor,
     nodes: IndexMap<ProjectionKey, NodeEntry>,
     deps: IndexMap<ProjectionKey, Vec<ProjectionKey>>,
     reverse_deps: IndexMap<ProjectionKey, Vec<ProjectionKey>>,
@@ -61,9 +79,11 @@ pub struct ProjectionRuntime {
 
 impl ProjectionRuntime {
     pub fn new(registry: ProjectionRegistry, config: ProjectionRuntimeConfig) -> Self {
+        let cursor = config.initial_cursor;
         Self {
             registry,
             config,
+            cursor,
             nodes: IndexMap::new(),
             deps: IndexMap::new(),
             reverse_deps: IndexMap::new(),
@@ -88,6 +108,10 @@ impl ProjectionRuntime {
 
     pub fn metrics(&self) -> &ProjectionMetrics {
         &self.metrics
+    }
+
+    pub fn cursor(&self) -> ProjectionRuntimeCursor {
+        self.cursor
     }
 
     pub fn active_topological_order(&self) -> &[ProjectionKey] {
@@ -129,8 +153,12 @@ impl ProjectionRuntime {
             },
         );
 
-        let initial_frames =
-            vec![self.snapshot_frame(&requested_key, ProjectionFrameOp::Snapshot, 0, 0)?];
+        let initial_frames = vec![self.snapshot_frame(
+            &requested_key,
+            ProjectionFrameOp::Snapshot,
+            self.cursor.batch_idx,
+            self.cursor.cursor_ts_ns,
+        )?];
 
         Ok(ProjectionSubscription {
             id,
@@ -170,7 +198,8 @@ impl ProjectionRuntime {
         Ok(())
     }
 
-    pub fn advance(&mut self, tick: ProjectionRuntimeTick) -> Result<Vec<ProjectionFrame>> {
+    pub fn advance(&mut self, tick: TruthTick) -> Result<Vec<ProjectionFrame>> {
+        self.cursor = ProjectionRuntimeCursor::new(tick.batch_idx, tick.cursor_ts_ns);
         let mut changed = IndexSet::<ProjectionKey>::new();
         let mut frames = Vec::new();
 
@@ -207,9 +236,7 @@ impl ProjectionRuntime {
                     self.last_payloads.insert(key.clone(), snapshot);
                 }
                 ProjectionAdvance::NeedsAsyncWork(reason) => {
-                    bail!(
-                        "projection node {key} requested async work in Phase 2 runtime: {reason}"
-                    );
+                    bail!("projection node {key} requested async work: {reason}");
                 }
             }
 
@@ -227,6 +254,11 @@ impl ProjectionRuntime {
     }
 
     pub fn reset(&mut self) -> Result<Vec<ProjectionFrame>> {
+        self.reset_at(self.cursor)
+    }
+
+    pub fn reset_at(&mut self, cursor: ProjectionRuntimeCursor) -> Result<Vec<ProjectionFrame>> {
+        self.cursor = cursor;
         self.generation += 1;
         self.sequence = 0;
         self.metrics.clear();
@@ -246,7 +278,14 @@ impl ProjectionRuntime {
             .collect::<IndexSet<_>>();
         requested_keys
             .iter()
-            .map(|key| self.snapshot_frame(key, ProjectionFrameOp::Snapshot, 0, 0))
+            .map(|key| {
+                self.snapshot_frame(
+                    key,
+                    ProjectionFrameOp::Snapshot,
+                    self.cursor.batch_idx,
+                    self.cursor.cursor_ts_ns,
+                )
+            })
             .collect()
     }
 
@@ -397,7 +436,7 @@ impl ProjectionRuntime {
         Ok(())
     }
 
-    fn wake_due(&self, key: &ProjectionKey, tick: &ProjectionRuntimeTick) -> Result<bool> {
+    fn wake_due(&self, key: &ProjectionKey, tick: &TruthTick) -> Result<bool> {
         let entry = self
             .nodes
             .get(key)
@@ -517,13 +556,13 @@ fn ensure_supported_execution(key: &ProjectionKey, manifest: &ProjectionManifest
         | ProjectionExecutionType::OfflineArtifact
         | ProjectionExecutionType::ReviewOnly => {
             bail!(
-                "projection {key} uses {:?}, which is not supported by the Phase 2 runtime",
+                "projection {key} uses {:?}, which is not supported by the sync projection runtime",
                 manifest.execution_type
             );
         }
     }
     if matches!(manifest.lag_policy, ProjectionLagPolicy::ReviewOnly) {
-        bail!("projection {key} uses review-only lag policy in Phase 2 runtime");
+        bail!("projection {key} uses review-only lag policy in the sync projection runtime");
     }
     Ok(())
 }
@@ -852,9 +891,7 @@ mod tests {
     fn runtime_advances_in_topological_order() {
         let mut runtime = runtime();
         let subscription = runtime.subscribe(spec("sum_counter")).unwrap();
-        let frames = runtime
-            .advance(ProjectionRuntimeTick::synthetic(1, 100))
-            .unwrap();
+        let frames = runtime.advance(TruthTick::synthetic(1, 100)).unwrap();
 
         let values = frames
             .iter()
@@ -885,9 +922,7 @@ mod tests {
         let subscription = runtime.subscribe(spec("source_counter")).unwrap();
         runtime.unsubscribe(subscription.id).unwrap();
 
-        let frames = runtime
-            .advance(ProjectionRuntimeTick::synthetic(1, 100))
-            .unwrap();
+        let frames = runtime.advance(TruthTick::synthetic(1, 100)).unwrap();
 
         assert!(frames.is_empty());
         assert_eq!(runtime.active_node_count(), 0);
@@ -917,9 +952,7 @@ mod tests {
     fn runtime_generation_increments_on_reset() {
         let mut runtime = runtime();
         runtime.subscribe(spec("source_counter")).unwrap();
-        runtime
-            .advance(ProjectionRuntimeTick::synthetic(1, 100))
-            .unwrap();
+        runtime.advance(TruthTick::synthetic(1, 100)).unwrap();
 
         let frames = runtime.reset().unwrap();
 
@@ -942,14 +975,47 @@ mod tests {
     }
 
     #[test]
+    fn runtime_initial_snapshot_uses_configured_cursor() {
+        let mut runtime = ProjectionRuntime::new(
+            registry(),
+            ProjectionRuntimeConfig {
+                session_id: "session-a".to_string(),
+                replay_dataset_id: "dataset-a".to_string(),
+                initial_cursor: ProjectionRuntimeCursor::new(7, 700),
+            },
+        );
+        let subscription = runtime.subscribe(spec("source_counter")).unwrap();
+        let frame = &subscription.initial_frames[0];
+
+        assert_eq!(frame.stamp.session_id, "session-a");
+        assert_eq!(frame.stamp.replay_dataset_id, "dataset-a");
+        assert_eq!(frame.stamp.batch_idx, 7);
+        assert_eq!(frame.stamp.cursor_ts_ns, "700");
+    }
+
+    #[test]
+    fn runtime_reset_at_uses_requested_cursor() {
+        let mut runtime = runtime();
+        runtime.subscribe(spec("source_counter")).unwrap();
+        runtime.advance(TruthTick::synthetic(1, 100)).unwrap();
+
+        let frames = runtime
+            .reset_at(ProjectionRuntimeCursor::new(3, 300))
+            .unwrap();
+
+        assert_eq!(runtime.generation(), 1);
+        assert_eq!(runtime.cursor(), ProjectionRuntimeCursor::new(3, 300));
+        assert_eq!(frames[0].stamp.generation, 1);
+        assert_eq!(frames[0].stamp.batch_idx, 3);
+        assert_eq!(frames[0].stamp.cursor_ts_ns, "300");
+    }
+
+    #[test]
     fn runtime_frame_stamp_uses_string_nanoseconds() {
         let mut runtime = runtime();
         runtime.subscribe(spec("source_counter")).unwrap();
         let frame = runtime
-            .advance(ProjectionRuntimeTick::synthetic(
-                7,
-                1_773_266_400_000_000_000,
-            ))
+            .advance(TruthTick::synthetic(7, 1_773_266_400_000_000_000))
             .unwrap()
             .remove(0);
         let encoded = serde_json::to_value(frame.stamp).unwrap();

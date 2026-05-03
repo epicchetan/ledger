@@ -1,40 +1,20 @@
 use anyhow::Result;
 use indexmap::IndexMap;
-use ledger_domain::{
-    ProjectionFrameOp, ProjectionKey, ProjectionSpec, ProjectionWakeEventMask, UnixNanos,
-};
+use ledger_domain::{ProjectionFrameOp, ProjectionKey, ProjectionSpec};
 use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectionRuntimeTick {
-    pub batch_idx: u64,
-    pub cursor_ts_ns: UnixNanos,
-    pub flags: ProjectionWakeEventMask,
-}
-
-impl ProjectionRuntimeTick {
-    pub fn synthetic(batch_idx: u64, cursor_ts_ns: UnixNanos) -> Self {
-        Self {
-            batch_idx,
-            cursor_ts_ns,
-            flags: ProjectionWakeEventMask {
-                exchange_events: true,
-                ..Default::default()
-            },
-        }
-    }
-}
+use super::TruthTick;
 
 #[derive(Debug, Clone)]
 pub struct ProjectionContext<'a> {
-    tick: &'a ProjectionRuntimeTick,
+    tick: &'a TruthTick,
     key: &'a ProjectionKey,
     dependencies: IndexMap<ProjectionKey, Value>,
 }
 
 impl<'a> ProjectionContext<'a> {
     pub(crate) fn new(
-        tick: &'a ProjectionRuntimeTick,
+        tick: &'a TruthTick,
         key: &'a ProjectionKey,
         dependencies: IndexMap<ProjectionKey, Value>,
     ) -> Self {
@@ -45,7 +25,7 @@ impl<'a> ProjectionContext<'a> {
         }
     }
 
-    pub fn tick(&self) -> &ProjectionRuntimeTick {
+    pub fn tick(&self) -> &TruthTick {
         self.tick
     }
 

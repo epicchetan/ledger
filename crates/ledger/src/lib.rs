@@ -28,6 +28,8 @@ pub mod projection;
 mod replay_session;
 mod validation;
 
+use projection::ProjectionRegistry;
+
 pub use ledger_store::ObjectStore;
 pub use progress::*;
 pub use replay_session::*;
@@ -36,6 +38,7 @@ pub use validation::*;
 #[derive(Clone)]
 pub struct Ledger<S: ObjectStore + 'static> {
     pub store: LedgerStore<S>,
+    projection_registry: ProjectionRegistry,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,13 +137,31 @@ impl Ledger<ledger_store::R2ObjectStore> {
     ) -> Result<Self> {
         Ok(Self {
             store: R2LedgerStore::from_env(data_dir, r2_prefix).await?,
+            projection_registry: ProjectionRegistry::new(),
         })
     }
 }
 
 impl<S: ObjectStore + 'static> Ledger<S> {
     pub fn new(store: LedgerStore<S>) -> Self {
-        Self { store }
+        Self {
+            store,
+            projection_registry: ProjectionRegistry::new(),
+        }
+    }
+
+    pub fn with_projection_registry(
+        store: LedgerStore<S>,
+        projection_registry: ProjectionRegistry,
+    ) -> Self {
+        Self {
+            store,
+            projection_registry,
+        }
+    }
+
+    pub fn projection_registry(&self) -> &ProjectionRegistry {
+        &self.projection_registry
     }
 
     pub async fn status(&self, symbol: &str, date: NaiveDate) -> Result<ReplayDatasetStatus> {
