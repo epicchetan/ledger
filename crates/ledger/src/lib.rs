@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 mod progress;
+pub mod projection;
 mod replay_session;
 mod validation;
 

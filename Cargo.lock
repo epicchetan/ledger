@@ -2000,6 +2000,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "indexmap",
  "ledger-book",
  "ledger-domain",
  "ledger-ingest",
