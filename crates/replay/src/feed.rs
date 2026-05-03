@@ -41,6 +41,8 @@ pub struct ReplayFeedSnapshot {
     pub feed_seq: u64,
     pub feed_ts_ns: UnixNanos,
     pub next_feed_ts_ns: Option<UnixNanos>,
+    pub source_first_ts_ns: Option<UnixNanos>,
+    pub source_last_ts_ns: Option<UnixNanos>,
     pub batch_idx: usize,
     pub total_batches: usize,
     pub book_checksum: String,
@@ -55,6 +57,8 @@ pub struct ReplayFeed {
     mode: ReplayFeedMode,
     feed_seq: u64,
     total_batches: usize,
+    source_first_ts_ns: Option<UnixNanos>,
+    source_last_ts_ns: Option<UnixNanos>,
 }
 
 impl ReplayFeed {
@@ -65,6 +69,8 @@ impl ReplayFeed {
             mode,
             feed_seq: 0,
             total_batches,
+            source_first_ts_ns: None,
+            source_last_ts_ns: None,
         }
     }
 
@@ -85,6 +91,8 @@ impl ReplayFeed {
             .step_next_exchange_batch()
             .context("advancing replay feed one exchange-truth batch")?;
         self.feed_seq += 1;
+        self.source_first_ts_ns = Some(source_first_ts_ns);
+        self.source_last_ts_ns = Some(source_last_ts_ns);
         Ok(Some(ReplayFeedBatch {
             feed_seq: self.feed_seq,
             feed_ts_ns: replay_step.cursor_ts_ns,
@@ -99,14 +107,22 @@ impl ReplayFeed {
             .seek_to(target_ts_ns)
             .context("seeking replay feed")?;
         self.feed_seq = 0;
+        self.source_first_ts_ns = None;
+        self.source_last_ts_ns = None;
         Ok(self.snapshot())
+    }
+
+    pub fn next_feed_ts_ns(&self) -> Option<UnixNanos> {
+        self.simulator.next_batch_ts_ns()
     }
 
     pub fn snapshot(&self) -> ReplayFeedSnapshot {
         ReplayFeedSnapshot {
             feed_seq: self.feed_seq,
             feed_ts_ns: self.simulator.cursor_ts_ns(),
-            next_feed_ts_ns: self.simulator.next_batch_ts_ns(),
+            next_feed_ts_ns: self.next_feed_ts_ns(),
+            source_first_ts_ns: self.source_first_ts_ns,
+            source_last_ts_ns: self.source_last_ts_ns,
             batch_idx: self.simulator.batch_idx(),
             total_batches: self.total_batches,
             book_checksum: self.simulator.book().checksum(),
@@ -170,6 +186,8 @@ mod tests {
         assert_eq!(snapshot.feed_seq, 0);
         assert_eq!(snapshot.feed_ts_ns, 100);
         assert_eq!(snapshot.next_feed_ts_ns, Some(100));
+        assert_eq!(snapshot.source_first_ts_ns, None);
+        assert_eq!(snapshot.source_last_ts_ns, None);
         assert_eq!(snapshot.batch_idx, 0);
         assert_eq!(snapshot.total_batches, 1);
         assert!(!snapshot.ended);
@@ -186,6 +204,8 @@ mod tests {
         assert_eq!(batch.source_first_ts_ns, Some(100));
         assert_eq!(batch.source_last_ts_ns, Some(100));
         assert_eq!(batch.replay_step.batch_idx_after, 1);
+        assert_eq!(feed.snapshot().source_first_ts_ns, Some(100));
+        assert_eq!(feed.snapshot().source_last_ts_ns, Some(100));
         assert!(feed.snapshot().ended);
     }
 
@@ -210,6 +230,8 @@ mod tests {
 
         assert_eq!(snapshot.feed_seq, 0);
         assert_eq!(snapshot.feed_ts_ns, 100);
+        assert_eq!(snapshot.source_first_ts_ns, None);
+        assert_eq!(snapshot.source_last_ts_ns, None);
         assert_eq!(snapshot.batch_idx, 1);
         assert_eq!(snapshot.next_feed_ts_ns, Some(200));
     }

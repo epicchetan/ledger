@@ -30,6 +30,10 @@ impl Default for ProjectionRuntimeConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ProjectionRuntimeCursor {
+    pub feed_seq: u64,
+    pub feed_ts_ns: UnixNanos,
+    pub source_first_ts_ns: Option<UnixNanos>,
+    pub source_last_ts_ns: Option<UnixNanos>,
     pub batch_idx: u64,
     pub cursor_ts_ns: UnixNanos,
 }
@@ -37,9 +41,42 @@ pub struct ProjectionRuntimeCursor {
 impl ProjectionRuntimeCursor {
     pub fn new(batch_idx: u64, cursor_ts_ns: UnixNanos) -> Self {
         Self {
+            feed_seq: batch_idx,
+            feed_ts_ns: cursor_ts_ns,
+            source_first_ts_ns: None,
+            source_last_ts_ns: None,
             batch_idx,
             cursor_ts_ns,
         }
+    }
+
+    pub fn with_feed(
+        feed_seq: u64,
+        feed_ts_ns: UnixNanos,
+        source_first_ts_ns: Option<UnixNanos>,
+        source_last_ts_ns: Option<UnixNanos>,
+        batch_idx: u64,
+        cursor_ts_ns: UnixNanos,
+    ) -> Self {
+        Self {
+            feed_seq,
+            feed_ts_ns,
+            source_first_ts_ns,
+            source_last_ts_ns,
+            batch_idx,
+            cursor_ts_ns,
+        }
+    }
+
+    pub fn from_tick(tick: &SessionTick) -> Self {
+        Self::with_feed(
+            tick.feed_seq,
+            tick.feed_ts_ns,
+            tick.source_first_ts_ns,
+            tick.source_last_ts_ns,
+            tick.batch_idx,
+            tick.cursor_ts_ns,
+        )
     }
 }
 
@@ -152,12 +189,8 @@ impl ProjectionRuntime {
             },
         );
 
-        let initial_frames = vec![self.snapshot_frame(
-            &requested_key,
-            ProjectionFrameOp::Snapshot,
-            self.cursor.batch_idx,
-            self.cursor.cursor_ts_ns,
-        )?];
+        let initial_frames =
+            vec![self.snapshot_frame(&requested_key, ProjectionFrameOp::Snapshot, self.cursor)?];
 
         Ok(ProjectionSubscription {
             id,
@@ -198,7 +231,7 @@ impl ProjectionRuntime {
     }
 
     pub fn advance(&mut self, tick: SessionTick) -> Result<Vec<ProjectionFrame>> {
-        self.cursor = ProjectionRuntimeCursor::new(tick.batch_idx, tick.cursor_ts_ns);
+        self.cursor = ProjectionRuntimeCursor::from_tick(&tick);
         let mut changed = IndexSet::<ProjectionKey>::new();
         let mut frames = Vec::new();
 
@@ -243,7 +276,7 @@ impl ProjectionRuntime {
             let drafts = self.drain_node_frames(&key)?;
             let frame_count = drafts.len();
             for draft in drafts {
-                frames.push(self.stamp_frame(&key, draft, tick.batch_idx, tick.cursor_ts_ns)?);
+                frames.push(self.stamp_frame(&key, draft, self.cursor)?);
             }
             self.metrics
                 .record_advance(&key, started_at.elapsed(), frame_count);
@@ -277,14 +310,7 @@ impl ProjectionRuntime {
             .collect::<IndexSet<_>>();
         requested_keys
             .iter()
-            .map(|key| {
-                self.snapshot_frame(
-                    key,
-                    ProjectionFrameOp::Snapshot,
-                    self.cursor.batch_idx,
-                    self.cursor.cursor_ts_ns,
-                )
-            })
+            .map(|key| self.snapshot_frame(key, ProjectionFrameOp::Snapshot, self.cursor))
             .collect()
     }
 
@@ -476,28 +502,21 @@ impl ProjectionRuntime {
         &mut self,
         key: &ProjectionKey,
         op: ProjectionFrameOp,
-        batch_idx: u64,
-        cursor_ts_ns: UnixNanos,
+        cursor: ProjectionRuntimeCursor,
     ) -> Result<ProjectionFrame> {
         let payload = self
             .last_payloads
             .get(key)
             .cloned()
             .with_context(|| format!("projection node {key} has no snapshot payload"))?;
-        self.stamp_frame(
-            key,
-            ProjectionFrameDraft { op, payload },
-            batch_idx,
-            cursor_ts_ns,
-        )
+        self.stamp_frame(key, ProjectionFrameDraft { op, payload }, cursor)
     }
 
     fn stamp_frame(
         &mut self,
         key: &ProjectionKey,
         draft: ProjectionFrameDraft,
-        batch_idx: u64,
-        cursor_ts_ns: UnixNanos,
+        cursor: ProjectionRuntimeCursor,
     ) -> Result<ProjectionFrame> {
         let entry = self
             .nodes
@@ -511,8 +530,12 @@ impl ProjectionRuntime {
                 generation: self.generation,
                 projection_key: key.clone(),
                 output_schema: entry.manifest.output_schema.clone(),
-                batch_idx,
-                cursor_ts_ns: cursor_ts_ns.to_string(),
+                feed_seq: cursor.feed_seq,
+                feed_ts_ns: cursor.feed_ts_ns.to_string(),
+                source_first_ts_ns: cursor.source_first_ts_ns.map(|ts| ts.to_string()),
+                source_last_ts_ns: cursor.source_last_ts_ns.map(|ts| ts.to_string()),
+                batch_idx: cursor.batch_idx,
+                cursor_ts_ns: cursor.cursor_ts_ns.to_string(),
                 source_view: entry.manifest.source_view,
                 temporal_policy: entry.manifest.temporal_policy,
                 produced_at_ns: now_ns().to_string(),
@@ -944,6 +967,8 @@ mod tests {
 
         assert_eq!(frame.stamp.session_id, "session-a");
         assert_eq!(frame.stamp.replay_dataset_id, "dataset-a");
+        assert_eq!(frame.stamp.feed_seq, 7);
+        assert_eq!(frame.stamp.feed_ts_ns, "700");
         assert_eq!(frame.stamp.batch_idx, 7);
         assert_eq!(frame.stamp.cursor_ts_ns, "700");
     }
@@ -961,6 +986,8 @@ mod tests {
         assert_eq!(runtime.generation(), 1);
         assert_eq!(runtime.cursor(), ProjectionRuntimeCursor::new(3, 300));
         assert_eq!(frames[0].stamp.generation, 1);
+        assert_eq!(frames[0].stamp.feed_seq, 3);
+        assert_eq!(frames[0].stamp.feed_ts_ns, "300");
         assert_eq!(frames[0].stamp.batch_idx, 3);
         assert_eq!(frames[0].stamp.cursor_ts_ns, "300");
     }
@@ -975,6 +1002,10 @@ mod tests {
             .remove(0);
         let encoded = serde_json::to_value(frame.stamp).unwrap();
 
+        assert_eq!(encoded["feed_seq"], json!(7));
+        assert_eq!(encoded["feed_ts_ns"], json!("1773266400000000000"));
+        assert_eq!(encoded["source_first_ts_ns"], json!("1773266400000000000"));
+        assert_eq!(encoded["source_last_ts_ns"], json!("1773266400000000000"));
         assert_eq!(encoded["cursor_ts_ns"], json!("1773266400000000000"));
         assert!(encoded["produced_at_ns"].is_string());
     }

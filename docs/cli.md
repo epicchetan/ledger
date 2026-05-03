@@ -137,6 +137,31 @@ opens a `Session` with a replay feed, advances the requested number of feed
 batches, and reports feed cursor, batch index, checksum, BBO, frame count, and
 fill count. It does not persist a training session.
 
+## `session clock-run`
+
+Run the active `Session` controller with a deterministic fake clock. This proves
+the same feed/projection path can be advanced by session time instead of a fixed
+batch count.
+
+```bash
+cargo run -p ledger-cli -- session clock-run \
+  --symbol ESH6 \
+  --date 2026-03-12 \
+  --projection bars:v1 \
+  --params '{"seconds":60}' \
+  --speed 60 \
+  --tick-ms 16 \
+  --ticks 1000 \
+  --budget-batches 500 \
+  --digest \
+  --truth-visibility
+```
+
+The command does not sleep. It opens a replay-backed `Session`, subscribes the
+projection, advances fake monotonic time by `tick-ms`, pumps all feed batches
+due by the target feed time up to `budget-batches`, and prints a deterministic
+JSON report plus optional frame digest.
+
 ## `replay cache-status`
 
 Inspect whether the current durable `ReplayDataset` is cached locally.

@@ -180,7 +180,7 @@ Phase C  Projection contracts, runtime skeleton, and SessionTick integration
 
 ```text
 Phase 1  Base replay projections and contract cleanup
-Phase 2  Projection CLI validation
+Phase 2  Deterministic Session clock CLI validation
 ```
 
 ### Later Plans
@@ -506,11 +506,28 @@ print summary JSON
 compute stable digest from deterministic frame fields
 ```
 
+`session clock-run`:
+
+```text
+open cached ReplayDataset
+hydrate from R2 if missing
+start Session
+subscribe projection
+play with deterministic fake monotonic clock
+pump feed batches due by target feed time within a batch budget
+write optional JSONL ProjectionFrames
+print clock summary JSON
+compute stable digest from deterministic frame fields
+```
+
 Digest input should include:
 
 ```text
 projection_key
 generation
+feed_seq
+feed_ts_ns
+source timestamp range
 batch_idx
 cursor_ts_ns
 frame op
@@ -546,8 +563,8 @@ absolute local paths
     "requested_batches": 10000,
     "applied_batches": 10000,
     "frames": 812,
-    "first_cursor_ts_ns": "1773266400000000000",
-    "last_cursor_ts_ns": "1773266500000000000",
+    "first_feed_ts_ns": "1773266400000000000",
+    "last_feed_ts_ns": "1773266500000000000",
     "digest": "sha256:..."
   },
   "passed": true

@@ -20,6 +20,10 @@ fn projection_digest_value(frame: &ProjectionFrame) -> Result<Value> {
     Ok(json!({
         "projection_key": frame.stamp.projection_key.to_string(),
         "generation": frame.stamp.generation,
+        "feed_seq": frame.stamp.feed_seq,
+        "feed_ts_ns": frame.stamp.feed_ts_ns,
+        "source_first_ts_ns": frame.stamp.source_first_ts_ns,
+        "source_last_ts_ns": frame.stamp.source_last_ts_ns,
         "batch_idx": frame.stamp.batch_idx,
         "cursor_ts_ns": frame.stamp.cursor_ts_ns,
         "op": frame.op,
@@ -63,6 +67,10 @@ mod tests {
                     .key()
                     .unwrap(),
                 output_schema: ProjectionOutputSchema::new("bbo_v1").unwrap(),
+                feed_seq: 7,
+                feed_ts_ns: "700".to_string(),
+                source_first_ts_ns: Some("700".to_string()),
+                source_last_ts_ns: Some("700".to_string()),
                 batch_idx: 7,
                 cursor_ts_ns: "700".to_string(),
                 source_view: Some(SourceView::ExchangeTruth),

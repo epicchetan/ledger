@@ -29,6 +29,7 @@ status
 list
 session validate
 session run
+session clock-run
 replay cache-status
 replay cache-remove
 storage cleanup-tmp
@@ -39,9 +40,11 @@ storage cleanup-tmp
 `session validate` operates on immutable `ReplayDataset` artifacts and delegates
 shared validation composition to `ledger`. `storage cleanup-tmp` removes
 disposable staging files left by failed or interrupted jobs. `session run`
-opens the active mutable `Session` controller headlessly with a replay feed, and
-the replay cache commands inspect/remove the local read-through artifact cache
-used by replay-backed sessions.
+opens the active mutable `Session` controller headlessly with a replay feed.
+`session clock-run` uses a deterministic fake clock to validate clock-driven
+Session advancement without wall-clock sleeps. The replay cache commands
+inspect/remove the local read-through artifact cache used by replay-backed
+sessions.
 
 ## Boundary
 

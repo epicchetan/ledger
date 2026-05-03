@@ -374,6 +374,19 @@ cargo run -p ledger-cli -- session validate --symbol ESH6 --date 2026-03-12 --re
 
 # Run an active Session headlessly with a replay feed
 cargo run -p ledger-cli -- session run --symbol ESH6 --date 2026-03-12 --batches 1000
+
+# Validate clock-driven Session advancement without wall-clock sleeps
+cargo run -p ledger-cli -- session clock-run \
+  --symbol ESH6 \
+  --date 2026-03-12 \
+  --projection bars:v1 \
+  --params '{"seconds":60}' \
+  --speed 60 \
+  --tick-ms 16 \
+  --ticks 1000 \
+  --budget-batches 500 \
+  --digest \
+  --truth-visibility
 ```
 
 ## Lens

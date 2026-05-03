@@ -418,6 +418,12 @@ pub struct ProjectionFrameStamp {
     pub generation: u64,
     pub projection_key: ProjectionKey,
     pub output_schema: ProjectionOutputSchema,
+    pub feed_seq: u64,
+    pub feed_ts_ns: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_first_ts_ns: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_last_ts_ns: Option<String>,
     pub batch_idx: u64,
     pub cursor_ts_ns: String,
     pub source_view: Option<SourceView>,
@@ -627,6 +633,10 @@ mod tests {
             generation: 2,
             projection_key: spec.key().unwrap(),
             output_schema: ProjectionOutputSchema::new("bbo_v1").unwrap(),
+            feed_seq: 42,
+            feed_ts_ns: "1773266400000000000".to_string(),
+            source_first_ts_ns: Some("1773266400000000000".to_string()),
+            source_last_ts_ns: Some("1773266400000000000".to_string()),
             batch_idx: 42,
             cursor_ts_ns: "1773266400000000000".to_string(),
             source_view: Some(SourceView::ExchangeTruth),
@@ -636,6 +646,9 @@ mod tests {
         };
 
         let encoded = serde_json::to_value(&stamp).unwrap();
+        assert_eq!(encoded["feed_seq"], json!(42));
+        assert_eq!(encoded["feed_ts_ns"], json!("1773266400000000000"));
+        assert_eq!(encoded["source_first_ts_ns"], json!("1773266400000000000"));
         assert_eq!(encoded["cursor_ts_ns"], json!("1773266400000000000"));
         assert_eq!(encoded["produced_at_ns"], json!("1773266400000000100"));
 

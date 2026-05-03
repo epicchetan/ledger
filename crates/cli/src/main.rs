@@ -10,8 +10,8 @@ use chrono::NaiveDate;
 use clap::{Args, Parser, Subcommand};
 use ledger::projection::{base_projection_registry, resolve_projection_graph};
 use ledger::{
-    Ledger, LedgerProgressEvent, LedgerProgressSink, ProjectionRunRequest, SessionRunRequest,
-    ValidateReplayDatasetRequest, ValidationTrigger,
+    Ledger, LedgerProgressEvent, LedgerProgressSink, ProjectionRunRequest, SessionClockRunRequest,
+    SessionRunRequest, ValidateReplayDatasetRequest, ValidationTrigger,
 };
 use ledger_domain::{ProjectionId, ProjectionSpec, ProjectionVersion};
 use ledger_store::MarketDayFilter;
@@ -71,6 +71,7 @@ struct StorageCommand {
 enum SessionSubcommand {
     Validate(ValidateArgs),
     Run(SessionRunArgs),
+    ClockRun(SessionClockRunArgs),
 }
 
 #[derive(Args)]
@@ -138,6 +139,42 @@ struct SessionRunArgs {
 
     #[arg(long)]
     start_ts_ns: Option<u64>,
+
+    #[arg(long)]
+    truth_visibility: bool,
+}
+
+#[derive(Args, Clone)]
+struct SessionClockRunArgs {
+    #[command(flatten)]
+    market_day: MarketDayArgs,
+
+    #[arg(long)]
+    projection: String,
+
+    #[arg(long, default_value = "{}")]
+    params: String,
+
+    #[arg(long)]
+    speed: f64,
+
+    #[arg(long)]
+    tick_ms: u64,
+
+    #[arg(long)]
+    ticks: usize,
+
+    #[arg(long, default_value_t = 500)]
+    budget_batches: usize,
+
+    #[arg(long)]
+    start_ts_ns: Option<u64>,
+
+    #[arg(long)]
+    jsonl: Option<PathBuf>,
+
+    #[arg(long)]
+    digest: bool,
 
     #[arg(long)]
     truth_visibility: bool,
@@ -297,6 +334,44 @@ async fn main() -> Result<()> {
                     })
                     .await?;
                 progress.done("headless Session run completed", started_at);
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+            SessionSubcommand::ClockRun(args) => {
+                let date = parse_date(&args.market_day.date)?;
+                let spec = parse_projection_arg(&args.projection, &args.params)?;
+                progress.step(format!(
+                    "running deterministic Session clock for {} over {} {}",
+                    spec.id, args.market_day.symbol, date
+                ));
+                let ledger = Ledger::from_env(&cli.data_dir, &cli.r2_prefix).await?;
+                let cache = ledger
+                    .replay_cache_status(&args.market_day.symbol, date)
+                    .await?;
+                if cache.cached {
+                    progress.step("replay cache hit; using local ReplayDataset artifacts");
+                } else {
+                    progress.step("replay cache miss; hydrating ReplayDataset artifacts from R2");
+                }
+                let started_at = Instant::now();
+                let report = ledger
+                    .run_session_clock(SessionClockRunRequest {
+                        symbol: args.market_day.symbol,
+                        market_date: date,
+                        start_ts_ns: args.start_ts_ns,
+                        projection: spec,
+                        speed: args.speed,
+                        tick_ms: args.tick_ms,
+                        ticks: args.ticks,
+                        budget_batches: args.budget_batches,
+                        digest: args.digest,
+                        truth_visibility: args.truth_visibility,
+                    })
+                    .await?;
+                if let Some(path) = args.jsonl {
+                    write_projection_jsonl(&path, &report.frames)?;
+                    progress.step(format!("wrote projection frames to {}", path.display()));
+                }
+                progress.done("deterministic Session clock run completed", started_at);
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
         },
