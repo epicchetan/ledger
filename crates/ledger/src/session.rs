@@ -4,58 +4,63 @@ use ledger_domain::{
     Bbo, EventStore, ExecutionProfile, MarketDay, ProjectionFrame, ProjectionSpec, UnixNanos,
     VisibilityProfile,
 };
-use ledger_replay::ReplaySimulator;
+use ledger_replay::{ReplayFeed, ReplayFeedConfig, ReplayFeedMode, ReplaySimulator};
 use serde::{Deserialize, Serialize};
 
 use crate::projection::{
     base_projection_registry, projection_frame_digest, ProjectionMetrics, ProjectionRegistry,
     ProjectionRuntime, ProjectionRuntimeConfig, ProjectionRuntimeCursor, ProjectionSubscription,
-    ProjectionSubscriptionId, TruthTick,
+    ProjectionSubscriptionId, SessionTick,
 };
 use crate::{Ledger, ObjectStore, ReplayDataset};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ReplaySessionConfig {
+pub struct OpenSessionRequest {
     pub session_id: Option<String>,
     pub symbol: String,
     pub market_date: NaiveDate,
     pub start_ts_ns: Option<UnixNanos>,
-    pub execution_profile: ExecutionProfile,
-    pub visibility_profile: VisibilityProfile,
+    pub feed: SessionFeedConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionFeedConfig {
+    Replay(ReplayFeedConfig),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ReplayPlaybackState {
+pub enum SessionPlaybackState {
     Paused,
     Playing,
     Ended,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ReplaySessionState {
-    pub playback: ReplayPlaybackState,
+pub struct SessionState {
+    pub playback: SessionPlaybackState,
     pub speed: f64,
 }
 
-impl Default for ReplaySessionState {
+impl Default for SessionState {
     fn default() -> Self {
         Self {
-            playback: ReplayPlaybackState::Paused,
+            playback: SessionPlaybackState::Paused,
             speed: 1.0,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ReplaySessionSnapshot {
+pub struct SessionSnapshot {
     pub session_id: String,
     pub replay_dataset_id: String,
     pub market_day: MarketDay,
-    pub cursor_ts_ns: String,
+    pub feed_ts_ns: String,
     pub batch_idx: usize,
     pub total_batches: usize,
-    pub playback: ReplayPlaybackState,
+    pub playback: SessionPlaybackState,
     pub speed: f64,
     pub book_checksum: String,
     pub bbo: Option<Bbo>,
@@ -64,15 +69,15 @@ pub struct ReplaySessionSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ReplaySessionStepReport {
+pub struct SessionAdvanceReport {
     pub requested_batches: usize,
     pub applied_batches: usize,
-    pub snapshot: ReplaySessionSnapshot,
+    pub snapshot: SessionSnapshot,
     pub projection_frames: Vec<ProjectionFrame>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ReplayRunRequest {
+pub struct SessionRunRequest {
     pub symbol: String,
     pub market_date: NaiveDate,
     pub start_ts_ns: Option<UnixNanos>,
@@ -81,10 +86,10 @@ pub struct ReplayRunRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ReplayRunReport {
+pub struct SessionRunReport {
     pub requested_batches: usize,
     pub applied_batches: usize,
-    pub snapshot: ReplaySessionSnapshot,
+    pub snapshot: SessionSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -128,50 +133,49 @@ pub struct ProjectionRunSummary {
     pub applied_batches: usize,
     pub frames: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub first_cursor_ts_ns: Option<String>,
+    pub first_feed_ts_ns: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_cursor_ts_ns: Option<String>,
+    pub last_feed_ts_ns: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
 }
 
-pub struct ReplaySession {
+pub struct Session {
     id: String,
     replay_dataset_id: String,
     market_day: MarketDay,
-    total_batches: usize,
-    simulator: ReplaySimulator,
+    feed: SessionFeed,
     projection_runtime: ProjectionRuntime,
-    state: ReplaySessionState,
+    state: SessionState,
 }
 
-impl ReplaySession {
-    pub fn new(
+pub enum SessionFeed {
+    Replay(ReplayFeed),
+}
+
+impl Session {
+    pub fn from_replay_dataset(
         session_id: String,
         dataset: ReplayDataset,
         event_store: EventStore,
-        execution_profile: ExecutionProfile,
-        visibility_profile: VisibilityProfile,
+        feed_config: ReplayFeedConfig,
     ) -> Self {
-        Self::new_with_projection_registry(
+        Self::from_replay_dataset_with_projection_registry(
             session_id,
             dataset,
             event_store,
-            execution_profile,
-            visibility_profile,
+            feed_config,
             base_projection_registry().expect("base projection registry must be valid"),
         )
     }
 
-    pub fn new_with_projection_registry(
+    pub fn from_replay_dataset_with_projection_registry(
         session_id: String,
         dataset: ReplayDataset,
         event_store: EventStore,
-        execution_profile: ExecutionProfile,
-        visibility_profile: VisibilityProfile,
+        feed_config: ReplayFeedConfig,
         projection_registry: ProjectionRegistry,
     ) -> Self {
-        let total_batches = event_store.batches.len();
         let initial_cursor = ProjectionRuntimeCursor::new(
             0,
             event_store
@@ -188,42 +192,49 @@ impl ReplaySession {
                 initial_cursor,
             },
         );
+        let replay_feed = ReplayFeed::new(
+            ReplaySimulator::new(
+                event_store,
+                feed_config.execution_profile,
+                feed_config.visibility_profile,
+            ),
+            feed_config.mode,
+        );
         let mut session = Self {
             id: session_id,
             replay_dataset_id: dataset.replay_dataset_id,
             market_day: dataset.market_day,
-            total_batches,
-            simulator: ReplaySimulator::new(event_store, execution_profile, visibility_profile),
+            feed: SessionFeed::Replay(replay_feed),
             projection_runtime,
-            state: ReplaySessionState::default(),
+            state: SessionState::default(),
         };
         session.refresh_end_state();
         session
     }
 
-    pub fn seek_to(&mut self, ts_ns: UnixNanos) -> Result<ReplaySessionSnapshot> {
-        self.simulator
-            .seek_to(ts_ns)
-            .with_context(|| format!("seeking ReplaySession {} to {ts_ns}", self.id))?;
+    pub fn seek_to(&mut self, ts_ns: UnixNanos) -> Result<SessionSnapshot> {
+        let feed_snapshot = match &mut self.feed {
+            SessionFeed::Replay(feed) => feed
+                .seek_to(ts_ns)
+                .with_context(|| format!("seeking replay feed for Session {}", self.id))?,
+        };
         self.projection_runtime
             .reset_at(ProjectionRuntimeCursor::new(
-                self.simulator.batch_idx() as u64,
-                self.simulator.cursor_ts_ns(),
+                feed_snapshot.batch_idx as u64,
+                feed_snapshot.feed_ts_ns,
             ))
-            .with_context(|| {
-                format!("resetting projection runtime for ReplaySession {}", self.id)
-            })?;
+            .with_context(|| format!("resetting projection runtime for Session {}", self.id))?;
         self.refresh_end_state();
         Ok(self.snapshot())
     }
 
-    pub fn step_one_batch(&mut self) -> Result<ReplaySessionStepReport> {
-        self.step_batches(1)
+    pub fn advance_one_feed_batch(&mut self) -> Result<SessionAdvanceReport> {
+        self.advance_feed_batches(1)
     }
 
-    pub fn step_batches(&mut self, batches: usize) -> Result<ReplaySessionStepReport> {
-        if self.state.playback == ReplayPlaybackState::Ended {
-            return Ok(ReplaySessionStepReport {
+    pub fn advance_feed_batches(&mut self, batches: usize) -> Result<SessionAdvanceReport> {
+        if self.state.playback == SessionPlaybackState::Ended {
+            return Ok(SessionAdvanceReport {
                 requested_batches: batches,
                 applied_batches: 0,
                 snapshot: self.snapshot(),
@@ -234,25 +245,26 @@ impl ReplaySession {
         let mut applied_batches = 0;
         let mut projection_frames = Vec::new();
         for _ in 0..batches {
-            if self.simulator.batch_idx() >= self.total_batches {
-                self.state.playback = ReplayPlaybackState::Ended;
+            let feed_batch = match &mut self.feed {
+                SessionFeed::Replay(feed) => feed
+                    .advance_one()
+                    .with_context(|| format!("advancing replay feed for Session {}", self.id))?,
+            };
+            let Some(feed_batch) = feed_batch else {
+                self.state.playback = SessionPlaybackState::Ended;
                 break;
-            }
-            let replay_step = self
-                .simulator
-                .step_next_exchange_batch()
-                .with_context(|| format!("stepping ReplaySession {}", self.id))?;
-            let tick = TruthTick::from_replay_step(&replay_step);
+            };
+            let tick = SessionTick::from_replay_feed_batch(&feed_batch);
             projection_frames.extend(
-                self.projection_runtime.advance(tick).with_context(|| {
-                    format!("advancing projections for ReplaySession {}", self.id)
-                })?,
+                self.projection_runtime
+                    .advance(tick)
+                    .with_context(|| format!("advancing projections for Session {}", self.id))?,
             );
             applied_batches += 1;
         }
 
         self.refresh_end_state();
-        Ok(ReplaySessionStepReport {
+        Ok(SessionAdvanceReport {
             requested_batches: batches,
             applied_batches,
             snapshot: self.snapshot(),
@@ -276,83 +288,89 @@ impl ReplaySession {
         self.projection_runtime.metrics()
     }
 
-    pub fn pause(&mut self) -> ReplaySessionSnapshot {
-        if self.state.playback != ReplayPlaybackState::Ended {
-            self.state.playback = ReplayPlaybackState::Paused;
+    pub fn pause(&mut self) -> SessionSnapshot {
+        if self.state.playback != SessionPlaybackState::Ended {
+            self.state.playback = SessionPlaybackState::Paused;
         }
         self.snapshot()
     }
 
-    pub fn set_speed(&mut self, speed: f64) -> Result<ReplaySessionSnapshot> {
+    pub fn set_speed(&mut self, speed: f64) -> Result<SessionSnapshot> {
         ensure!(
             speed.is_finite() && speed > 0.0,
-            "ReplaySession speed must be a positive finite value"
+            "Session speed must be a positive finite value"
         );
         self.state.speed = speed;
         Ok(self.snapshot())
     }
 
-    pub fn snapshot(&self) -> ReplaySessionSnapshot {
-        ReplaySessionSnapshot {
+    pub fn snapshot(&self) -> SessionSnapshot {
+        let SessionFeed::Replay(feed) = &self.feed;
+        let feed_snapshot = feed.snapshot();
+
+        SessionSnapshot {
             session_id: self.id.clone(),
             replay_dataset_id: self.replay_dataset_id.clone(),
             market_day: self.market_day.clone(),
-            cursor_ts_ns: self.simulator.cursor_ts_ns().to_string(),
-            batch_idx: self.simulator.batch_idx(),
-            total_batches: self.total_batches,
+            feed_ts_ns: feed_snapshot.feed_ts_ns.to_string(),
+            batch_idx: feed_snapshot.batch_idx,
+            total_batches: feed_snapshot.total_batches,
             playback: self.state.playback,
             speed: self.state.speed,
-            book_checksum: self.simulator.book().checksum(),
-            bbo: self.simulator.book().bbo(),
-            frame_count: self.simulator.visibility().emitted().len(),
-            fill_count: self.simulator.execution().fills().len(),
+            book_checksum: feed_snapshot.book_checksum,
+            bbo: feed_snapshot.bbo,
+            frame_count: feed_snapshot.visibility_frame_count,
+            fill_count: feed_snapshot.fill_count,
         }
     }
 
     fn refresh_end_state(&mut self) {
-        if self.simulator.batch_idx() >= self.total_batches {
-            self.state.playback = ReplayPlaybackState::Ended;
-        } else if self.state.playback == ReplayPlaybackState::Ended {
-            self.state.playback = ReplayPlaybackState::Paused;
+        let ended = match &self.feed {
+            SessionFeed::Replay(feed) => feed.ended(),
+        };
+        if ended {
+            self.state.playback = SessionPlaybackState::Ended;
+        } else if self.state.playback == SessionPlaybackState::Ended {
+            self.state.playback = SessionPlaybackState::Paused;
         }
     }
 }
 
 impl<S: ObjectStore + 'static> Ledger<S> {
-    pub async fn open_replay_session(&self, config: ReplaySessionConfig) -> Result<ReplaySession> {
+    pub async fn open_session(&self, request: OpenSessionRequest) -> Result<Session> {
         let dataset = self
-            .load_cached_replay_dataset(&config.symbol, config.market_date)
+            .load_cached_replay_dataset(&request.symbol, request.market_date)
             .await
             .with_context(|| {
                 format!(
                     "loading ReplayDataset for {} {}",
-                    config.symbol, config.market_date
+                    request.symbol, request.market_date
                 )
             })?;
-        let session_id = config.session_id.unwrap_or_else(|| {
+        let session_id = request.session_id.unwrap_or_else(|| {
             format!(
                 "replay-{}-{}",
                 dataset.market_day.contract_symbol, dataset.market_day.market_date
             )
         });
         let event_store = dataset.event_store().await?;
-        let mut session = ReplaySession::new_with_projection_registry(
+        let SessionFeedConfig::Replay(feed_config) = request.feed;
+        let mut session = Session::from_replay_dataset_with_projection_registry(
             session_id,
             dataset,
             event_store,
-            config.execution_profile,
-            config.visibility_profile,
+            feed_config,
             self.projection_registry().clone(),
         );
-        if let Some(start_ts_ns) = config.start_ts_ns {
+        if let Some(start_ts_ns) = request.start_ts_ns {
             session.seek_to(start_ts_ns)?;
         }
         Ok(session)
     }
 
-    pub async fn run_replay_session(&self, request: ReplayRunRequest) -> Result<ReplayRunReport> {
+    pub async fn run_session(&self, request: SessionRunRequest) -> Result<SessionRunReport> {
         if request.batches == 0 {
-            bail!("ReplaySession run batches must be greater than zero");
+            bail!("Session run batches must be greater than zero");
         }
 
         let visibility_profile = if request.truth_visibility {
@@ -361,18 +379,21 @@ impl<S: ObjectStore + 'static> Ledger<S> {
             VisibilityProfile::default()
         };
         let mut session = self
-            .open_replay_session(ReplaySessionConfig {
+            .open_session(OpenSessionRequest {
                 session_id: Some("local-run".to_string()),
                 symbol: request.symbol,
                 market_date: request.market_date,
                 start_ts_ns: request.start_ts_ns,
-                execution_profile: ExecutionProfile::default(),
-                visibility_profile,
+                feed: SessionFeedConfig::Replay(ReplayFeedConfig {
+                    mode: ReplayFeedMode::ExchangeTruth,
+                    execution_profile: ExecutionProfile::default(),
+                    visibility_profile,
+                }),
             })
             .await?;
-        let step = session.step_batches(request.batches)?;
+        let step = session.advance_feed_batches(request.batches)?;
 
-        Ok(ReplayRunReport {
+        Ok(SessionRunReport {
             requested_batches: step.requested_batches,
             applied_batches: step.applied_batches,
             snapshot: step.snapshot,
@@ -393,13 +414,16 @@ impl<S: ObjectStore + 'static> Ledger<S> {
             VisibilityProfile::default()
         };
         let mut session = self
-            .open_replay_session(ReplaySessionConfig {
+            .open_session(OpenSessionRequest {
                 session_id: Some("projection-run".to_string()),
                 symbol: request.symbol.clone(),
                 market_date: request.market_date,
                 start_ts_ns: request.start_ts_ns,
-                execution_profile: ExecutionProfile::default(),
-                visibility_profile,
+                feed: SessionFeedConfig::Replay(ReplayFeedConfig {
+                    mode: ReplayFeedMode::ExchangeTruth,
+                    execution_profile: ExecutionProfile::default(),
+                    visibility_profile,
+                }),
             })
             .await?;
 
@@ -413,15 +437,15 @@ impl<S: ObjectStore + 'static> Ledger<S> {
             .filter(|frame| frame.stamp.projection_key == projection_key)
             .collect::<Vec<_>>();
 
-        let step = session.step_batches(request.batches)?;
+        let step = session.advance_feed_batches(request.batches)?;
         frames.extend(
             step.projection_frames
                 .into_iter()
                 .filter(|frame| frame.stamp.projection_key == projection_key),
         );
 
-        let first_cursor_ts_ns = frames.first().map(|frame| frame.stamp.cursor_ts_ns.clone());
-        let last_cursor_ts_ns = frames.last().map(|frame| frame.stamp.cursor_ts_ns.clone());
+        let first_feed_ts_ns = frames.first().map(|frame| frame.stamp.cursor_ts_ns.clone());
+        let last_feed_ts_ns = frames.last().map(|frame| frame.stamp.cursor_ts_ns.clone());
         let digest = if request.digest {
             Some(projection_frame_digest(&frames)?)
         } else {
@@ -443,8 +467,8 @@ impl<S: ObjectStore + 'static> Ledger<S> {
                 requested_batches: request.batches,
                 applied_batches: step.applied_batches,
                 frames: frames.len(),
-                first_cursor_ts_ns,
-                last_cursor_ts_ns,
+                first_feed_ts_ns,
+                last_feed_ts_ns,
                 digest,
             },
             passed: true,
@@ -520,26 +544,29 @@ mod tests {
         }
     }
 
-    fn replay_session(store: EventStore) -> ReplaySession {
-        ReplaySession::new(
+    fn replay_feed_config() -> ReplayFeedConfig {
+        ReplayFeedConfig {
+            mode: ReplayFeedMode::ExchangeTruth,
+            execution_profile: ExecutionProfile::default(),
+            visibility_profile: VisibilityProfile::truth(),
+        }
+    }
+
+    fn session(store: EventStore) -> Session {
+        Session::from_replay_dataset(
             "test-session".to_string(),
             replay_dataset(),
             store,
-            ExecutionProfile::default(),
-            VisibilityProfile::truth(),
+            replay_feed_config(),
         )
     }
 
-    fn replay_session_with_registry(
-        store: EventStore,
-        registry: ProjectionRegistry,
-    ) -> ReplaySession {
-        ReplaySession::new_with_projection_registry(
+    fn session_with_registry(store: EventStore, registry: ProjectionRegistry) -> Session {
+        Session::from_replay_dataset_with_projection_registry(
             "test-session".to_string(),
             replay_dataset(),
             store,
-            ExecutionProfile::default(),
-            VisibilityProfile::truth(),
+            replay_feed_config(),
             registry,
         )
     }
@@ -549,7 +576,7 @@ mod tests {
             id: ProjectionId::new("tick_echo").unwrap(),
             version: ProjectionVersion::new(1).unwrap(),
             name: "tick_echo".to_string(),
-            description: "Test projection that echoes TruthTick facts.".to_string(),
+            description: "Test projection that echoes SessionTick facts.".to_string(),
             kind: ProjectionKind::Base,
             params_schema: json!({ "type": "object" }),
             default_params: json!({}),
@@ -593,7 +620,7 @@ mod tests {
         ) -> Result<Box<dyn ProjectionNode>> {
             Ok(Box::new(TickEchoNode {
                 key,
-                payload: json!({ "batch_idx": 0, "cursor_ts_ns": "0" }),
+                payload: json!({ "batch_idx": 0, "feed_seq": 0, "feed_ts_ns": "0" }),
                 pending: Vec::new(),
             }))
         }
@@ -615,14 +642,15 @@ mod tests {
             self.payload = json!({
                 "batch_idx": tick.batch_idx,
                 "applied_batch_idx": tick.applied_batch_idx,
-                "cursor_ts_ns": tick.cursor_ts_ns.to_string(),
+                "feed_seq": tick.feed_seq,
+                "feed_ts_ns": tick.feed_ts_ns.to_string(),
                 "exchange_events": tick.flags.exchange_events,
                 "trades": tick.flags.trades,
                 "bbo_changed": tick.flags.bbo_changed,
                 "visibility_frame": tick.flags.visibility_frame,
                 "fill_event": tick.flags.fill_event,
-                "event_count": tick.exchange.event_count,
-                "trade_count": tick.exchange.trade_count,
+                "event_count": tick.market.event_count,
+                "trade_count": tick.market.trade_count,
             });
             self.pending
                 .push(ProjectionFrameDraft::replace(self.payload.clone()));
@@ -638,7 +666,7 @@ mod tests {
         }
 
         fn reset(&mut self) -> Result<()> {
-            self.payload = json!({ "batch_idx": 0, "cursor_ts_ns": "0" });
+            self.payload = json!({ "batch_idx": 0, "feed_seq": 0, "feed_ts_ns": "0" });
             self.pending.clear();
             Ok(())
         }
@@ -657,57 +685,57 @@ mod tests {
     }
 
     #[test]
-    fn replay_session_steps_and_reports_snapshots() {
+    fn session_steps_and_reports_snapshots() {
         let store = event_store(vec![
             add(100, 1, BookSide::Bid, 100, 2, 1),
             add(200, 2, BookSide::Ask, 101, 3, 2),
         ]);
-        let mut session = replay_session(store);
+        let mut session = session(store);
 
         let initial = session.snapshot();
         assert_eq!(initial.session_id, "test-session");
-        assert_eq!(initial.cursor_ts_ns, "100");
+        assert_eq!(initial.feed_ts_ns, "100");
         assert_eq!(initial.batch_idx, 0);
         assert_eq!(initial.total_batches, 2);
-        assert_eq!(initial.playback, ReplayPlaybackState::Paused);
+        assert_eq!(initial.playback, SessionPlaybackState::Paused);
         assert_eq!(initial.bbo, None);
 
-        let first = session.step_one_batch().unwrap();
+        let first = session.advance_one_feed_batch().unwrap();
         assert_eq!(first.requested_batches, 1);
         assert_eq!(first.applied_batches, 1);
         assert!(first.projection_frames.is_empty());
-        assert_eq!(first.snapshot.cursor_ts_ns, "100");
+        assert_eq!(first.snapshot.feed_ts_ns, "100");
         assert_eq!(first.snapshot.batch_idx, 1);
         assert_eq!(first.snapshot.frame_count, 1);
-        assert_eq!(first.snapshot.playback, ReplayPlaybackState::Paused);
+        assert_eq!(first.snapshot.playback, SessionPlaybackState::Paused);
         assert_eq!(first.snapshot.bbo.unwrap().bid_price, Some(PriceTicks(100)));
 
-        let remaining = session.step_batches(10).unwrap();
+        let remaining = session.advance_feed_batches(10).unwrap();
         assert_eq!(remaining.requested_batches, 10);
         assert_eq!(remaining.applied_batches, 1);
-        assert_eq!(remaining.snapshot.cursor_ts_ns, "200");
+        assert_eq!(remaining.snapshot.feed_ts_ns, "200");
         assert_eq!(remaining.snapshot.batch_idx, 2);
         assert_eq!(remaining.snapshot.frame_count, 2);
-        assert_eq!(remaining.snapshot.playback, ReplayPlaybackState::Ended);
+        assert_eq!(remaining.snapshot.playback, SessionPlaybackState::Ended);
         assert_eq!(
             remaining.snapshot.bbo.unwrap().ask_price,
             Some(PriceTicks(101))
         );
 
-        let exhausted = session.step_one_batch().unwrap();
+        let exhausted = session.advance_one_feed_batch().unwrap();
         assert_eq!(exhausted.applied_batches, 0);
         assert!(exhausted.projection_frames.is_empty());
-        assert_eq!(exhausted.snapshot.playback, ReplayPlaybackState::Ended);
+        assert_eq!(exhausted.snapshot.playback, SessionPlaybackState::Ended);
     }
 
     #[test]
-    fn replay_session_projection_subscription_receives_tick_frames() {
+    fn session_projection_subscription_receives_tick_frames() {
         let store = event_store(vec![
             add(100, 1, BookSide::Bid, 100, 2, 1),
             add(200, 2, BookSide::Ask, 101, 3, 2),
         ]);
         let registry = registry_with_tick_echo(ProjectionWakePolicy::EveryTick);
-        let mut session = replay_session_with_registry(store, registry);
+        let mut session = session_with_registry(store, registry);
 
         let subscription = session.subscribe_projection(tick_echo_spec()).unwrap();
         assert_eq!(subscription.initial_frames.len(), 1);
@@ -722,7 +750,7 @@ mod tests {
         assert_eq!(subscription.initial_frames[0].stamp.batch_idx, 0);
         assert_eq!(subscription.initial_frames[0].stamp.cursor_ts_ns, "100");
 
-        let step = session.step_one_batch().unwrap();
+        let step = session.advance_one_feed_batch().unwrap();
 
         assert_eq!(step.applied_batches, 1);
         assert_eq!(step.projection_frames.len(), 1);
@@ -734,7 +762,8 @@ mod tests {
         assert_eq!(frame.stamp.cursor_ts_ns, "100");
         assert_eq!(frame.payload["batch_idx"], 1);
         assert_eq!(frame.payload["applied_batch_idx"], 0);
-        assert_eq!(frame.payload["cursor_ts_ns"], "100");
+        assert_eq!(frame.payload["feed_seq"], 1);
+        assert_eq!(frame.payload["feed_ts_ns"], "100");
         assert_eq!(frame.payload["exchange_events"], true);
     }
 
@@ -745,8 +774,8 @@ mod tests {
             add(200, 2, BookSide::Ask, 101, 3, 2),
         ]);
         let registry = registry_with_tick_echo(ProjectionWakePolicy::EveryTick);
-        let mut session = replay_session_with_registry(store, registry);
-        session.step_one_batch().unwrap();
+        let mut session = session_with_registry(store, registry);
+        session.advance_one_feed_batch().unwrap();
 
         let subscription = session.subscribe_projection(tick_echo_spec()).unwrap();
 
@@ -756,17 +785,17 @@ mod tests {
     }
 
     #[test]
-    fn truth_tick_flags_match_trade_batch() {
+    fn session_tick_flags_match_trade_batch() {
         let store = event_store(vec![trade(100, 1, BookSide::Ask, 100, 3)]);
         let registry =
             registry_with_tick_echo(ProjectionWakePolicy::OnEventMask(ProjectionWakeEventMask {
                 trades: true,
                 ..Default::default()
             }));
-        let mut session = replay_session_with_registry(store, registry);
+        let mut session = session_with_registry(store, registry);
         session.subscribe_projection(tick_echo_spec()).unwrap();
 
-        let step = session.step_one_batch().unwrap();
+        let step = session.advance_one_feed_batch().unwrap();
 
         assert_eq!(step.projection_frames.len(), 1);
         assert_eq!(step.projection_frames[0].payload["trades"], true);
@@ -775,17 +804,17 @@ mod tests {
     }
 
     #[test]
-    fn truth_tick_flags_match_bbo_change() {
+    fn session_tick_flags_match_bbo_change() {
         let store = event_store(vec![add(100, 1, BookSide::Bid, 100, 2, 1)]);
         let registry =
             registry_with_tick_echo(ProjectionWakePolicy::OnEventMask(ProjectionWakeEventMask {
                 bbo_changed: true,
                 ..Default::default()
             }));
-        let mut session = replay_session_with_registry(store, registry);
+        let mut session = session_with_registry(store, registry);
         session.subscribe_projection(tick_echo_spec()).unwrap();
 
-        let step = session.step_one_batch().unwrap();
+        let step = session.advance_one_feed_batch().unwrap();
 
         assert_eq!(step.projection_frames.len(), 1);
         assert_eq!(step.projection_frames[0].payload["bbo_changed"], true);
@@ -799,17 +828,17 @@ mod tests {
             add(200, 2, BookSide::Ask, 101, 3, 2),
         ]);
         let registry = registry_with_tick_echo(ProjectionWakePolicy::EveryTick);
-        let mut session = replay_session_with_registry(store, registry);
+        let mut session = session_with_registry(store, registry);
         session.subscribe_projection(tick_echo_spec()).unwrap();
 
-        let first = session.step_one_batch().unwrap();
+        let first = session.advance_one_feed_batch().unwrap();
         assert_eq!(first.projection_frames[0].stamp.generation, 0);
 
         session.seek_to(100).unwrap();
         assert_eq!(session.projection_generation(), 1);
 
-        let second = session.step_one_batch().unwrap();
-        assert_eq!(second.snapshot.cursor_ts_ns, "200");
+        let second = session.advance_one_feed_batch().unwrap();
+        assert_eq!(second.snapshot.feed_ts_ns, "200");
         assert_eq!(second.projection_frames.len(), 1);
         assert_eq!(second.projection_frames[0].stamp.generation, 1);
         assert_eq!(second.projection_frames[0].stamp.batch_idx, 2);
@@ -817,25 +846,25 @@ mod tests {
     }
 
     #[test]
-    fn replay_session_seek_rebuilds_from_start() {
+    fn session_seek_rebuilds_from_start() {
         let store = event_store(vec![
             add(100, 1, BookSide::Bid, 100, 2, 1),
             add(200, 2, BookSide::Ask, 101, 3, 2),
         ]);
-        let mut session = replay_session(store);
-        session.step_batches(10).unwrap();
-        assert_eq!(session.snapshot().playback, ReplayPlaybackState::Ended);
+        let mut session = session(store);
+        session.advance_feed_batches(10).unwrap();
+        assert_eq!(session.snapshot().playback, SessionPlaybackState::Ended);
 
         let snapshot = session.seek_to(100).unwrap();
 
-        assert_eq!(snapshot.cursor_ts_ns, "100");
+        assert_eq!(snapshot.feed_ts_ns, "100");
         assert_eq!(snapshot.batch_idx, 1);
-        assert_eq!(snapshot.playback, ReplayPlaybackState::Paused);
+        assert_eq!(snapshot.playback, SessionPlaybackState::Paused);
         assert_eq!(snapshot.bbo.unwrap().bid_price, Some(PriceTicks(100)));
     }
 
     #[test]
-    fn replay_session_snapshot_matches_direct_simulator_checksum() {
+    fn session_snapshot_matches_direct_simulator_checksum() {
         let store = event_store(vec![
             add(100, 1, BookSide::Bid, 100, 2, 1),
             add(200, 2, BookSide::Ask, 101, 3, 2),
@@ -848,17 +877,17 @@ mod tests {
         simulator.step_next_exchange_batch().unwrap();
         simulator.step_next_exchange_batch().unwrap();
 
-        let mut session = replay_session(store);
-        let snapshot = session.step_batches(2).unwrap().snapshot;
+        let mut session = session(store);
+        let snapshot = session.advance_feed_batches(2).unwrap().snapshot;
 
         assert_eq!(snapshot.book_checksum, simulator.book().checksum());
         assert_eq!(snapshot.bbo, simulator.book().bbo());
     }
 
     #[test]
-    fn replay_session_rejects_invalid_speed() {
+    fn session_rejects_invalid_speed() {
         let store = event_store(vec![add(100, 1, BookSide::Bid, 100, 2, 1)]);
-        let mut session = replay_session(store);
+        let mut session = session(store);
 
         let err = session.set_speed(0.0).unwrap_err();
 

@@ -2,7 +2,7 @@
 //!
 //! The runtime can register projection factories, resolve dependency trees,
 //! lazily instantiate nodes, and advance deterministic truth ticks from an
-//! active `ReplaySession`.
+//! active `Session`.
 
 pub mod base;
 mod digest;

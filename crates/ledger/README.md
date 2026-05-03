@@ -1,8 +1,8 @@
 # ledger
 
 `ledger` is the backend application core for raw data/replay dataset lifecycle,
-validation composition, ingest orchestration, and active replay-session work.
-It exposes the public `Ledger`, `ReplayDataset`, and `ReplaySession` models used
+validation composition, ingest orchestration, and active feed-driven session
+work. It exposes the public `Ledger`, `ReplayDataset`, and `Session` models used
 by API and CLI adapters.
 
 ## Owns
@@ -15,7 +15,7 @@ by API and CLI adapters.
 - Running deterministic book-check comparison and replay simulator probes.
 - Orchestrating market-day ingest through `ledger-ingest`.
 - Staging replay artifacts from R2 into `tmp` for validation.
-- Loading cached replay artifacts for active `ReplaySession` startup.
+- Loading cached replay artifacts for active replay-backed `Session` startup.
 - Hydrating staged replay artifacts into `ledger-domain::EventStore`.
 
 ## Does Not Own
@@ -33,8 +33,9 @@ by API and CLI adapters.
   `MarketDay`.
 - `ReplayDatasetValidationReport` is the shared validation/trust report used by
   CLI and API.
-- `ReplaySession` is the active mutable replay controller over one
-  `ReplayDataset`.
+- `Session` is the active mutable runtime controller. Today it is opened with a
+  replay feed over one `ReplayDataset`; live feeds can converge on the same
+  session shape later.
 - `PrepareReplayDatasetReport` combines the ingest/preprocess report with a
   readiness validation report for job-backed API work.
 
@@ -43,7 +44,7 @@ by API and CLI adapters.
 Callers should ask `Ledger` to prepare and validate replay datasets, not hydrate
 individual files or rebuild validation reports themselves. The store decides how
 to stage R2-backed artifacts for validation and cache artifacts for active
-ReplaySession startup.
+replay-backed Session startup.
 
 ## Tests
 

@@ -1,6 +1,6 @@
 use super::{
     ProjectionAdvance, ProjectionContext, ProjectionFrameDraft, ProjectionMetrics, ProjectionNode,
-    ProjectionRegistry, TruthTick,
+    ProjectionRegistry, SessionTick,
 };
 use anyhow::{bail, ensure, Context, Result};
 use indexmap::{IndexMap, IndexSet};
@@ -197,7 +197,7 @@ impl ProjectionRuntime {
         Ok(())
     }
 
-    pub fn advance(&mut self, tick: TruthTick) -> Result<Vec<ProjectionFrame>> {
+    pub fn advance(&mut self, tick: SessionTick) -> Result<Vec<ProjectionFrame>> {
         self.cursor = ProjectionRuntimeCursor::new(tick.batch_idx, tick.cursor_ts_ns);
         let mut changed = IndexSet::<ProjectionKey>::new();
         let mut frames = Vec::new();
@@ -434,7 +434,7 @@ impl ProjectionRuntime {
         Ok(())
     }
 
-    fn wake_due(&self, key: &ProjectionKey, tick: &TruthTick) -> Result<bool> {
+    fn wake_due(&self, key: &ProjectionKey, tick: &SessionTick) -> Result<bool> {
         let entry = self
             .nodes
             .get(key)
@@ -846,7 +846,7 @@ mod tests {
     fn runtime_advances_in_topological_order() {
         let mut runtime = runtime();
         let subscription = runtime.subscribe(spec("sum_counter")).unwrap();
-        let frames = runtime.advance(TruthTick::synthetic(1, 100)).unwrap();
+        let frames = runtime.advance(SessionTick::synthetic(1, 100)).unwrap();
 
         let values = frames
             .iter()
@@ -877,7 +877,7 @@ mod tests {
         let subscription = runtime.subscribe(spec("source_counter")).unwrap();
         runtime.unsubscribe(subscription.id).unwrap();
 
-        let frames = runtime.advance(TruthTick::synthetic(1, 100)).unwrap();
+        let frames = runtime.advance(SessionTick::synthetic(1, 100)).unwrap();
 
         assert!(frames.is_empty());
         assert_eq!(runtime.active_node_count(), 0);
@@ -907,7 +907,7 @@ mod tests {
     fn runtime_generation_increments_on_reset() {
         let mut runtime = runtime();
         runtime.subscribe(spec("source_counter")).unwrap();
-        runtime.advance(TruthTick::synthetic(1, 100)).unwrap();
+        runtime.advance(SessionTick::synthetic(1, 100)).unwrap();
 
         let frames = runtime.reset().unwrap();
 
@@ -952,7 +952,7 @@ mod tests {
     fn runtime_reset_at_uses_requested_cursor() {
         let mut runtime = runtime();
         runtime.subscribe(spec("source_counter")).unwrap();
-        runtime.advance(TruthTick::synthetic(1, 100)).unwrap();
+        runtime.advance(SessionTick::synthetic(1, 100)).unwrap();
 
         let frames = runtime
             .reset_at(ProjectionRuntimeCursor::new(3, 300))
@@ -970,7 +970,7 @@ mod tests {
         let mut runtime = runtime();
         runtime.subscribe(spec("source_counter")).unwrap();
         let frame = runtime
-            .advance(TruthTick::synthetic(7, 1_773_266_400_000_000_000))
+            .advance(SessionTick::synthetic(7, 1_773_266_400_000_000_000))
             .unwrap()
             .remove(0);
         let encoded = serde_json::to_value(frame.stamp).unwrap();

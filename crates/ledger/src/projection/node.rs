@@ -3,18 +3,18 @@ use indexmap::IndexMap;
 use ledger_domain::{ProjectionFrameOp, ProjectionKey, ProjectionSpec};
 use serde_json::Value;
 
-use super::TruthTick;
+use super::SessionTick;
 
 #[derive(Debug, Clone)]
 pub struct ProjectionContext<'a> {
-    tick: &'a TruthTick,
+    tick: &'a SessionTick,
     key: &'a ProjectionKey,
     dependencies: IndexMap<ProjectionKey, Value>,
 }
 
 impl<'a> ProjectionContext<'a> {
     pub(crate) fn new(
-        tick: &'a TruthTick,
+        tick: &'a SessionTick,
         key: &'a ProjectionKey,
         dependencies: IndexMap<ProjectionKey, Value>,
     ) -> Self {
@@ -25,7 +25,7 @@ impl<'a> ProjectionContext<'a> {
         }
     }
 
-    pub fn tick(&self) -> &TruthTick {
+    pub fn tick(&self) -> &SessionTick {
         self.tick
     }
 

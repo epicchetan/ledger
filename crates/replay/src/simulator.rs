@@ -155,6 +155,25 @@ impl ReplaySimulator {
         self.batch_idx
     }
 
+    pub fn total_batches(&self) -> usize {
+        self.store.batches.len()
+    }
+
+    pub fn next_batch_ts_ns(&self) -> Option<UnixNanos> {
+        self.store
+            .batches
+            .get(self.batch_idx)
+            .map(|batch| batch.ts_event_ns)
+    }
+
+    pub fn next_batch_source_range(&self) -> Option<(UnixNanos, UnixNanos)> {
+        let span = *self.store.batches.get(self.batch_idx)?;
+        let events = self.store.batch_events(span);
+        let first = events.first().map(|event| event.ts_event_ns)?;
+        let last = events.last().map(|event| event.ts_event_ns)?;
+        Some((first, last))
+    }
+
     pub fn book(&self) -> &OrderBook {
         &self.book
     }

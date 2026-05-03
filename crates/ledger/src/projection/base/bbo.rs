@@ -74,7 +74,7 @@ impl ProjectionNode for BboProjectionNode {
     }
 
     fn advance(&mut self, ctx: &ProjectionContext<'_>) -> Result<ProjectionAdvance> {
-        let next = ctx.tick().exchange.bbo_after;
+        let next = ctx.tick().market.bbo_after;
         if next == self.last_bbo {
             return Ok(ProjectionAdvance::NoChange);
         }

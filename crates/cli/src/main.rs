@@ -10,7 +10,7 @@ use chrono::NaiveDate;
 use clap::{Args, Parser, Subcommand};
 use ledger::projection::{base_projection_registry, resolve_projection_graph};
 use ledger::{
-    Ledger, LedgerProgressEvent, LedgerProgressSink, ProjectionRunRequest, ReplayRunRequest,
+    Ledger, LedgerProgressEvent, LedgerProgressSink, ProjectionRunRequest, SessionRunRequest,
     ValidateReplayDatasetRequest, ValidationTrigger,
 };
 use ledger_domain::{ProjectionId, ProjectionSpec, ProjectionVersion};
@@ -70,6 +70,7 @@ struct StorageCommand {
 #[derive(Subcommand)]
 enum SessionSubcommand {
     Validate(ValidateArgs),
+    Run(SessionRunArgs),
 }
 
 #[derive(Args)]
@@ -80,7 +81,6 @@ struct SessionCommand {
 
 #[derive(Subcommand)]
 enum ReplaySubcommand {
-    Run(ReplayRunArgs),
     CacheStatus(MarketDayArgs),
     CacheRemove(MarketDayArgs),
 }
@@ -129,7 +129,7 @@ struct ValidateArgs {
 }
 
 #[derive(Args, Clone)]
-struct ReplayRunArgs {
+struct SessionRunArgs {
     #[command(flatten)]
     market_day: MarketDayArgs,
 
@@ -271,12 +271,10 @@ async fn main() -> Result<()> {
                     .await?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
-        },
-        Command::Replay(replay) => match replay.command {
-            ReplaySubcommand::Run(args) => {
+            SessionSubcommand::Run(args) => {
                 let date = parse_date(&args.market_day.date)?;
                 progress.step(format!(
-                    "running headless ReplaySession for {} {}",
+                    "running headless Session with replay feed for {} {}",
                     args.market_day.symbol, date
                 ));
                 let ledger = Ledger::from_env(&cli.data_dir, &cli.r2_prefix).await?;
@@ -290,7 +288,7 @@ async fn main() -> Result<()> {
                 }
                 let started_at = Instant::now();
                 let report = ledger
-                    .run_replay_session(ReplayRunRequest {
+                    .run_session(SessionRunRequest {
                         symbol: args.market_day.symbol,
                         market_date: date,
                         start_ts_ns: args.start_ts_ns,
@@ -298,9 +296,11 @@ async fn main() -> Result<()> {
                         truth_visibility: args.truth_visibility,
                     })
                     .await?;
-                progress.done("headless ReplaySession run completed", started_at);
+                progress.done("headless Session run completed", started_at);
                 println!("{}", serde_json::to_string_pretty(&report)?);
             }
+        },
+        Command::Replay(replay) => match replay.command {
             ReplaySubcommand::CacheStatus(args) => {
                 let date = parse_date(&args.date)?;
                 progress.step(format!(

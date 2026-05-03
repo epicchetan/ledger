@@ -14,6 +14,8 @@ cache replay datasets.
 - Conservative same-timestamp ordering between exchange events and simulated
   order arrivals.
 - Visibility frames delayed/coalesced from exchange truth.
+- Replay feed batches containing deterministic feed sequence/time, source-time
+  ranges, and replay step facts for `ledger::Session`.
 - Replay reports containing fills, emitted frames, cursor position, and final
   book checksum.
 
@@ -27,6 +29,10 @@ cache replay datasets.
 ## Main Public Concepts
 
 - `ReplaySimulator` coordinates exchange batches, execution, and visibility.
+- `ReplayFeed` wraps `ReplaySimulator` and exposes replay as a market-data feed
+  for active `Session` orchestration in `ledger`.
+- `ReplayFeedBatch` is the delivered feed input that `ledger` converts into a
+  `SessionTick` for projection runtime advancement.
 - `ExecutionSimulator` models order-entry latency, cancel latency, marketable
   fills, passive queue-ahead, and cancel/fill races.
 - `VisibilityModel` emits delayed/coalesced BBO, depth, and trade frames.

@@ -123,7 +123,7 @@ The roadmap is split into four major groups.
 Phase 0  Documentation and baseline alignment
 Phase 1  Shared projection contracts in ledger-domain
 Phase 2  Projection registry and runtime skeleton in ledger
-Phase 3  TruthTick and ReplaySession integration
+Phase 3  SessionTick and Session integration
 Phase 4  Core base projections and CLI run
 Phase 5  Visual base projections, wake/frame policies, coalescing
 Phase 6  Projection profiling and validation harness
@@ -446,7 +446,7 @@ roundtrip tests, and no dependencies on ledger/replay/book/api/lens. Do not impl
 
 Create the runtime skeleton that can register projection factories, resolve dependency trees, instantiate nodes lazily, detect cycles, share nodes by `ProjectionKey`, and advance synthetic ticks in topological order.
 
-This phase can use synthetic test ticks. It does not need full `ReplaySession` integration yet.
+This phase can use synthetic test ticks. It does not need full `Session` integration yet.
 
 ### Primary code areas
 
@@ -487,7 +487,7 @@ reuse existing node for same ProjectionKey
 track subscriber/reference counts
 detect cycles
 compute topological active order
-advance nodes in topological order on synthetic TruthTick
+advance nodes in topological order on synthetic SessionTick
 store last payloads
 emit initial snapshot frame
 reset runtime generation
@@ -565,25 +565,25 @@ Do not add WebSocket protocol.
 Implement a projection registry/runtime skeleton in ledger using domain projection DTOs.
 Use synthetic test nodes only. Support lazy dependency resolution, cycle detection,
 node sharing by ProjectionKey, topological execution, and generation reset.
-Do not integrate ReplaySession or CLI yet.
+Do not integrate Session or CLI yet.
 ```
 
 ---
 
-## 8. Phase 3 — TruthTick and ReplaySession Integration
+## 8. Phase 3 — SessionTick and Session Integration
 
 ### Objective
 
-Connect `ReplaySession` to `ProjectionRuntime` through a `TruthTick` abstraction.
+Connect `Session` to `ProjectionRuntime` through a `SessionTick` abstraction.
 
 This phase does not need many real projections; it proves the integration boundary between replay truth and projections.
 
 ### Primary code areas
 
 ```text
-crates/domain/src/projection.rs          # TruthTick-related DTOs if pure
+crates/domain/src/projection.rs          # SessionTick-related DTOs if pure
 crates/replay/src/...                    # richer step result if needed
-crates/ledger/src/replay_session.rs      # active session orchestration
+crates/ledger/src/session.rs      # active session orchestration
 crates/ledger/src/projection/runtime.rs
 ```
 
@@ -592,28 +592,28 @@ crates/ledger/src/projection/runtime.rs
 Add conceptual tick structures:
 
 ```rust
-TruthTick
-TruthTickFlags
-ReplayTruthStepResult or equivalent bridge type
+SessionTick
+SessionTickFlags
+ReplayFeedBatch or equivalent bridge type
 ```
 
 Modify active replay/session flow so that:
 
 ```text
 ReplaySimulator steps one batch.
-Ledger builds a TruthTick.
-ProjectionRuntime receives TruthTick.
+Ledger builds a SessionTick.
+ProjectionRuntime receives SessionTick.
 ProjectionRuntime returns ProjectionFrames.
-ReplaySession step report can include projection frames.
+Session step report can include projection frames.
 ```
 
-If current `run_replay_session` is batch-oriented, this phase can integrate internally without exposing projection frames to CLI yet.
+If current `run_session` is batch-oriented, this phase can integrate internally without exposing projection frames to CLI yet.
 
 ### Required boundaries
 
 ```text
 ledger-replay emits replay facts; it does not own the projection graph.
-ledger owns ProjectionRuntime and converts replay step output to TruthTick.
+ledger owns ProjectionRuntime and converts replay step output to SessionTick.
 Projection nodes do not mutate the book.
 Projection nodes do not call replay directly.
 ```
@@ -621,11 +621,11 @@ Projection nodes do not call replay directly.
 ### Suggested tests
 
 ```text
-replay_session_can_step_with_empty_projection_runtime
-truth_tick_generation_matches_session_generation
-truth_tick_cursor_advances_monotonically
-truth_tick_flags_match_synthetic_trade_batch
-truth_tick_flags_match_synthetic_bbo_change
+session_can_step_with_empty_projection_runtime
+session_tick_generation_matches_session_generation
+session_tick_cursor_advances_monotonically
+session_tick_flags_match_synthetic_trade_batch
+session_tick_flags_match_synthetic_bbo_change
 projection_runtime_receives_tick_during_session_step
 seek_or_reset_increments_generation
 old_generation_frames_are_not_reused_after_reset
@@ -634,7 +634,7 @@ old_generation_frames_are_not_reused_after_reset
 ### Agentic validation
 
 ```bash
-cargo test -p ledger replay_session
+cargo test -p ledger session
 cargo test -p ledger projection
 cargo test -p ledger-replay
 ```
@@ -642,7 +642,7 @@ cargo test -p ledger-replay
 Existing CLI smoke should still pass:
 
 ```bash
-ledger replay run --symbol ES --date 2026-03-12 --batches 100
+ledger session run --symbol ES --date 2026-03-12 --batches 100
 ```
 
 Use the real symbol/date available in the local test environment; this command is a template.
@@ -650,9 +650,9 @@ Use the real symbol/date available in the local test environment; this command i
 ### Acceptance criteria
 
 ```text
-ReplaySession can own a ProjectionRuntime.
+Session can own a ProjectionRuntime.
 Replay stepping still works with no projection subscriptions.
-TruthTick is built without breaking replay determinism.
+SessionTick is built without breaking replay determinism.
 Generation is present and increments on reset/seek.
 ledger-replay remains study-agnostic.
 ```
@@ -669,7 +669,7 @@ Do not implement checkpoints.
 ### Codex prompt guidance
 
 ```text
-Integrate ProjectionRuntime into active ReplaySession by building a TruthTick per replay batch.
+Integrate ProjectionRuntime into active Session by building a SessionTick per replay batch.
 Keep ledger-replay study-agnostic. Ensure replay session runs still work when no projections are subscribed.
 Add tests for cursor/generation/tick flags.
 ```
@@ -736,7 +736,7 @@ ledger projection run --symbol ES --date 2026-03-12 --projection bbo:v1 --params
 
 ```text
 open/hydrate ReplayDataset
-start ReplaySession
+start Session
 subscribe root projection
 step requested batches
 emit optional JSONL frames
@@ -822,7 +822,7 @@ Do not expose WebSocket.
 
 ```text
 Add core base projections cursor/status/bbo/canonical_trades and projection CLI list/manifest/graph/run.
-The run command should execute against a ReplaySession and output deterministic digestable frames.
+The run command should execute against a Session and output deterministic digestable frames.
 Keep API/Lens untouched.
 ```
 
@@ -1148,10 +1148,10 @@ Likely dependencies:
 ```text
 bbo:v1
 canonical_trades:v1
-depth:v1 or direct TruthTick book/depth summaries if more efficient
+depth:v1 or direct SessionTick book/depth summaries if more efficient
 ```
 
-The design can choose direct `TruthTick` summaries for base facts, but derived studies should consume `batch_features`.
+The design can choose direct `SessionTick` summaries for base facts, but derived studies should consume `batch_features`.
 
 ### Payload fields
 
@@ -1255,7 +1255,7 @@ Do not add model inference.
 
 ```text
 Implement batch_features:v1 as the shared L3 feature spine. It should derive compact per-batch features
-from TruthTick and/or base projections, expose a typed payload, include fixture tests, and pass CLI profile/validate.
+from SessionTick and/or base projections, expose a typed payload, include fixture tests, and pass CLI profile/validate.
 ```
 
 ---
@@ -1532,7 +1532,7 @@ This phase should not invent new computation. It should adapt CLI-validated runt
 
 ```text
 crates/api/src/...
-crates/ledger/src/replay_session.rs
+crates/ledger/src/session.rs
 crates/domain/src/projection.rs
 ```
 
@@ -1631,7 +1631,7 @@ Do not implement live mode.
 ### Codex prompt guidance
 
 ```text
-Expose ReplaySession projection subscriptions over WebSocket using existing ProjectionSpec and ProjectionFrame DTOs.
+Expose Session projection subscriptions over WebSocket using existing ProjectionSpec and ProjectionFrame DTOs.
 Do not create any API-specific computation path. Add subscribe/unsubscribe/step/seek tests and generation handling.
 ```
 
@@ -1798,7 +1798,7 @@ lens/src/...                   # journal UI later
 ```text
 MarketDay
 ReplayDatasetId
-ReplaySessionId
+SessionId
 entry cursor
 exit cursor
 orders/fills
@@ -2165,7 +2165,7 @@ crates/ledger/src/projection/checkpoint.rs
 crates/ledger/src/projection/cache.rs
 crates/store/src/... artifact metadata
 crates/domain/src/projection.rs cache/checkpoint DTOs
-crates/ledger/src/replay_session.rs
+crates/ledger/src/session.rs
 ```
 
 ### Checkpoint design
@@ -2288,7 +2288,7 @@ This phase should happen only after replay projections, API, Lens, and validatio
 
 ```text
 LiveSession or equivalent source adapter
-Live TruthTick producer
+Live SessionTick producer
 live source view semantics
 same ProjectionRuntime interface
 live-safe projection subset
@@ -2701,7 +2701,7 @@ Block exposure until fixed. This is correctness, not UX polish.
 ```text
 Phase 1 required before all later phases.
 Phase 2 required before any real projection node work.
-Phase 3 required before CLI run over ReplaySession.
+Phase 3 required before CLI run over Session.
 Phase 4 required before bars/depth/studies have a run path.
 Phase 5 required before DOM/chart-like visual projections are safe.
 Phase 6 required before adding many experimental studies.
@@ -2737,7 +2737,7 @@ Phase 4
 Outcome:
 
 ```text
-Can run cursor/status/bbo/trades projections through CLI over ReplaySession.
+Can run cursor/status/bbo/trades projections through CLI over Session.
 ```
 
 ### Milestone B — Base Visual Projections and Validation
@@ -2861,7 +2861,7 @@ After these phases, Ledger should have:
 ```text
 A typed projection contract in ledger-domain.
 A lazy dependency graph runtime in ledger.
-ReplaySession feeding TruthTicks into the runtime.
+Session feeding SessionTicks into the runtime.
 Base projections for cursor/status/BBO/trades/depth/bars/VWAP.
 Shared batch_features for L3 studies.
 Derived studies implemented as manifest-declared nodes.

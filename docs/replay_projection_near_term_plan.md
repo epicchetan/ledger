@@ -17,10 +17,10 @@ Ledger now has the first real projection spine:
 
 ```text
 ReplayDataset
-  -> ReplaySession
+  -> Session
   -> ReplaySimulator
   -> ReplayStepResult
-  -> TruthTick
+  -> SessionTick
   -> ProjectionRuntime
   -> ProjectionFrame
 ```
@@ -31,7 +31,7 @@ The product priority is:
 
 ```text
 validated data
-  -> active replay session
+  -> active Session with replay feed
   -> base projections
   -> CLI validation
   -> first deterministic projection run
@@ -55,13 +55,13 @@ ledger projection runtime skeleton
   lazy subscription, dependency resolution, cycle detection, node sharing,
   topological advancement, reset generation, metrics.
 
-ReplaySession integration
-  ReplaySession owns ProjectionRuntime.
+Session integration
+  Session owns ProjectionRuntime.
   ReplaySimulator emits ReplayStepResult.
-  Ledger converts replay facts to TruthTick.
-  ReplaySession step reports can include ProjectionFrames.
+  Ledger converts replay facts to SessionTick.
+  Session step reports can include ProjectionFrames.
 
-CLI replay run
+CLI session run
   Headless validation path exists and can exercise real ReplayDataset loading,
   replay cache hydration, and deterministic stepping.
 ```
@@ -172,8 +172,8 @@ If a removed concept returns later, it should be introduced as part of that feat
 
 ```text
 Phase A  Data Center and replay data control plane
-Phase B  Active ReplaySession controller and replay cache
-Phase C  Projection contracts, runtime skeleton, and TruthTick integration
+Phase B  Active Session controller and replay cache
+Phase C  Projection contracts, runtime skeleton, and SessionTick integration
 ```
 
 ### Near-Term Product Path
@@ -332,7 +332,7 @@ This projection should not re-interpret raw DBN. It should consume the canonical
 Required prerequisite:
 
 ```text
-TruthTick must carry the actual canonical TradeRecord values for the applied
+SessionTick must carry the actual canonical TradeRecord values for the applied
 batch, not only trade_count.
 ```
 
@@ -451,7 +451,7 @@ projection_dependencies_feed_bars_from_trades
 cargo test -p ledger-domain projection
 cargo test -p ledger projection::base
 cargo test -p ledger projection::registry
-cargo test -p ledger replay_session
+cargo test -p ledger session
 cargo test -p ledger-replay
 cargo test --workspace
 ```
@@ -498,7 +498,7 @@ Return root, nodes, edges, and cycle=false.
 ```text
 open cached ReplayDataset
 hydrate from R2 if missing
-start ReplaySession
+start Session
 subscribe projection
 step requested batches
 write optional JSONL ProjectionFrames
@@ -668,5 +668,5 @@ Any projection added in the near-term path must satisfy:
 5. Projection can run over a real ReplayDataset from CLI.
 6. CLI digest is deterministic across repeated runs.
 7. Runtime tests prove wake/frame behavior.
-8. ReplaySession tests prove frames are emitted from real TruthTick input.
+8. Session tests prove frames are emitted from real SessionTick input.
 ```

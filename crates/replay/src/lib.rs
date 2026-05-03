@@ -9,9 +9,11 @@
 //! belongs to `ledger-store`.
 
 mod execution;
+mod feed;
 mod simulator;
 mod visibility;
 
 pub use execution::*;
+pub use feed::*;
 pub use simulator::*;
 pub use visibility::*;

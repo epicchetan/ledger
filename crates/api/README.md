@@ -5,7 +5,7 @@
 It should stay thin: route parsing, response serialization, job tracking, and
 local development CORS live here. Market-day lifecycle behavior, replay dataset
 staging, validation composition, ingest orchestration, and later active
-replay-session ownership belong in `ledger`.
+session ownership belong in `ledger`.
 
 ## Routes
 

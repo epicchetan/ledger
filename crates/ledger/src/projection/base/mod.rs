@@ -106,7 +106,7 @@ fn event_mask_with_bbo_changed() -> ProjectionWakeEventMask {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::projection::{ProjectionRuntime, ProjectionRuntimeConfig, TruthTick};
+    use crate::projection::{ProjectionRuntime, ProjectionRuntimeConfig, SessionTick};
     use ledger_domain::{BookSide, PriceTicks, ProjectionFrameOp, ProjectionId, ProjectionSpec};
     use serde_json::json;
 
@@ -158,13 +158,16 @@ mod tests {
         );
         runtime.subscribe(spec(CURSOR_ID, json!({}))).unwrap();
 
-        let frames = runtime.advance(TruthTick::synthetic(7, 700)).unwrap();
+        let frames = runtime.advance(SessionTick::synthetic(7, 700)).unwrap();
 
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].op, ProjectionFrameOp::Replace);
         assert_eq!(frames[0].payload["batch_idx"], json!(7));
         assert_eq!(frames[0].payload["applied_batch_idx"], json!(6));
-        assert_eq!(frames[0].payload["cursor_ts_ns"], json!("700"));
+        assert_eq!(frames[0].payload["feed_seq"], json!(7));
+        assert_eq!(frames[0].payload["feed_ts_ns"], json!("700"));
+        assert_eq!(frames[0].payload["source_first_ts_ns"], json!("700"));
+        assert_eq!(frames[0].payload["source_last_ts_ns"], json!("700"));
     }
 
     #[test]
@@ -176,13 +179,13 @@ mod tests {
         runtime.subscribe(spec(BBO_ID, json!({}))).unwrap();
 
         assert!(runtime
-            .advance(TruthTick::synthetic(1, 100))
+            .advance(SessionTick::synthetic(1, 100))
             .unwrap()
             .is_empty());
 
-        let mut tick = TruthTick::synthetic(2, 200);
+        let mut tick = SessionTick::synthetic(2, 200);
         tick.flags.bbo_changed = true;
-        tick.exchange.bbo_after = Some(ledger_domain::Bbo {
+        tick.market.bbo_after = Some(ledger_domain::Bbo {
             bid_price: Some(PriceTicks(100)),
             bid_size: 2,
             ask_price: Some(PriceTicks(101)),
@@ -207,9 +210,9 @@ mod tests {
         runtime
             .subscribe(spec(CANONICAL_TRADES_ID, json!({})))
             .unwrap();
-        let mut tick = TruthTick::synthetic(1, 100);
+        let mut tick = SessionTick::synthetic(1, 100);
         tick.flags.trades = true;
-        tick.exchange.trades = vec![ledger_domain::TradeRecord {
+        tick.market.trades = vec![ledger_domain::TradeRecord {
             ts_event_ns: 100,
             sequence: 17,
             price: PriceTicks(101),
@@ -217,7 +220,7 @@ mod tests {
             aggressor_side: Some(BookSide::Ask),
             order_id: 9,
         }];
-        tick.exchange.trade_count = tick.exchange.trades.len();
+        tick.market.trade_count = tick.market.trades.len();
 
         let frames = runtime.advance(tick).unwrap();
 
@@ -237,14 +240,14 @@ mod tests {
         let subscription = runtime
             .subscribe(spec(BARS_ID, json!({ "seconds": 60 })))
             .unwrap();
-        let mut tick = TruthTick::synthetic(1, 1_000_000_000);
+        let mut tick = SessionTick::synthetic(1, 1_000_000_000);
         tick.flags.trades = true;
-        tick.exchange.trades = vec![
+        tick.market.trades = vec![
             trade(1_000_000_000, 1, 100, 2),
             trade(2_000_000_000, 2, 103, 1),
             trade(3_000_000_000, 3, 99, 5),
         ];
-        tick.exchange.trade_count = tick.exchange.trades.len();
+        tick.market.trade_count = tick.market.trades.len();
 
         let frames = runtime.advance(tick).unwrap();
         let bars_frames = frames
@@ -273,19 +276,19 @@ mod tests {
             .subscribe(spec(BARS_ID, json!({ "seconds": 60 })))
             .unwrap();
 
-        let mut first = TruthTick::synthetic(1, 1_000_000_000);
+        let mut first = SessionTick::synthetic(1, 1_000_000_000);
         first.flags.trades = true;
-        first.exchange.trades = vec![trade(1_000_000_000, 1, 100, 2)];
-        first.exchange.trade_count = first.exchange.trades.len();
+        first.market.trades = vec![trade(1_000_000_000, 1, 100, 2)];
+        first.market.trade_count = first.market.trades.len();
         let first_frames = runtime.advance(first).unwrap();
         assert!(first_frames
             .iter()
             .all(|frame| frame.stamp.projection_key.id.as_str() != BARS_ID));
 
-        let mut second = TruthTick::synthetic(2, 61_000_000_000);
+        let mut second = SessionTick::synthetic(2, 61_000_000_000);
         second.flags.trades = true;
-        second.exchange.trades = vec![trade(61_000_000_000, 2, 105, 1)];
-        second.exchange.trade_count = second.exchange.trades.len();
+        second.market.trades = vec![trade(61_000_000_000, 2, 105, 1)];
+        second.market.trade_count = second.market.trades.len();
         let frames = runtime.advance(second).unwrap();
         let bars_frames = frames
             .iter()
@@ -311,7 +314,7 @@ mod tests {
         runtime
             .subscribe(spec(BARS_ID, json!({ "seconds": 60 })))
             .unwrap();
-        let mut tick = TruthTick::synthetic(1, 100);
+        let mut tick = SessionTick::synthetic(1, 100);
         tick.flags.trades = true;
 
         let frames = runtime.advance(tick).unwrap();

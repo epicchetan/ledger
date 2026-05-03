@@ -17,7 +17,7 @@ full-day ES L3 data
 → better discretionary trading decisions
 ```
 
-Ledger is the source of truth. Lens is the operating surface. Ledger owns ingestion, storage, normalized data, L3 order-book truth, replay sessions, studies, levels, validation, and eventually live adapters. Lens manages data, shows trust/validation status, renders charts/DOM/studies/levels, controls replay, and captures journal/review workflows.
+Ledger is the source of truth. Lens is the operating surface. Ledger owns ingestion, storage, normalized data, L3 order-book truth, feed-driven sessions, studies, levels, validation, and eventually live adapters. Lens manages data, shows trust/validation status, renders charts/DOM/studies/levels, controls replay, and captures journal/review workflows.
 
 The key design principle remains: **replay and live should converge below the UI**. Lens should consume normalized state, projections, levels, orders/fills, and journal data. It should not care whether the source was historical replay or live market data.
 
@@ -32,22 +32,24 @@ MarketDay
 
 ReplayDataset
   Immutable replay inputs for a MarketDay.
-  Formerly called ReplaySession.
   Durable Layer 2 artifacts: events, batches, trades, book-check, and future cached projections.
 
-ReplaySession
-  Active mutable replay/training session.
-  Formerly called ReplayRun.
-  Owns simulator state, cursor, play/pause/speed, visibility profile, execution profile, active orders, and projection graph.
+ReplayFeed
+  Replay-backed market-data feed over a ReplayDataset.
+  Owns deterministic replay delivery mechanics and converts historical exchange truth into feed batches.
+
+Session
+  Active mutable training/runtime session.
+  Owns feed state, cursor, play/pause/speed, visibility profile, execution profile, active orders, and projection graph.
 
 ContextWindow
   Prior MarketDays and cached artifacts used for historical candles, prior levels, volume profile, and context.
 
 Study
-  A typed projection over ReplayDataset, ReplaySession state, level sets, other studies, or journal/context data.
+  A typed projection over ReplayDataset, Session state, level sets, other studies, or journal/context data.
 ```
 
-This naming is cleaner: a dataset is input; a session is something actively experienced and controlled.
+This naming is cleaner: a dataset is immutable input; a feed delivers data; a session is something actively experienced and controlled.
 
 ## 3. Current Product Priority: Lens Data Center
 
@@ -78,10 +80,10 @@ delete ReplayDataset
 delete raw data
 track job progress and history
 view trust report
-open validated day as a ReplaySession later
+open validated day as a Session later
 ```
 
-Loading or hydrating a `ReplayDataset` is not a Data Center user action. It is an internal implementation detail used by validation today and by active `ReplaySession` startup later.
+Loading or hydrating a `ReplayDataset` is not a Data Center user action. It is an internal implementation detail used by validation today and by active replay-backed `Session` startup later.
 
 The first Ledger API is therefore a small Data Center API:
 
@@ -167,9 +169,11 @@ This day is usable but has warnings.
 This day should not be trusted.
 ```
 
-## 5. Replay Session Model
+## 5. Feed-Driven Session Model
 
-A ReplaySession is an active training simulation over a ReplayDataset.
+A Session is an active training/runtime controller over a market-data feed.
+Replay is one feed implementation over a ReplayDataset; live should become
+another feed implementation later.
 
 Replay has three separate layers:
 
@@ -186,12 +190,12 @@ Execution Simulation
 
 This separation is non-negotiable. It allows accurate training without pretending the trader has impossible priority or perfect instantaneous information.
 
-Initial ReplaySession responsibilities:
+Initial Session responsibilities:
 
 ```text
-load one ReplayDataset
+load one ReplayDataset through a ReplayFeed
 seek to RTH open or selected timestamp
-step batches
+advance feed batches
 play/pause/speed
 hold visibility and execution profiles
 accept simulated orders later
@@ -199,7 +203,7 @@ own the active StudyGraph
 emit projection frames to Lens
 ```
 
-V1 can support one active ReplaySession at a time. Lens may have many panels/charts subscribed to that one session.
+V1 can support one active Session at a time. Lens may have many panels/charts subscribed to that one session.
 
 ## 6. Studies as a First-Class Projection Graph
 
@@ -215,7 +219,7 @@ docs/study_graph_phased_implementation.md
 The architecture should be a directed study graph:
 
 ```text
-ReplayDataset / ReplaySession / LevelSets / Journal Context
+ReplayDataset / Session / LevelSets / Journal Context
   ↓
 Base projections
   ↓
@@ -294,7 +298,7 @@ canonical event replay
 Principles:
 
 ```text
-one canonical book process per active ReplaySession
+one canonical book process per active Session
 shared StudyGraph for all Lens panels
 lazy computation only for subscribed/needed studies
 incremental online updates during replay
@@ -409,7 +413,7 @@ A journal entry should reference:
 ```text
 MarketDay
 ReplayDataset
-ReplaySession
+Session
 cursor timestamps
 orders/fills
 chart layout
@@ -442,7 +446,7 @@ Study input dependencies
 Study output schema
 LevelSet schema
 ReplayDataset artifacts
-ReplaySession projection protocol
+Session projection protocol
 Journal schema
 Validation report schema
 ```
@@ -506,7 +510,7 @@ lens
 Completed foundation:
 
 ```text
-1. Adopt naming: ReplayDataset = immutable inputs, ReplaySession = active simulator.
+1. Adopt naming: ReplayDataset = immutable inputs, Session = active runtime.
 2. Add / update docs with this vision.
 3. Build Lens Data Center surface.
 4. Add minimal Ledger Data API for market days, jobs, prepare, rebuild, validation, and delete.
@@ -515,8 +519,8 @@ Completed foundation:
 7. Persist jobs, job progress, job history, and validation reports for Lens.
 8. Wire Lens Data Center to the real API with table actions and trust state.
 9. Add stronger data-quality report fields and Lens trust summaries.
-10. Introduce active ReplaySession controller over ReplayDataset and ReplaySimulator.
-11. Add headless CLI replay run flow for agentic validation.
+10. Introduce active Session controller over ReplayDataset and ReplaySimulator.
+11. Add headless CLI session run flow for agentic validation.
 12. Add local read-through ReplayDataset cache for active replay startup.
 13. Add study graph vision and phased implementation docs.
 ```
@@ -526,7 +530,7 @@ Next sequence:
 ```text
 1. Add shared projection contracts in ledger-domain.
 2. Add ProjectionRuntime registry and skeleton in Ledger.
-3. Feed TruthTick from ReplaySession into the projection runtime.
+3. Feed SessionTick from Session into the projection runtime.
 4. Add core base projections and CLI projection run/list/manifest/graph commands.
 5. Add visual base projections, wake policies, frame policies, and coalescing.
 6. Add projection profiling and validation harnesses.
@@ -536,16 +540,16 @@ Next sequence:
 10. Add journaling/training memory, levels/gamma, model studies, checkpointing, and live mode in later phases.
 ```
 
-The next major product boundary is now the projection graph around active `ReplaySession`. ReplaySession proves the mutable simulation core: open a validated `ReplayDataset`, seek, step, and report deterministic state. The next step is defining the typed projection contracts and runtime that decide what Ledger computes and emits from that session: base projections first, derived studies after the graph is proven, then WebSocket frames for Lens.
+The next major product boundary is now the projection graph around active `Session`. Session proves the mutable simulation core: open a validated `ReplayDataset` through a replay feed, seek, advance, and report deterministic state. The next step is defining the typed projection contracts and runtime that decide what Ledger computes and emits from that session: base projections first, derived studies after the graph is proven, then WebSocket frames for Lens.
 
-The purpose of this sequence is to avoid painting ourselves into a corner. The Data Center proves data ownership. ReplaySession proves active simulation. The projection graph defines the contract between replay truth and UI rendering. StudyGraph is the extensibility layer inside that projection graph, so levels/gamma, model studies, and journaling become natural extensions instead of rewrites.
+The purpose of this sequence is to avoid painting ourselves into a corner. The Data Center proves data ownership. Session proves active feed-driven simulation. The projection graph defines the contract between session feed truth and UI rendering. StudyGraph is the extensibility layer inside that projection graph, so levels/gamma, model studies, and journaling become natural extensions instead of rewrites.
 
 ## 14. Source-of-Truth Decision
 
 This document establishes the base direction:
 
 ```text
-Ledger owns validated data, replay sessions, study graphs, levels, and journal truth.
+Ledger owns validated data, sessions, study graphs, levels, and journal truth.
 Lens manages data first, then replay, then charts/studies/journal workflows.
 Studies are a first-class typed projection graph, not a loose indicator list.
 0DTE/gamma levels become time-aware level sets and study inputs.

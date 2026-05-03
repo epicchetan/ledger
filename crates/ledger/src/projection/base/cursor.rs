@@ -21,8 +21,8 @@ impl CursorProjectionFactory {
         Self {
             manifest: base_manifest(
                 CURSOR_ID,
-                "Replay Cursor",
-                "Emits replay cursor progress for every applied batch.",
+                "Session Cursor",
+                "Emits session feed progress for every applied feed batch.",
                 no_params_schema(),
                 json!({}),
                 vec![],
@@ -54,7 +54,7 @@ impl ProjectionFactory for CursorProjectionFactory {
     fn build(&self, _spec: ProjectionSpec, key: ProjectionKey) -> Result<Box<dyn ProjectionNode>> {
         Ok(Box::new(CursorProjectionNode {
             key,
-            payload: cursor_payload(0, 0, 0),
+            payload: cursor_payload(0, 0, None, None, 0, 0),
             pending: Vec::new(),
         }))
     }
@@ -73,7 +73,14 @@ impl ProjectionNode for CursorProjectionNode {
 
     fn advance(&mut self, ctx: &ProjectionContext<'_>) -> Result<ProjectionAdvance> {
         let tick = ctx.tick();
-        self.payload = cursor_payload(tick.batch_idx, tick.cursor_ts_ns, tick.applied_batch_idx);
+        self.payload = cursor_payload(
+            tick.feed_seq,
+            tick.feed_ts_ns,
+            tick.source_first_ts_ns,
+            tick.source_last_ts_ns,
+            tick.batch_idx,
+            tick.applied_batch_idx,
+        );
         self.pending
             .push(ProjectionFrameDraft::replace(self.payload.clone()));
         Ok(ProjectionAdvance::StateChanged)
@@ -88,16 +95,26 @@ impl ProjectionNode for CursorProjectionNode {
     }
 
     fn reset(&mut self) -> Result<()> {
-        self.payload = cursor_payload(0, 0, 0);
+        self.payload = cursor_payload(0, 0, None, None, 0, 0);
         self.pending.clear();
         Ok(())
     }
 }
 
-fn cursor_payload(batch_idx: u64, cursor_ts_ns: u64, applied_batch_idx: u64) -> Value {
+fn cursor_payload(
+    feed_seq: u64,
+    feed_ts_ns: u64,
+    source_first_ts_ns: Option<u64>,
+    source_last_ts_ns: Option<u64>,
+    batch_idx: u64,
+    applied_batch_idx: u64,
+) -> Value {
     json!({
+        "feed_seq": feed_seq,
+        "feed_ts_ns": feed_ts_ns.to_string(),
+        "source_first_ts_ns": source_first_ts_ns.map(|ts| ts.to_string()),
+        "source_last_ts_ns": source_last_ts_ns.map(|ts| ts.to_string()),
         "batch_idx": batch_idx,
-        "cursor_ts_ns": cursor_ts_ns.to_string(),
         "applied_batch_idx": applied_batch_idx,
     })
 }

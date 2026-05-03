@@ -77,12 +77,12 @@ validate
   -> decode and run validation/probe
   -> write SQLite validation report
 
-open replay session
+open session with replay feed
   -> look up replay artifact keys from SQLite
   -> reuse valid files under data/cache/replay/...
   -> download missing/stale artifacts from R2
   -> update SQLite cache metadata and LRU access time
-  -> hydrate EventStore and create ReplaySession
+  -> hydrate EventStore and create Session
 
 delete replay
   -> delete Layer 2 objects from R2

@@ -73,11 +73,7 @@ impl ProjectionNode for CanonicalTradesProjectionNode {
 
     fn advance(&mut self, ctx: &ProjectionContext<'_>) -> Result<ProjectionAdvance> {
         let tick = ctx.tick();
-        self.payload = trades_payload(
-            tick.batch_idx,
-            tick.applied_batch_idx,
-            &tick.exchange.trades,
-        );
+        self.payload = trades_payload(tick.batch_idx, tick.applied_batch_idx, &tick.market.trades);
         self.pending
             .push(ProjectionFrameDraft::append(self.payload.clone()));
         Ok(ProjectionAdvance::StateChanged)

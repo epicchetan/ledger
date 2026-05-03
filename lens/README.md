@@ -5,7 +5,7 @@ Vite frontend for Ledger.
 The default screen is the API-backed Data Center surface:
 
 ```text
-MarketDay -> Layer 1 Raw Data -> Layer 2 ReplayDataset -> ReplaySession
+MarketDay -> Layer 1 Raw Data -> Layer 2 ReplayDataset -> Session
 ```
 
 Set `VITE_LEDGER_API_URL` to point Lens at a non-default API address. The

@@ -349,7 +349,7 @@ function trustSummary(record: ApiDataCenterMarketDay) {
   if (validation) return validation.summary
   if (record.replay_dataset.status === "available") {
     return record.replay_dataset.objects_valid
-      ? "ReplayDataset artifacts are durable in R2 and available for validation or replay-session staging."
+      ? "ReplayDataset artifacts are durable in R2 and available for validation or session staging."
       : "ReplayDataset artifact metadata exists, but one or more R2 objects failed verification."
   }
   if (record.raw.status === "available") return "Raw market data is durable in R2. ReplayDataset can be built without redownloading."

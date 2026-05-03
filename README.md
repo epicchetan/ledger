@@ -33,7 +33,8 @@ flowchart LR
   Raw["Raw ES L3 data<br/>DBN / MBO"]:::durable
   DataCenter["Data Center<br/>catalog / prepare / validate / trust"]:::surface
   Dataset["ReplayDataset<br/>immutable validated artifacts"]:::durable
-  Session["ReplaySession<br/>seek / step / play / simulate"]:::runtime
+  Feed["ReplayFeed<br/>historical market-data feed"]:::runtime
+  Session["Session<br/>seek / advance / play / simulate"]:::runtime
   Truth["Exchange Truth<br/>canonical L3 book"]:::runtime
   Projections["Projection Runtime<br/>typed lazy DAG"]:::runtime
 
@@ -47,7 +48,8 @@ flowchart LR
 
   Raw --> DataCenter
   DataCenter --> Dataset
-  Dataset --> Session
+  Dataset --> Feed
+  Feed --> Session
   Session --> Truth
   Truth --> Projections
 
@@ -72,7 +74,7 @@ Ledger should answer questions like:
 What raw data did this result come from?
 Was the ReplayDataset validated?
 What did the L3 book actually look like?
-What could the trader see at that replay cursor?
+What could the trader see at that session cursor?
 What would have filled after latency and queue assumptions?
 Which projection version produced this signal?
 Was this signal causal, stale, async, or hindsight-only?
@@ -81,7 +83,7 @@ Can an agent safely modify the study and prove it still behaves?
 Can the journal later find similar scenarios from live or replay?
 ```
 
-The journal is not just a text log. It should eventually preserve the replay cursor, visible projections, projection versions, fills, tags, levels, screenshots or view state, and selected study values. That makes it possible to ask useful questions later:
+The journal is not just a text log. It should eventually preserve the session cursor, visible projections, projection versions, fills, tags, levels, screenshots or view state, and selected study values. That makes it possible to ask useful questions later:
 
 ```text
 Show me prior trades where this setup appeared.
@@ -114,7 +116,7 @@ repeat quickly with traceability
 | Area | Ledger approach |
 | --- | --- |
 | Replay | Validated ES L3 event replay, not approximate candle playback. |
-| Market truth | One canonical order book per active ReplaySession. |
+| Market truth | One canonical order book per active Session. |
 | Visibility | Trader-visible frames stay separate from exchange truth. |
 | Execution | Simulated orders fill against truth after latency and queue assumptions. |
 | Studies | Typed, versioned projections in a lazy DAG. |
@@ -153,7 +155,7 @@ flowchart LR
   classDef output fill:#0e0e0e,stroke:#777,color:#ddd;
   classDef agent fill:#0e0e0e,stroke:#aaaaaa,color:#eee,stroke-dasharray:4 4;
 
-  Tick["TruthTick<br/>ReplaySession advances one batch"]:::input
+  Tick["SessionTick<br/>Session advances one feed batch"]:::input
   Levels["LevelSets<br/>prior day / VWAP / 0DTE"]:::input
   JournalCtx["Journal Context<br/>tags / review / prior decisions"]:::input
 
@@ -235,7 +237,7 @@ can return when the platform has the feature pressure and tests to justify them.
 
 ## Execution Policy
 
-Near-term projections run synchronously inside the active replay session. Core
+Near-term projections run synchronously inside the active Session. Core
 truth cannot be stale, and the first product goal is to make cursor, BBO,
 canonical trades, and bars deterministic before introducing worker queues or
 lag semantics.
@@ -276,7 +278,7 @@ flowchart LR
   R2["R2<br/>raw DBN + replay artifacts"]:::durable
   Tmp["data/tmp<br/>job staging"]:::temp
   Cache["data/cache<br/>read-through replay cache"]:::temp
-  Session["ReplaySession<br/>hydrates only what it needs"]:::runtime
+  Session["Session<br/>hydrates only what it needs"]:::runtime
 
   SQLite --> R2
   R2 --> SQLite
@@ -305,26 +307,27 @@ raw/replay layer separation
 validation and trust summaries
 persisted jobs and job history
 ReplayDataset loading and validation
-active ReplaySession controller
-headless CLI replay run
+active feed-driven Session controller
+headless CLI session run
 local ReplayDataset cache
 study graph vision and phased implementation plan
 ```
 
-The next major implementation is **Phase 1 of the study graph**.
+The next major implementation is the feed-driven Session path that makes replay
+and live converge below Lens.
 
 ```text
 Phase 1
-  Add shared projection contracts in ledger-domain.
+  Refactor active replay into ReplayFeed -> Session -> SessionTick.
 
 Phase 2
-  Add ProjectionRuntime registry and skeleton in ledger.
+  Add deterministic session-clock validation.
 
 Phase 3
-  Feed TruthTick from ReplaySession into ProjectionRuntime.
+  Expose Session over WebSocket.
 
 Phase 4
-  Add core base projections and CLI projection run/list/manifest/graph.
+  Render projection frames in Lens.
 
 Phase 5+
   Add visual projections, profiling, batch_features, derived studies,
@@ -350,7 +353,7 @@ crates/store    SQLite control plane, R2 object storage, jobs, validation summar
 crates/ingest   Databento/raw DBN ingest, preprocessing, replay artifact creation
 crates/ledger   application orchestration shared by CLI and API
 crates/api      HTTP transport adapter for Lens
-crates/cli      terminal adapter for ingest, status, validation, replay runs
+crates/cli      terminal adapter for ingest, status, validation, session runs
 lens            web operating surface
 ```
 
@@ -369,8 +372,8 @@ cargo run -p ledger-cli -- status --symbol ESH6 --date 2026-03-12
 # Validate replay readiness
 cargo run -p ledger-cli -- session validate --symbol ESH6 --date 2026-03-12 --replay-batches 10000
 
-# Run an active ReplaySession headlessly
-cargo run -p ledger-cli -- replay run --symbol ESH6 --date 2026-03-12 --batches 1000
+# Run an active Session headlessly with a replay feed
+cargo run -p ledger-cli -- session run --symbol ESH6 --date 2026-03-12 --batches 1000
 ```
 
 ## Lens

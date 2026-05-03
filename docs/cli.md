@@ -114,28 +114,28 @@ the API uses. It proves replay artifacts decode, index validation holds,
 book-check still matches, and replay simulation can consume the hydrated
 `EventStore`.
 
-## `replay run`
+## `session run`
 
-Run the active `ReplaySession` controller headlessly and print a deterministic
-JSON report.
+Run the active `Session` controller headlessly with a replay feed and print a
+deterministic JSON report.
 
 ```bash
-cargo run -p ledger-cli -- replay run --symbol ESH6 --date 2026-03-12
+cargo run -p ledger-cli -- session run --symbol ESH6 --date 2026-03-12
 ```
 
 Useful variants:
 
 ```bash
-cargo run -p ledger-cli -- replay run --symbol ESH6 --date 2026-03-12 --batches 100
-cargo run -p ledger-cli -- replay run --symbol ESH6 --date 2026-03-12 --start-ts-ns 1773235800000000000
-cargo run -p ledger-cli -- replay run --symbol ESH6 --date 2026-03-12 --truth-visibility
+cargo run -p ledger-cli -- session run --symbol ESH6 --date 2026-03-12 --batches 100
+cargo run -p ledger-cli -- session run --symbol ESH6 --date 2026-03-12 --start-ts-ns 1773235800000000000
+cargo run -p ledger-cli -- session run --symbol ESH6 --date 2026-03-12 --truth-visibility
 ```
 
 This is the headless adapter for agentic/developer validation of replay
 feature work. It loads the `ReplayDataset` through the local replay cache,
-opens a `ReplaySession`, steps the requested number of batches, and reports
-cursor, batch index, checksum, BBO, frame count, and fill count. It does not
-persist a training session.
+opens a `Session` with a replay feed, advances the requested number of feed
+batches, and reports feed cursor, batch index, checksum, BBO, frame count, and
+fill count. It does not persist a training session.
 
 ## `replay cache-status`
 

@@ -25,14 +25,14 @@ use std::time::Instant;
 
 mod progress;
 pub mod projection;
-mod replay_session;
+mod session;
 mod validation;
 
 use projection::{base_projection_registry, ProjectionRegistry};
 
 pub use ledger_store::ObjectStore;
 pub use progress::*;
-pub use replay_session::*;
+pub use session::*;
 pub use validation::*;
 
 #[derive(Clone)]

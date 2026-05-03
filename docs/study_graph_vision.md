@@ -4,7 +4,7 @@
 
 ## 1. Executive Summary
 
-Ledger's study graph should be a **causal, typed, versioned, subscription-driven projection graph over active `ReplaySession` truth**.
+Ledger's study graph should be a **causal, typed, versioned, subscription-driven projection graph over active `Session` truth**.
 
 It should not be implemented as a loose list of chart indicators. The graph is the market-state computation layer between deterministic replay truth and every downstream consumer: CLI validation, API/WebSocket transport, Lens charts, DOM panels, heatmaps, journal prompts, model outputs, and future live mode.
 
@@ -13,7 +13,7 @@ The central idea is:
 ```text
 ReplayDataset / ContextWindow / LevelSets / Journal Context
                     ↓
-              ReplaySession
+              Session
    deterministic exchange truth + visibility + execution simulation
                     ↓
              ProjectionRuntime
@@ -69,11 +69,11 @@ Immutable replay inputs for a `MarketDay`.
 
 A `ReplayDataset` is not an active user session. It is durable input data: prepared events, batches, canonical trade artifacts, book-check artifacts, validation summaries, and future cached projection artifacts.
 
-### ReplaySession
+### Session
 
 An active mutable replay/training session over one `ReplayDataset`.
 
-A `ReplaySession` owns the replay cursor, play/pause/speed state, visibility profile, execution profile, simulated orders/fills, and the active projection runtime.
+A `Session` owns the replay cursor, play/pause/speed state, visibility profile, execution profile, simulated orders/fills, and the active projection runtime.
 
 ### Exchange Truth
 
@@ -161,7 +161,7 @@ The directed dependency graph of active projection nodes.
 
 ### ProjectionRuntime
 
-The per-`ReplaySession` engine that owns active projection nodes, resolves dependencies, advances nodes when due, applies async results, coalesces frames, and emits `ProjectionFrame`s.
+The per-`Session` engine that owns active projection nodes, resolves dependencies, advances nodes when due, applies async results, coalesces frames, and emits `ProjectionFrame`s.
 
 ### ProjectionManifest
 
@@ -189,11 +189,11 @@ A typed update emitted by the runtime for CLI/API/Lens/journal consumers.
 
 A frame always includes projection identity, generation, cursor stamps, schema, operation, payload, and timing/lag metadata.
 
-### TruthTick
+### SessionTick
 
-The root per-batch input from `ReplaySession` into `ProjectionRuntime`.
+The root per-batch input from `Session` into `ProjectionRuntime`.
 
-A `TruthTick` represents one deterministic replay advancement: exchange events applied, canonical book state after the batch, visibility frames emitted, execution state changes, fills, and cheap event flags.
+A `SessionTick` represents one deterministic replay advancement: exchange events applied, canonical book state after the batch, visibility frames emitted, execution state changes, fills, and cheap event flags.
 
 ---
 
@@ -218,8 +218,8 @@ ledger-replay
   Must not own study runtime or chart-specific computation.
 
 ledger
-  Application orchestration. Owns active ReplaySession controller and
-  ProjectionRuntime integration. Feeds TruthTick into projections.
+  Application orchestration. Owns active Session controller and
+  ProjectionRuntime integration. Feeds SessionTick into projections.
 
 ledger-api
   Transport adapter. Exposes replay controls and projection subscription
@@ -323,8 +323,8 @@ Only missing nodes are instantiated. Existing nodes are reused. Reference counts
 On each replay advancement:
 
 ```text
-ReplaySession applies one exchange batch
-→ ReplaySession emits TruthTick
+Session applies one exchange batch
+→ Session emits SessionTick
 → ProjectionRuntime checks wake policies and dirty dependencies
 → active nodes advance in topological order
 → async jobs are enqueued if needed
@@ -337,14 +337,14 @@ The graph is not a polling system where every node runs blindly every batch. It 
 
 ---
 
-## 6. TruthTick: The Root Clock of the Graph
+## 6. SessionTick: The Root Clock of the Graph
 
-Every online projection should ultimately be driven by `TruthTick`.
+Every online projection should ultimately be driven by `SessionTick`.
 
 A conceptual shape:
 
 ```rust
-pub struct TruthTick {
+pub struct SessionTick {
     pub session_id: SessionId,
     pub replay_dataset_id: ReplayDatasetId,
     pub generation: u64,
@@ -365,14 +365,14 @@ pub struct TruthTick {
     pub simulated_fills: Arc<[SimFill]>,
 
     pub book_checksum_after: Option<BookChecksum>,
-    pub flags: TruthTickFlags,
+    pub flags: SessionTickFlags,
 }
 ```
 
 Cheap event flags let the runtime skip most nodes quickly:
 
 ```rust
-pub struct TruthTickFlags {
+pub struct SessionTickFlags {
     pub has_exchange_events: bool,
     pub has_trades: bool,
     pub bbo_changed: bool,
@@ -384,14 +384,14 @@ pub struct TruthTickFlags {
 }
 ```
 
-`TruthTick` is the only online clock for the projection runtime.
+`SessionTick` is the only online clock for the projection runtime.
 
 Important rule:
 
 ```text
 Projection nodes do not mutate the canonical book.
-Projection nodes do not reach around ReplaySession to load raw data.
-Projection nodes consume TruthTicks, dependency outputs, immutable snapshots,
+Projection nodes do not reach around Session to load raw data.
+Projection nodes consume SessionTicks, dependency outputs, immutable snapshots,
 or declared artifacts.
 ```
 
@@ -1735,7 +1735,7 @@ pub struct ProjectionRuntime {
 Conceptual pseudo-code:
 
 ```rust
-pub fn on_truth_tick(&mut self, tick: &TruthTick) -> Result<Vec<ProjectionFrame>> {
+pub fn on_session_tick(&mut self, tick: &SessionTick) -> Result<Vec<ProjectionFrame>> {
     self.apply_completed_async_results(tick)?;
 
     let mut changed = DirtySet::new();
@@ -1840,8 +1840,8 @@ There is no per-node timing or lag report.
 ### Prefer these patterns
 
 ```text
-One canonical book process per active ReplaySession.
-One shared ProjectionRuntime per active ReplaySession.
+One canonical book process per active Session.
+One shared ProjectionRuntime per active Session.
 One node instance per unique ProjectionKey.
 Typed Rust payloads inside Ledger.
 JSON only at CLI/API boundaries.
@@ -2144,7 +2144,7 @@ Conceptual shape:
 pub struct JournalEntry {
     pub market_day: MarketDay,
     pub replay_dataset_id: ReplayDatasetId,
-    pub replay_session_id: SessionId,
+    pub session_id: SessionId,
 
     pub entry_cursor_ts_ns: UnixNanos,
     pub exit_cursor_ts_ns: Option<UnixNanos>,
@@ -2405,9 +2405,9 @@ V1 should implement the architecture seams clearly enough that these can be adde
 These rules should be protected by code, tests, CLI validation, and review discipline.
 
 ```text
-One active ReplaySession has one canonical truth book.
+One active Session has one canonical truth book.
 
-One ProjectionRuntime exists per active ReplaySession.
+One ProjectionRuntime exists per active Session.
 
 One ProjectionKey creates one shared node instance.
 
@@ -2454,7 +2454,7 @@ The study graph is not a feature. It is Ledger's core leverage point.
 The target is:
 
 ```text
-A deterministic, lazy, typed, timing-aware projection graph over ReplaySession truth,
+A deterministic, lazy, typed, timing-aware projection graph over Session truth,
 validated headlessly through CLI, exposed through a generic projection frame protocol,
 and rendered by Lens without duplicating market logic.
 ```
