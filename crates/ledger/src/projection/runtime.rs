@@ -84,6 +84,10 @@ impl ProjectionRuntimeCursor {
 pub struct ProjectionSubscriptionId(u64);
 
 impl ProjectionSubscriptionId {
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
     pub fn get(self) -> u64 {
         self.0
     }

@@ -34,10 +34,11 @@ validated data
   -> active Session with replay feed
   -> base projections
   -> CLI validation
-  -> first deterministic projection run
+  -> Session WebSocket transport
+  -> first Lens replay surface
 ```
 
-This document picks up after the completed projection contract/runtime/replay-integration work and replaces the old near-term sequence. It intentionally stops at CLI-validated base projections. The next feature after that should get its own plan.
+This document picks up after the completed projection contract/runtime/replay-integration work and replaces the old near-term sequence. It keeps the implementation focused on base projections, deterministic Session behavior, and a thin WebSocket transport before Lens rendering.
 
 ## 2. Current Implementation Audit
 
@@ -57,13 +58,18 @@ ledger projection runtime skeleton
 
 Session integration
   Session owns ProjectionRuntime.
-  ReplaySimulator emits ReplayStepResult.
-  Ledger converts replay facts to SessionTick.
-  Session step reports can include ProjectionFrames.
+  ReplayFeed wraps ReplaySimulator.
+  Ledger converts feed batches to SessionTick.
+  Session advance/clock/seek reports can include ProjectionFrames.
 
-CLI session run
+CLI session run and clock run
   Headless validation path exists and can exercise real ReplayDataset loading,
-  replay cache hydration, and deterministic stepping.
+  replay cache hydration, deterministic stepping, and fake-clock playback.
+
+API Session WebSocket
+  `GET /sessions/ws` opens one feed-driven Session per socket, subscribes
+  projections, advances/plays/seeks the Session, and returns canonical
+  ProjectionFrames without recomputing projection payloads in the API.
 ```
 
 This is the right boundary:
@@ -71,7 +77,7 @@ This is the right boundary:
 ```text
 ledger-replay = deterministic replay mechanics
 ledger        = session orchestration and projection runtime
-ledger-api    = transport later
+ledger-api    = HTTP/WebSocket transport
 ledger-cli    = headless validation
 lens          = rendering and workflow later
 ```
@@ -181,12 +187,12 @@ Phase C  Projection contracts, runtime skeleton, and SessionTick integration
 ```text
 Phase 1  Base replay projections and contract cleanup
 Phase 2  Deterministic Session clock CLI validation
+Phase 3  Session WebSocket transport
 ```
 
 ### Later Plans
 
 ```text
-minimal replay WebSocket API
 Lens replay surface
 product-driven base projection expansion
 first simple study
@@ -456,11 +462,11 @@ cargo test -p ledger-replay
 cargo test --workspace
 ```
 
-## 5. Phase 2 - Projection CLI Validation
+## 5. Phase 2 - Projection and Clock CLI Validation
 
 ### Objective
 
-Give Codex and humans a headless way to validate projection behavior over real ReplayDatasets before API/Lens depend on it.
+Give Codex and humans a headless way to validate projection behavior and deterministic Session clock behavior over real ReplayDatasets before API/Lens depend on it.
 
 ### Commands
 
@@ -594,18 +600,73 @@ cargo run -p ledger-cli -- projection run --symbol ESH6 --date 2026-03-12 --proj
 
 If R2 hydration is required in the Codex sandbox, rerun the CLI command with network approval rather than adding bypass code.
 
-## 6. Out of Scope for This Plan
+## 6. Phase 3 - Session WebSocket Transport
 
-### WebSocket and Lens
+### Objective
 
-WebSocket replay transport and Lens replay rendering are intentionally not specified here.
+Expose the feed-driven `Session` over a thin WebSocket transport without adding a second replay/projection path.
 
-The next plan after this one should start from the CLI-validated projection loop and then define:
+### Route
 
 ```text
-session open/close protocol
-projection subscribe/unsubscribe protocol
-frame routing
+GET /sessions/ws
+```
+
+### Commands
+
+```text
+open_session
+subscribe_projection
+unsubscribe_projection
+advance
+play
+pause
+set_speed
+seek
+snapshot
+close_session
+```
+
+### Required Behavior
+
+```text
+one WebSocket owns at most one active Session
+open_session hydrates a cached ReplayDataset through Ledger
+subscribe_projection returns initial snapshot frames from ProjectionRuntime
+advance manually applies feed batches while paused
+play/pause/set_speed use the Session clock
+seek pauses the Session and returns reset generation snapshot frames
+session_frame_batch returns SessionSnapshot plus canonical ProjectionFrames
+nanosecond fields cross the API boundary as strings
+```
+
+The API invariant:
+
+```text
+ledger-api parses socket messages and serializes responses.
+ledger-api does not compute bars, BBO, trades, dependencies, or projection payloads.
+```
+
+### Tests
+
+```text
+open_session_protocol_maps_ns_strings_to_ledger_request
+invalid_nanosecond_string_is_a_protocol_error
+subscribe_before_open_returns_protocol_error
+subscribe_and_advance_return_projection_frames
+seek_returns_reset_frames_with_new_generation
+play_pump_emits_due_feed_frames_and_pause_stops_pump
+```
+
+## 7. Out of Scope for This Plan
+
+### Lens
+
+Lens replay rendering is intentionally not specified here.
+
+The next plan after this one should start from the CLI-validated projection loop and Session WebSocket transport and then define:
+
+```text
 Lens connection/session/projection state
 the first replay screen
 ```

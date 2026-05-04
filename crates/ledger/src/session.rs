@@ -153,6 +153,13 @@ pub struct SessionClockPumpReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionSeekReport {
+    pub requested_ts_ns: String,
+    pub snapshot: SessionSnapshot,
+    pub projection_frames: Vec<ProjectionFrame>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRunRequest {
     pub symbol: String,
     pub market_date: NaiveDate,
@@ -339,13 +346,14 @@ impl Session {
         session
     }
 
-    pub fn seek_to(&mut self, ts_ns: UnixNanos) -> Result<SessionSnapshot> {
+    pub fn seek_to(&mut self, ts_ns: UnixNanos) -> Result<SessionSeekReport> {
         let feed_snapshot = match &mut self.feed {
             SessionFeed::Replay(feed) => feed
                 .seek_to(ts_ns)
                 .with_context(|| format!("seeking replay feed for Session {}", self.id))?,
         };
-        self.projection_runtime
+        let projection_frames = self
+            .projection_runtime
             .reset_at(ProjectionRuntimeCursor::with_feed(
                 feed_snapshot.feed_seq,
                 feed_snapshot.feed_ts_ns,
@@ -360,7 +368,11 @@ impl Session {
             self.state.playback = SessionPlaybackState::Paused;
         }
         self.refresh_end_state();
-        Ok(self.snapshot())
+        Ok(SessionSeekReport {
+            requested_ts_ns: ts_ns.to_string(),
+            snapshot: self.snapshot(),
+            projection_frames,
+        })
     }
 
     pub fn advance_one_feed_batch(&mut self) -> Result<SessionAdvanceReport> {
@@ -1210,8 +1222,11 @@ mod tests {
         let first = session.advance_one_feed_batch().unwrap();
         assert_eq!(first.projection_frames[0].stamp.generation, 0);
 
-        session.seek_to(100).unwrap();
+        let seek = session.seek_to(100).unwrap();
         assert_eq!(session.projection_generation(), 1);
+        assert_eq!(seek.projection_frames.len(), 1);
+        assert_eq!(seek.projection_frames[0].stamp.generation, 1);
+        assert_eq!(seek.projection_frames[0].stamp.batch_idx, 1);
 
         let second = session.advance_one_feed_batch().unwrap();
         assert_eq!(second.snapshot.feed_ts_ns, "200");
@@ -1231,7 +1246,8 @@ mod tests {
         session.advance_feed_batches(10).unwrap();
         assert_eq!(session.snapshot().playback, SessionPlaybackState::Ended);
 
-        let snapshot = session.seek_to(100).unwrap();
+        let seek = session.seek_to(100).unwrap();
+        let snapshot = seek.snapshot;
 
         assert_eq!(snapshot.feed_ts_ns, "100");
         assert_eq!(snapshot.batch_idx, 1);
@@ -1371,11 +1387,14 @@ mod tests {
             .pump_clock(100, FeedAdvanceBudget::new(10).unwrap())
             .unwrap();
 
-        let snapshot = session.seek_to(100).unwrap();
+        let seek = session.seek_to(100).unwrap();
+        let snapshot = seek.snapshot;
 
         assert_eq!(snapshot.playback, SessionPlaybackState::Paused);
         assert_eq!(snapshot.feed_seq, 0);
         assert_eq!(snapshot.source_first_ts_ns, None);
         assert_eq!(session.projection_generation(), 1);
+        assert_eq!(seek.projection_frames.len(), 1);
+        assert_eq!(seek.projection_frames[0].stamp.generation, 1);
     }
 }

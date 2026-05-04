@@ -24,6 +24,7 @@ DELETE /market-days/:symbol/:date/raw
 GET  /jobs?active=true
 GET  /jobs?active=false&limit=50
 GET  /jobs/:id
+GET  /sessions/ws
 ```
 
 Market-day status is cheap by default. It reports durable Layer 1 raw data,
@@ -45,6 +46,30 @@ and leave a ReplayDataset with current validation status.
 data. `replay/validate` is the heavier audit path.
 `replay/cache` removes only local cached replay artifacts; it does not touch R2
 or durable catalog records.
+
+`GET /sessions/ws` exposes the active feed-driven `Session` runtime over a
+WebSocket. The socket is intentionally transport-only: it opens a replay-backed
+session, subscribes projections, advances/plays/seeks the session, and returns
+`SessionSnapshot` plus Ledger `ProjectionFrame` payloads. The API does not
+recompute bars, BBO, trades, or projection dependencies.
+
+Session socket commands:
+
+```text
+open_session
+subscribe_projection
+unsubscribe_projection
+advance
+play
+pause
+set_speed
+seek
+snapshot
+close_session
+```
+
+One WebSocket currently owns at most one active Session. Shared sessions,
+live feeds, order entry, and Lens replay rendering are intentionally deferred.
 
 ## Development
 

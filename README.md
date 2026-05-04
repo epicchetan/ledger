@@ -309,6 +309,7 @@ persisted jobs and job history
 ReplayDataset loading and validation
 active feed-driven Session controller
 headless CLI session run
+Session WebSocket transport
 local ReplayDataset cache
 study graph vision and phased implementation plan
 ```
@@ -324,7 +325,8 @@ Phase 2
   Add deterministic session-clock validation.
 
 Phase 3
-  Expose Session over WebSocket.
+  Expose Session over WebSocket. Implemented as transport over Ledger
+  Session/ProjectionFrame primitives; Lens rendering is still next.
 
 Phase 4
   Render projection frames in Lens.
@@ -399,7 +401,7 @@ npm run dev
 
 Lens currently focuses on data ownership and trust: market days, raw/replay layer status, jobs, validation, cache state, and Data Center actions.
 
-Replay controls, charts, DOM, projection subscriptions, journal workflows, and agentic study creation come after the Projection Runtime boundary is in place.
+Replay controls, charts, DOM, journal workflows, and agentic study creation come after the Session WebSocket boundary is connected to Lens.
 
 ## Philosophy
 

@@ -22,5 +22,6 @@ tower-http.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+ledger-replay = { path = "../replay" }
 tempfile.workspace = true
 tower.workspace = true

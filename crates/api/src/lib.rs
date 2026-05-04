@@ -3,6 +3,8 @@ mod error;
 mod jobs;
 mod presenters;
 mod routes;
+mod session_protocol;
+mod session_ws;
 mod state;
 mod time;
 
@@ -16,6 +18,7 @@ use tower_http::cors::CorsLayer;
 pub use dto::*;
 pub use error::ApiError;
 pub use jobs::{progress_sink_for_job, JobKind, JobRecord, JobStatus, JobTarget};
+pub use session_protocol::*;
 pub use state::{ApiLedger, ApiState};
 
 pub fn router(state: ApiState) -> Router {
@@ -56,6 +59,7 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/jobs", get(routes::jobs))
         .route("/jobs/{id}", get(routes::job_status))
+        .route("/sessions/ws", get(session_ws::session_ws))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

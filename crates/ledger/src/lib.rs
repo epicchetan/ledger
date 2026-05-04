@@ -30,6 +30,7 @@ mod validation;
 
 use projection::{base_projection_registry, ProjectionRegistry};
 
+pub use ledger_replay::{ReplayFeedConfig, ReplayFeedMode};
 pub use ledger_store::ObjectStore;
 pub use progress::*;
 pub use session::*;
