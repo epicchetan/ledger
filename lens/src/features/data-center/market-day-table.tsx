@@ -1,5 +1,5 @@
 import type { Column, ColumnDef } from "@tanstack/react-table"
-import { ArrowUpDown, Database, HardDrive, MoreVertical, RefreshCw, ScrollText, ShieldCheck, Trash2 } from "lucide-react"
+import { ArrowUpDown, Database, HardDrive, MoreVertical, Play, RefreshCw, ScrollText, ShieldCheck, Trash2 } from "lucide-react"
 import { useMemo } from "react"
 
 import { Button } from "@/components/ui/button"
@@ -359,6 +359,11 @@ function RowActions({
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end">
+        <DropdownMenuItem disabled={!hasReplay} onSelect={() => onAction(day, "openReplay")}>
+          <Play className="size-3.5" />
+          Open Replay
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={() => onAction(day, "prepare")}>
           <Database className="size-3.5" />
           Prepare

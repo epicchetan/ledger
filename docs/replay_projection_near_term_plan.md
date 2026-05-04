@@ -658,17 +658,39 @@ seek_returns_reset_frames_with_new_generation
 play_pump_emits_due_feed_frames_and_pause_stops_pump
 ```
 
-## 7. Out of Scope for This Plan
+## 7. Phase 4 - Lens Charts Surface
 
-### Lens
+### Objective
 
-Lens replay rendering is intentionally not specified here.
+Render the first real replay surface in Lens from canonical Session WebSocket
+messages and ProjectionFrames.
 
-The next plan after this one should start from the CLI-validated projection loop and Session WebSocket transport and then define:
+### Scope
+
+Data Center remains the replay data ownership surface. Charts becomes the active
+Session surface:
 
 ```text
-Lens connection/session/projection state
-the first replay screen
+Data Center row action
+  -> Open Replay
+  -> Charts tab
+  -> /sessions/ws
+  -> open_session
+  -> subscribe bars:v1
+  -> render ProjectionFrames on lightweight-charts
+```
+
+### Required Behavior
+
+```text
+Open Replay is available for MarketDays with an available ReplayDataset.
+Charts keeps one active Session socket owned by Lens.
+Charts subscribes to bars:v1 with { "seconds": 60 }.
+Charts ignores dependency ProjectionFrames that are not bars:v1.
+Charts converts ES tick prices to display prices with 0.25 tick size.
+Charts parses nanosecond timestamps as strings/BigInt before chart conversion.
+Top-right header controls switch from Prepare controls to replay controls.
+Controls support manual advance, play, pause, speed, and close.
 ```
 
 The invariant remains:
@@ -677,6 +699,21 @@ The invariant remains:
 API and Lens must consume projection frames from ledger.
 They must not recompute bars, BBO, trade facts, or projection dependencies.
 ```
+
+### Validation
+
+```text
+npm run typecheck
+npm run lint
+npm run build
+manual Lens pass against ledger-api:
+  Open Data Center
+  Open Replay for a ready ReplayDataset
+  Advance or play until bars render
+  Pause and close the Session
+```
+
+## 8. Out of Scope For This Plan
 
 ### Orders and Fills
 

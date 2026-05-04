@@ -310,31 +310,31 @@ ReplayDataset loading and validation
 active feed-driven Session controller
 headless CLI session run
 Session WebSocket transport
+Lens Charts tab over Session WebSocket
 local ReplayDataset cache
 study graph vision and phased implementation plan
 ```
 
-The next major implementation is the feed-driven Session path that makes replay
-and live converge below Lens.
+The current runtime path is feed-driven and visible through Lens:
 
 ```text
 Phase 1
-  Refactor active replay into ReplayFeed -> Session -> SessionTick.
+  Refactor active replay into ReplayFeed -> Session -> SessionTick. Done.
 
 Phase 2
-  Add deterministic session-clock validation.
+  Add deterministic session-clock validation. Done.
 
 Phase 3
   Expose Session over WebSocket. Implemented as transport over Ledger
-  Session/ProjectionFrame primitives; Lens rendering is still next.
+  Session/ProjectionFrame primitives. Done.
 
 Phase 4
-  Render projection frames in Lens.
+  Open Replay from Data Center and render bars:v1 ProjectionFrames in
+  the Lens Charts tab. Done.
 
 Phase 5+
-  Add visual projections, profiling, batch_features, derived studies,
-  API/WebSocket projection subscriptions, Lens renderers, journaling,
-  levels/gamma, model studies, checkpointing, and live mode.
+  Product-driven projection expansion, first simple studies, journaling,
+  execution simulation, checkpointing, and live mode.
 ```
 
 Detailed planning:

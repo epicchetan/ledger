@@ -12,7 +12,15 @@ export type ArtifactStatus = "missing" | "remote" | "valid" | "invalid"
 
 export type ArtifactKey = "events" | "batches" | "trades" | "bookCheck"
 
-export type DatasetAction = "prepare" | "rebuild" | "validate" | "deleteCache" | "deleteReplay" | "deleteRaw" | "history"
+export type DatasetAction =
+  | "openReplay"
+  | "prepare"
+  | "rebuild"
+  | "validate"
+  | "deleteCache"
+  | "deleteReplay"
+  | "deleteRaw"
+  | "history"
 
 export type JobStatus = "queued" | "running" | "succeeded" | "failed"
 

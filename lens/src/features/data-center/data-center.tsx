@@ -22,12 +22,15 @@ import {
 import { ActiveJobTable, JobHistoryTable } from "@/features/data-center/job-table"
 import { MarketDayTable } from "@/features/data-center/market-day-table"
 import type { DataCenterLoadState, DatasetAction, JobRecord, MarketDay, MarketDayStatus } from "@/features/data-center/types"
+import { ReplayControls } from "@/features/replay/replay-controls"
+import { ReplayPage } from "@/features/replay/replay-page"
+import { useSessionSocket } from "@/features/replay/use-session-socket"
 
 const JOB_POLL_MS = 1_500
 const JOB_IDLE_POLL_MS = 5_000
 const JOB_HISTORY_LIMIT = 25
 
-type DataCenterTab = "dataCenter" | "jobs"
+type DataCenterTab = "dataCenter" | "jobs" | "charts"
 
 function updateDay(days: MarketDay[], nextDay: MarketDay) {
   return days.map((day) => (day.id === nextDay.id ? nextDay : day))
@@ -40,6 +43,7 @@ function errorMessage(error: unknown) {
 export function DataCenter() {
   const [days, setDays] = useState<MarketDay[]>([])
   const [activeTab, setActiveTab] = useState<DataCenterTab>("dataCenter")
+  const replay = useSessionSocket()
   const [pendingPrepare, setPendingPrepare] = useState(false)
   const [prepareContract, setPrepareContract] = useState("ESH6")
   const [prepareDate, setPrepareDate] = useState("")
@@ -207,7 +211,10 @@ export function DataCenter() {
 
   async function runAction(day: MarketDay, action: DatasetAction) {
     try {
-      if (action === "prepare") {
+      if (action === "openReplay") {
+        setActiveTab("charts")
+        replay.openReplay(day)
+      } else if (action === "prepare") {
         await prepareMarketDay(day.contract, day.marketDate)
       } else if (action === "history") {
         await loadJobHistory(day)
@@ -275,6 +282,9 @@ export function DataCenter() {
             <HeaderTab active={activeTab === "jobs"} onClick={() => setActiveTab("jobs")}>
               Jobs
             </HeaderTab>
+            <HeaderTab active={activeTab === "charts"} onClick={() => setActiveTab("charts")}>
+              Charts
+            </HeaderTab>
           </nav>
         </div>
         {activeTab === "dataCenter" ? (
@@ -286,10 +296,12 @@ export function DataCenter() {
             onDateChange={setPrepareDate}
             onPrepare={() => void prepareMarketDay(prepareContract, prepareDate)}
           />
+        ) : activeTab === "charts" ? (
+          <ReplayControls replay={replay} />
         ) : null}
       </header>
 
-      <main className="flex min-h-0 flex-1 flex-col gap-3 p-3">
+      <main className={activeTab === "charts" ? "flex min-h-0 flex-1 flex-col" : "flex min-h-0 flex-1 flex-col gap-3 p-3"}>
         {activeTab === "dataCenter" ? (
           <>
             {activeJobs.length > 0 ? <ActiveJobTable jobs={activeJobs} /> : null}
@@ -303,13 +315,15 @@ export function DataCenter() {
               <MarketDayTable days={displayDays} activeJobDayIds={activeJobDayIds} onAction={runAction} />
             )}
           </>
-        ) : (
+        ) : activeTab === "jobs" ? (
           <JobsTab
             activeJobs={activeJobs}
             history={visibleHistory}
             historyLoading={historyLoading}
             onClearHistory={historyScope ? () => setHistoryScope(null) : undefined}
           />
+        ) : (
+          <ReplayPage replay={replay} />
         )}
       </main>
     </div>
@@ -343,6 +357,8 @@ function statusForActiveJob(job: JobRecord): MarketDayStatus {
 
 function actionLabel(action: DatasetAction) {
   switch (action) {
+    case "openReplay":
+      return "Open Replay"
     case "prepare":
       return "Prepare"
     case "rebuild":
@@ -362,6 +378,8 @@ function actionLabel(action: DatasetAction) {
 
 function startDatasetAction(day: MarketDay, action: DatasetAction) {
   switch (action) {
+    case "openReplay":
+      throw new Error("Open Replay is handled by the Charts session")
     case "prepare":
       return prepareReplayDataset(day.contract, day.marketDate)
     case "rebuild":
