@@ -9,6 +9,7 @@ mod data_plane;
 mod error;
 mod key;
 mod projection;
+mod runtime;
 
 pub use cell::{ArrayKey, CellDescriptor, CellKind, CellOwner, ValueKey, WriteEffects};
 pub use data_plane::DataPlane;
@@ -17,3 +18,4 @@ pub use key::Key;
 pub use projection::{
     Projection, ProjectionContext, ProjectionDescriptor, ProjectionError, ProjectionId,
 };
+pub use runtime::{ExternalWriteBatch, RunStats, Runtime, RuntimeError, RuntimeStep};
