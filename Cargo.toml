@@ -6,6 +6,7 @@ members = [
     "crates/book",
     "crates/replay",
     "crates/ledger",
+    "crates/ledger-runtime",
     "crates/api",
     "crates/cli",
 ]
