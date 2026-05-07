@@ -18,7 +18,13 @@ interface TopBarProps {
   onToggleDom: () => void
 }
 
-export function TopBar({ replayState, channel, onChannelChange, showDom, onToggleDom }: TopBarProps) {
+export function TopBar({
+  replayState,
+  channel,
+  onChannelChange,
+  showDom,
+  onToggleDom,
+}: TopBarProps) {
   const hasState = replayState != null
   const playing = replayState?.playing ?? false
   const speed = replayState?.speed ?? 1
@@ -38,7 +44,7 @@ export function TopBar({ replayState, channel, onChannelChange, showDom, onToggl
       currentDate.getUTCHours(),
       currentDate.getUTCMinutes(),
       currentDate.getUTCSeconds(),
-      0,
+      0
     )
     // newDate is ET-shifted; reverse-shift for seek API (needs real UTC)
     const offset = getETOffsetSeconds(newDate.getTime())
@@ -51,7 +57,7 @@ export function TopBar({ replayState, channel, onChannelChange, showDom, onToggl
   }
 
   return (
-    <div className="flex h-10 items-center justify-between border-b-2 border-[rgba(255,255,255,0.15)] px-3">
+    <div className="flex h-10 items-center justify-between border-b-2 border-border px-3">
       {/* Left — bar type picker */}
       <div className="flex items-center gap-2">
         <BarPicker
@@ -86,7 +92,11 @@ export function TopBar({ replayState, channel, onChannelChange, showDom, onToggl
           onClick={handlePlayPause}
           disabled={!hasState}
         >
-          {playing ? <Pause className="size-3.5" /> : <Play className="size-3.5" />}
+          {playing ? (
+            <Pause className="size-3.5" />
+          ) : (
+            <Play className="size-3.5" />
+          )}
         </Button>
 
         <SpeedPicker

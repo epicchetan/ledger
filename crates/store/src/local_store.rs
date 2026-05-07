@@ -1,10 +1,6 @@
-use crate::sanitize_path_component;
 use anyhow::{Context, Result};
-use ledger_domain::{now_ns, MarketDay, StorageKind};
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
-use tokio::io::AsyncWriteExt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug)]
 pub struct LocalStore {
@@ -12,176 +8,63 @@ pub struct LocalStore {
 }
 
 impl LocalStore {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+    pub fn new(data_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            root: data_dir.into().join("store"),
+        }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    pub fn catalog_path(&self) -> PathBuf {
-        self.root.join("ledger.sqlite")
+    pub fn registry_objects_dir(&self) -> PathBuf {
+        self.root.join("registry").join("objects")
     }
 
-    pub fn ingest_run_dir(&self, md: &MarketDay, run_id: impl ToString) -> PathBuf {
-        self.root
-            .join("tmp")
-            .join("ingest")
-            .join(&md.root)
-            .join(&md.contract_symbol)
-            .join(md.market_date.to_string())
-            .join(run_id.to_string())
-    }
-
-    pub fn ingest_raw_path(&self, md: &MarketDay, run_id: impl ToString) -> PathBuf {
-        self.ingest_run_dir(md, run_id).join("raw.dbn.zst")
-    }
-
-    pub fn ingest_artifacts_dir(&self, md: &MarketDay, run_id: impl ToString) -> PathBuf {
-        self.ingest_run_dir(md, run_id).join("artifacts")
-    }
-
-    pub fn validate_run_dir(&self, md: &MarketDay, run_id: impl ToString) -> PathBuf {
-        self.root
-            .join("tmp")
-            .join("validate")
-            .join(&md.root)
-            .join(&md.contract_symbol)
-            .join(md.market_date.to_string())
-            .join(run_id.to_string())
-    }
-
-    pub fn validate_artifact_path(
-        &self,
-        md: &MarketDay,
-        run_id: impl ToString,
-        kind: StorageKind,
-    ) -> Result<PathBuf> {
-        Ok(self
-            .validate_run_dir(md, run_id)
-            .join(replay_file_name(kind)?))
-    }
-
-    pub fn replay_cache_dir(&self) -> PathBuf {
-        self.root.join("cache").join("replay")
-    }
-
-    pub fn replay_cache_dataset_dir(&self, md: &MarketDay, replay_dataset_id: &str) -> PathBuf {
-        self.replay_cache_dir()
-            .join(&md.root)
-            .join(&md.contract_symbol)
-            .join(md.market_date.to_string())
-            .join(sanitize_path_component(replay_dataset_id))
-    }
-
-    pub fn replay_cache_artifact_path(
-        &self,
-        md: &MarketDay,
-        replay_dataset_id: &str,
-        kind: StorageKind,
-    ) -> Result<PathBuf> {
-        Ok(self
-            .replay_cache_dataset_dir(md, replay_dataset_id)
-            .join(replay_file_name(kind)?))
+    pub fn local_objects_dir(&self) -> PathBuf {
+        self.root.join("local").join("objects")
     }
 
     pub fn tmp_dir(&self) -> PathBuf {
         self.root.join("tmp")
     }
 
-    pub fn new_ingest_run_label(&self) -> String {
-        now_ns().to_string()
+    pub fn put_tmp_dir(&self) -> PathBuf {
+        self.tmp_dir().join("put")
     }
 
-    pub async fn cleanup_ingest_run(&self, md: &MarketDay, run_id: impl ToString) -> Result<()> {
-        let dir = self.ingest_run_dir(md, run_id);
-        if dir.exists() {
-            tokio::fs::remove_dir_all(dir).await?;
-        }
-        Ok(())
+    pub fn hydrate_tmp_dir(&self) -> PathBuf {
+        self.tmp_dir().join("hydrate")
     }
 
-    pub async fn cleanup_validate_run(&self, md: &MarketDay, run_id: impl ToString) -> Result<()> {
-        let dir = self.validate_run_dir(md, run_id);
-        if dir.exists() {
-            tokio::fs::remove_dir_all(dir).await?;
-        }
-        Ok(())
+    pub fn local_path(&self, id: &crate::StoreObjectId, file_name: &str) -> PathBuf {
+        self.local_objects_dir().join(id.as_str()).join(file_name)
     }
 
-    pub fn cleanup_tmp(&self, older_than: Option<Duration>) -> Result<CleanupTmpReport> {
-        let tmp = self.tmp_dir();
-        let mut report = CleanupTmpReport {
-            root: tmp.clone(),
-            ..Default::default()
-        };
-        if !tmp.exists() {
-            return Ok(report);
-        }
-        cleanup_tmp_entries(&tmp, older_than, &mut report)?;
-        Ok(report)
+    pub fn relative_to_root(&self, path: &Path) -> Result<PathBuf> {
+        Ok(path
+            .strip_prefix(&self.root)
+            .with_context(|| {
+                format!(
+                    "path {} is not under store root {}",
+                    path.display(),
+                    self.root.display()
+                )
+            })?
+            .to_path_buf())
     }
 
-    pub fn remove_replay_cache_dir(&self, dir: PathBuf) -> Result<RemoveLocalDirReport> {
-        let mut report = RemoveLocalDirReport {
-            root: dir.clone(),
-            ..Default::default()
-        };
-        if !dir.exists() {
-            return Ok(report);
-        }
-        collect_local_dir_entries(&dir, &mut report)?;
-        std::fs::remove_dir_all(&dir)
-            .with_context(|| format!("removing replay cache dir {}", dir.display()))?;
-        Ok(report)
-    }
-
-    pub async fn hydrate_atomic<F, Fut>(&self, dest: &Path, hydrate: F) -> Result<()>
-    where
-        F: FnOnce(PathBuf) -> Fut,
-        Fut: std::future::Future<Output = Result<()>>,
-    {
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let tmp = tmp_path(dest);
-        if tmp.exists() {
-            tokio::fs::remove_file(&tmp).await.ok();
-        }
-        hydrate(tmp.clone()).await?;
-        tokio::fs::rename(&tmp, dest)
-            .await
-            .with_context(|| format!("renaming {} -> {}", tmp.display(), dest.display()))?;
-        Ok(())
-    }
-
-    pub async fn write_atomic(&self, path: &Path, bytes: &[u8]) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let tmp = tmp_path(path);
-        let mut file = tokio::fs::File::create(&tmp)
-            .await
-            .with_context(|| format!("creating {}", tmp.display()))?;
-        file.write_all(bytes).await?;
-        file.sync_all().await?;
-        drop(file);
-        tokio::fs::rename(&tmp, path)
-            .await
-            .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
-        Ok(())
+    pub fn absolute_from_root(&self, path: &Path) -> PathBuf {
+        self.root.join(path)
     }
 }
 
-pub fn replay_file_name(kind: StorageKind) -> Result<&'static str> {
-    match kind {
-        StorageKind::EventStore => Ok("events.v1.bin"),
-        StorageKind::BatchIndex => Ok("batches.v1.bin"),
-        StorageKind::TradeIndex => Ok("trades.v1.bin"),
-        StorageKind::BookCheck => Ok("book_check.v1.json"),
-        other => anyhow::bail!("{} is not a replay artifact", other.as_str()),
-    }
+pub fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_nanos() as u64
 }
 
 pub fn tmp_path(path: &Path) -> PathBuf {
@@ -190,75 +73,12 @@ pub fn tmp_path(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct CleanupTmpReport {
-    pub root: PathBuf,
-    pub deleted_files: usize,
-    pub deleted_dirs: usize,
-    pub bytes_deleted: u64,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct RemoveLocalDirReport {
-    pub root: PathBuf,
-    pub deleted_files: usize,
-    pub deleted_dirs: usize,
-    pub bytes_deleted: u64,
-}
-
-fn cleanup_tmp_entries(
-    dir: &Path,
-    older_than: Option<Duration>,
-    report: &mut CleanupTmpReport,
-) -> Result<bool> {
-    let mut empty = true;
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            if cleanup_tmp_entries(&path, older_than, report)? && eligible(&metadata, older_than) {
-                std::fs::remove_dir(&path)?;
-                report.deleted_dirs += 1;
-            } else {
-                empty = false;
-            }
-        } else if eligible(&metadata, older_than) {
-            let bytes = metadata.len();
-            std::fs::remove_file(&path)?;
-            report.deleted_files += 1;
-            report.bytes_deleted += bytes;
-        } else {
-            empty = false;
-        }
-    }
-    Ok(empty)
-}
-
-fn collect_local_dir_entries(dir: &Path, report: &mut RemoveLocalDirReport) -> Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            report.deleted_dirs += 1;
-            collect_local_dir_entries(&path, report)?;
-        } else {
-            report.deleted_files += 1;
-            report.bytes_deleted += metadata.len();
-        }
-    }
-    Ok(())
-}
-
-fn eligible(metadata: &std::fs::Metadata, older_than: Option<Duration>) -> bool {
-    let Some(older_than) = older_than else {
-        return true;
-    };
-    let Ok(modified_at) = metadata.modified() else {
-        return false;
-    };
-    SystemTime::now()
-        .duration_since(modified_at)
-        .is_ok_and(|age| age >= older_than)
+pub fn sanitize_file_name(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => c,
+            _ => '_',
+        })
+        .collect()
 }

@@ -1,65 +1,25 @@
 mod dto;
 mod error;
-mod jobs;
-mod presenters;
 mod routes;
-mod session_protocol;
-mod session_ws;
 mod state;
 mod time;
 
-use axum::{
-    routing::{delete, get, post},
-    Router,
-};
+use axum::{routing::get, Router};
 use std::net::SocketAddr;
 use tower_http::cors::CorsLayer;
 
 pub use dto::*;
 pub use error::ApiError;
-pub use jobs::{progress_sink_for_job, JobKind, JobRecord, JobStatus, JobTarget};
-pub use session_protocol::*;
-pub use state::{ApiLedger, ApiState};
+pub use state::ApiState;
 
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/health", get(routes::health))
-        .route("/market-days", get(routes::list_market_days))
+        .route("/store/objects", get(routes::list_store_objects))
         .route(
-            "/market-days/{symbol}/{date}",
-            get(routes::market_day_status),
+            "/store/objects/{id}",
+            get(routes::get_store_object).delete(routes::delete_store_object),
         )
-        .route(
-            "/market-days/{symbol}/{date}/jobs",
-            get(routes::market_day_jobs),
-        )
-        .route(
-            "/market-days/{symbol}/{date}/prepare",
-            post(routes::prepare_replay_dataset),
-        )
-        .route(
-            "/market-days/{symbol}/{date}/replay/build",
-            post(routes::build_replay_dataset),
-        )
-        .route(
-            "/market-days/{symbol}/{date}/replay/validate",
-            post(routes::validate_replay_dataset),
-        )
-        .route(
-            "/market-days/{symbol}/{date}/replay",
-            delete(routes::delete_replay_dataset),
-        )
-        .route(
-            "/market-days/{symbol}/{date}/replay/cache",
-            delete(routes::delete_replay_dataset_cache),
-        )
-        .route(
-            "/market-days/{symbol}/{date}/raw",
-            delete(routes::delete_raw_market_data),
-        )
-        .route("/jobs", get(routes::jobs))
-        .route("/jobs/{id}", get(routes::job_status))
-        .route("/sessions/ws", get(session_ws::session_ws))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

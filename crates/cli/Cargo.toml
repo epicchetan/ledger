@@ -10,11 +10,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-chrono.workspace = true
 dotenvy.workspace = true
-ledger-domain = { path = "../domain" }
-ledger = { path = "../ledger" }
-ledger-store = { path = "../store" }
+store = { path = "../store" }
 tokio.workspace = true
 serde_json.workspace = true
 serde.workspace = true

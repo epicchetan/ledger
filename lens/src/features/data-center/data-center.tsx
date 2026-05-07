@@ -1,488 +1,306 @@
-import { AlertTriangle, RefreshCw, Send } from "lucide-react"
-import type { ReactNode } from "react"
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { AlertTriangle, Search, Trash2 } from "lucide-react"
+import type { FormEvent } from "react"
+import { useCallback, useEffect, useState } from "react"
 import { toast } from "sonner"
 
 import { Button } from "@/components/ui/button"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import {
-  deleteRawMarketData,
-  deleteReplayDataset,
-  deleteReplayDatasetCache,
-  fetchActiveJobs,
-  fetchMarketDays,
-  fetchMarketDayStatus,
-  fetchMarketDayJobs,
-  fetchJob,
-  fetchRecentJobs,
-  prepareReplayDataset,
-  rebuildReplayDataset,
-  validateReplayDataset,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import {
+  deleteStoreObject,
+  fetchStoreObjects,
+  formatBytes,
 } from "@/features/data-center/api"
-import { ActiveJobTable, JobHistoryTable } from "@/features/data-center/job-table"
-import { MarketDayTable } from "@/features/data-center/market-day-table"
-import type { DataCenterLoadState, DatasetAction, JobRecord, MarketDay, MarketDayStatus } from "@/features/data-center/types"
-import { ReplayControls } from "@/features/replay/replay-controls"
-import { ReplayPage } from "@/features/replay/replay-page"
-import { useSessionSocket } from "@/features/replay/use-session-socket"
+import { ObjectTable } from "@/features/data-center/object-table"
+import type {
+  DataCenterLoadState,
+  StoreObject,
+  StoreObjectFilters,
+} from "@/features/data-center/types"
 
-const JOB_POLL_MS = 1_500
-const JOB_IDLE_POLL_MS = 5_000
-const JOB_HISTORY_LIMIT = 25
-
-type DataCenterTab = "dataCenter" | "jobs" | "charts"
-
-function updateDay(days: MarketDay[], nextDay: MarketDay) {
-  return days.map((day) => (day.id === nextDay.id ? nextDay : day))
+const EMPTY_FILTERS: StoreObjectFilters = {
+  role: "",
+  kind: "",
+  idPrefix: "",
 }
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Unknown error"
 }
 
+function normalizeFilters(filters: StoreObjectFilters): StoreObjectFilters {
+  return {
+    role: filters.role,
+    kind: filters.kind.trim(),
+    idPrefix: filters.idPrefix.trim(),
+  }
+}
+
+function sameFilters(left: StoreObjectFilters, right: StoreObjectFilters) {
+  return (
+    left.role === right.role &&
+    left.kind === right.kind &&
+    left.idPrefix === right.idPrefix
+  )
+}
+
 export function DataCenter() {
-  const [days, setDays] = useState<MarketDay[]>([])
-  const [activeTab, setActiveTab] = useState<DataCenterTab>("dataCenter")
-  const replay = useSessionSocket()
-  const [pendingPrepare, setPendingPrepare] = useState(false)
-  const [prepareContract, setPrepareContract] = useState("ESH6")
-  const [prepareDate, setPrepareDate] = useState("")
-  const [jobs, setJobs] = useState<JobRecord[]>([])
-  const [recentJobs, setRecentJobs] = useState<JobRecord[]>([])
-  const [historyScope, setHistoryScope] = useState<{ title: string; jobs: JobRecord[] } | null>(null)
-  const [historyLoading, setHistoryLoading] = useState(false)
-  const refreshGeneration = useRef(0)
-  const hadActiveJobs = useRef(false)
+  const [objects, setObjects] = useState<StoreObject[]>([])
+  const [filters, setFilters] = useState<StoreObjectFilters>(EMPTY_FILTERS)
+  const [appliedFilters, setAppliedFilters] =
+    useState<StoreObjectFilters>(EMPTY_FILTERS)
+  const [deleteTarget, setDeleteTarget] = useState<StoreObject | null>(null)
+  const [deleting, setDeleting] = useState(false)
   const [loadState, setLoadState] = useState<DataCenterLoadState>({
     kind: "loading",
     message: "Connecting to Ledger API.",
   })
 
-  const replaceActiveJobs = useCallback((nextJobs: JobRecord[]) => {
-    const activeJobs = nextJobs.filter(isActiveJob).slice(0, 5)
-    setJobs(activeJobs)
-    return activeJobs
-  }, [])
-
-  const replaceRecentJobs = useCallback((nextJobs: JobRecord[]) => {
-    const completedJobs = nextJobs.filter((job) => !isActiveJob(job)).slice(0, 10)
-    setRecentJobs(completedJobs)
-    return completedJobs
-  }, [])
-
   const refresh = useCallback(async () => {
-    const generation = refreshGeneration.current + 1
-    refreshGeneration.current = generation
-    setLoadState({ kind: "loading", message: "Loading cataloged market days from Ledger API." })
-
+    setLoadState({
+      kind: "loading",
+      message: "Loading store objects from Ledger API.",
+    })
     try {
-      const [nextDays, activeJobs, recentJobs] = await Promise.all([
-        fetchMarketDays(),
-        fetchActiveJobs(),
-        fetchRecentJobs(JOB_HISTORY_LIMIT),
-      ])
-      if (refreshGeneration.current !== generation) return
-
-      setDays(nextDays)
-      replaceActiveJobs(activeJobs)
-      replaceRecentJobs(recentJobs)
-
-      if (nextDays.length === 0) {
-        setLoadState({
-          kind: "empty",
-          message: "No market days are cataloged yet. Ingest a day from the CLI or API first.",
-        })
-      } else {
-        setLoadState({
-          kind: "ready",
-          message: `Loaded ${nextDays.length} cataloged market day${nextDays.length === 1 ? "" : "s"}.`,
-        })
-        hydrateStatuses(nextDays, generation)
-      }
+      const nextObjects = await fetchStoreObjects(appliedFilters)
+      setObjects(nextObjects)
+      setLoadState(
+        nextObjects.length === 0
+          ? { kind: "empty", message: "No store objects are registered yet." }
+          : {
+              kind: "ready",
+              message: `Loaded ${nextObjects.length} store object${nextObjects.length === 1 ? "" : "s"}.`,
+            }
+      )
     } catch (error) {
-      setDays([])
+      setObjects([])
       setLoadState({
         kind: "error",
         message: `Ledger API request failed: ${errorMessage(error)}`,
       })
       toast.error("Ledger API unavailable", {
-        description: "Start ledger-api on 127.0.0.1:3001 or set VITE_LEDGER_API_URL.",
+        description:
+          "Start ledger-api on 127.0.0.1:3001 or set VITE_LEDGER_API_URL.",
       })
     }
-  }, [replaceActiveJobs, replaceRecentJobs])
-
-  function hydrateStatuses(nextDays: MarketDay[], generation: number) {
-    for (const day of nextDays) {
-      void fetchMarketDayStatus(day)
-        .then((nextDay) => {
-          if (refreshGeneration.current !== generation) return
-          setDays((current) => updateDay(current, nextDay))
-        })
-        .catch(() => {
-          // Keep the catalog-derived row visible. Status hydration can be retried
-          // without blocking the whole Data Center surface.
-        })
-    }
-  }
+  }, [appliedFilters])
 
   useEffect(() => {
     void refresh()
   }, [refresh])
 
   useEffect(() => {
-    let cancelled = false
-    let timeout: number | null = null
+    const timeout = window.setTimeout(() => {
+      const nextFilters = normalizeFilters(filters)
+      setAppliedFilters((current) =>
+        sameFilters(current, nextFilters) ? current : nextFilters
+      )
+    }, 180)
 
-    async function pollActiveJobs() {
-      let nextDelay = JOB_IDLE_POLL_MS
-      try {
-        const activeJobs = replaceActiveJobs(await fetchActiveJobs())
-        if (cancelled) return
+    return () => window.clearTimeout(timeout)
+  }, [filters])
 
-        const hasActiveJobs = activeJobs.length > 0
-        if (!hasActiveJobs && hadActiveJobs.current) {
-          void refresh()
-        }
-        hadActiveJobs.current = hasActiveJobs
-        nextDelay = hasActiveJobs ? JOB_POLL_MS : JOB_IDLE_POLL_MS
-      } catch {
-        // Keep the current catalog visible if the API is briefly unavailable.
-        // The main refresh path owns user-facing connection errors.
-      }
-
-      if (!cancelled) {
-        timeout = window.setTimeout(() => void pollActiveJobs(), nextDelay)
-      }
-    }
-
-    void pollActiveJobs()
-    return () => {
-      cancelled = true
-      if (timeout !== null) {
-        window.clearTimeout(timeout)
-      }
-    }
-  }, [refresh, replaceActiveJobs])
-
-  function upsertJob(job: JobRecord) {
-    setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)].filter(isActiveJob).slice(0, 5))
+  function applyFilters(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setAppliedFilters(normalizeFilters(filters))
   }
 
-  async function waitForJob(job: JobRecord): Promise<JobRecord> {
-    let current = job
-    upsertJob(current)
-    while (current.status === "queued" || current.status === "running") {
-      await sleep(JOB_POLL_MS)
-      current = await fetchJob(current.id)
-      upsertJob(current)
-    }
-    if (current.status === "failed") {
-      throw new Error(current.error ?? "Job failed")
-    }
-    return current
-  }
-
-  async function prepareMarketDay(contract: string, marketDate: string) {
-    const nextContract = contract.trim().toUpperCase()
-    if (!nextContract || !marketDate) {
-      toast.error("Prepare requires a contract and date")
-      return
-    }
-
-    setPendingPrepare(true)
+  async function confirmDelete() {
+    if (!deleteTarget) return
+    setDeleting(true)
     try {
-      const job = await prepareReplayDataset(nextContract, marketDate)
-      toast.success("Prepare job started", {
-        description: `${nextContract} ${marketDate} job ${shortJobId(job.id)}`,
+      const report = await deleteStoreObject(deleteTarget.id)
+      toast.success("Object deleted", {
+        description: `${deleteTarget.fileName} removed ${formatBytes(report.bytesDeleted)} across store locations.`,
       })
-      await waitForJob(job)
-      toast.success("ReplayDataset prepared", {
-        description: `${nextContract} ${marketDate} has durable raw and replay layers.`,
-      })
+      setDeleteTarget(null)
       await refresh()
     } catch (error) {
-      toast.error("Prepare failed", {
+      toast.error("Delete failed", {
         description: errorMessage(error),
       })
     } finally {
-      setPendingPrepare(false)
+      setDeleting(false)
     }
   }
-
-  async function runAction(day: MarketDay, action: DatasetAction) {
-    try {
-      if (action === "openReplay") {
-        setActiveTab("charts")
-        replay.openReplay(day)
-      } else if (action === "prepare") {
-        await prepareMarketDay(day.contract, day.marketDate)
-      } else if (action === "history") {
-        await loadJobHistory(day)
-      } else if (action === "deleteCache") {
-        const report = await deleteReplayDatasetCache(day)
-        toast.success("Replay cache removed", {
-          description: `${day.contract} ${day.marketDate} removed ${formatBytes(report.bytes_deleted)} from local cache.`,
-        })
-        await refresh()
-      } else {
-        const job = await startDatasetAction(day, action)
-        toast.success(`${actionLabel(action)} job started`, {
-          description: `${day.contract} ${day.marketDate} job ${shortJobId(job.id)}`,
-        })
-        await waitForJob(job)
-        await refresh()
-      }
-    } catch (error) {
-      toast.error(`${actionLabel(action)} failed`, {
-        description: errorMessage(error),
-      })
-    }
-  }
-
-  async function loadJobHistory(day: MarketDay) {
-    setHistoryLoading(true)
-    setActiveTab("jobs")
-    setHistoryScope({ title: `${day.contract} ${day.marketDate} Job History`, jobs: [] })
-    try {
-      const jobs = await fetchMarketDayJobs(day, JOB_HISTORY_LIMIT)
-      setHistoryScope({ title: `${day.contract} ${day.marketDate} Job History`, jobs })
-    } catch (error) {
-      setHistoryScope(null)
-      toast.error("Job history failed", {
-        description: errorMessage(error),
-      })
-    } finally {
-      setHistoryLoading(false)
-    }
-  }
-
-  const activeJobs = jobs.filter(isActiveJob)
-  const activeJobsByDayId = useMemo(() => jobsByDayId(activeJobs), [activeJobs])
-  const activeJobDayIds = useMemo(() => new Set(activeJobsByDayId.keys()), [activeJobsByDayId])
-  const visibleHistory = historyScope ?? { title: "Recent Activity", jobs: recentJobs }
-  const displayDays = useMemo(
-    () =>
-      days.map((day) => {
-        const activeJob = activeJobsByDayId.get(day.id)
-        return activeJob ? { ...day, status: statusForActiveJob(activeJob) } : day
-      }),
-    [days, activeJobsByDayId],
-  )
 
   return (
     <div className="flex h-svh flex-col bg-background text-foreground">
-      <header className="flex min-h-10 shrink-0 flex-wrap items-center justify-between gap-2 border-b-2 border-[rgba(255,255,255,0.15)] px-3 py-1">
+      <header className="flex min-h-10 shrink-0 items-center justify-between gap-2 border-b-2 border-border px-3 py-1">
         <div className="flex min-w-0 items-center gap-3">
           <div className="text-sm font-semibold">Ledger</div>
           <div className="h-4 w-px bg-border" />
-          <nav className="flex min-w-0 items-center gap-1">
-            <HeaderTab active={activeTab === "dataCenter"} onClick={() => setActiveTab("dataCenter")}>
-              Data Center
-            </HeaderTab>
-            <HeaderTab active={activeTab === "jobs"} onClick={() => setActiveTab("jobs")}>
-              Jobs
-            </HeaderTab>
-            <HeaderTab active={activeTab === "charts"} onClick={() => setActiveTab("charts")}>
-              Charts
-            </HeaderTab>
-          </nav>
+          <div className="text-xs font-medium text-muted-foreground">
+            Data Center
+          </div>
         </div>
-        {activeTab === "dataCenter" ? (
-          <PrepareControls
-            contract={prepareContract}
-            marketDate={prepareDate}
-            pending={pendingPrepare}
-            onContractChange={setPrepareContract}
-            onDateChange={setPrepareDate}
-            onPrepare={() => void prepareMarketDay(prepareContract, prepareDate)}
-          />
-        ) : activeTab === "charts" ? (
-          <ReplayControls replay={replay} />
-        ) : null}
+        <div className="text-xs text-muted-foreground">
+          {objectSummary(objects, loadState.kind)}
+        </div>
       </header>
 
-      <main className={activeTab === "charts" ? "flex min-h-0 flex-1 flex-col" : "flex min-h-0 flex-1 flex-col gap-3 p-3"}>
-        {activeTab === "dataCenter" ? (
-          <>
-            {activeJobs.length > 0 ? <ActiveJobTable jobs={activeJobs} /> : null}
-            {loadState.kind === "error" || loadState.kind === "empty" ? (
-              <DataCenterStatePanel
-                title={loadState.kind === "error" ? "API Error" : "No Market Days"}
-                message={loadState.message}
-                onRetry={loadState.kind === "error" ? refresh : undefined}
-              />
-            ) : (
-              <MarketDayTable days={displayDays} activeJobDayIds={activeJobDayIds} onAction={runAction} />
-            )}
-          </>
-        ) : activeTab === "jobs" ? (
-          <JobsTab
-            activeJobs={activeJobs}
-            history={visibleHistory}
-            historyLoading={historyLoading}
-            onClearHistory={historyScope ? () => setHistoryScope(null) : undefined}
+      <main className="flex min-h-0 flex-1 flex-col gap-2 p-3">
+        <form
+          className="flex shrink-0 flex-wrap items-center justify-between gap-2"
+          onSubmit={applyFilters}
+        >
+          <div className="relative min-w-[18rem] flex-1 md:max-w-xl">
+            <Search className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              className="h-8 w-full pl-7 text-xs"
+              value={filters.idPrefix}
+              onChange={(event) =>
+                setFilters((current) => ({
+                  ...current,
+                  idPrefix: event.target.value,
+                }))
+              }
+              placeholder="Search object id"
+            />
+          </div>
+          <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
+            <Input
+              className="h-8 w-52 text-xs"
+              value={filters.kind}
+              onChange={(event) =>
+                setFilters((current) => ({
+                  ...current,
+                  kind: event.target.value,
+                }))
+              }
+              placeholder="Kind"
+            />
+            <Select
+              value={filters.role || "all"}
+              onValueChange={(value) =>
+                setFilters((current) => ({
+                  ...current,
+                  role: value === "all" ? "" : value,
+                }))
+              }
+            >
+              <SelectTrigger
+                aria-label="Object role"
+                className="h-8 w-32 rounded-none border-border bg-background px-2 text-xs text-foreground hover:bg-muted/30"
+              >
+                <SelectValue placeholder="Role" />
+              </SelectTrigger>
+              <SelectContent className="rounded-none border border-border bg-popover text-xs shadow-none ring-0">
+                <SelectItem className="rounded-none text-xs" value="all">
+                  All roles
+                </SelectItem>
+                <SelectItem className="rounded-none text-xs" value="raw">
+                  Raw
+                </SelectItem>
+                <SelectItem className="rounded-none text-xs" value="artifact">
+                  Artifact
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+        </form>
+
+        {loadState.kind === "error" || loadState.kind === "empty" ? (
+          <DataCenterStatePanel
+            title={loadState.kind === "error" ? "API Error" : "No Objects"}
+            message={loadState.message}
+            onRetry={loadState.kind === "error" ? refresh : undefined}
           />
         ) : (
-          <ReplayPage replay={replay} />
+          <ObjectTable objects={objects} onDelete={setDeleteTarget} />
         )}
       </main>
+
+      <DeleteObjectDialog
+        object={deleteTarget}
+        deleting={deleting}
+        onOpenChange={(open) => {
+          if (!open && !deleting) setDeleteTarget(null)
+        }}
+        onConfirm={() => void confirmDelete()}
+      />
     </div>
   )
 }
 
-function isActiveJob(job: JobRecord) {
-  return job.status === "queued" || job.status === "running"
+function objectSummary(
+  objects: StoreObject[],
+  state: DataCenterLoadState["kind"]
+) {
+  if (state === "loading") return "Loading"
+  if (state === "error") return "Offline"
+  if (objects.length === 0) return "0 objects"
+  const totalBytes = objects.reduce((sum, object) => sum + object.sizeBytes, 0)
+  return `${objects.length} objects / ${formatBytes(totalBytes)}`
 }
 
-function jobsByDayId(jobs: JobRecord[]) {
-  const map = new Map<string, JobRecord>()
-  for (const job of jobs) {
-    const dayId = job.target?.market_day_id ?? job.market_day_id
-    if (dayId && !map.has(dayId)) {
-      map.set(dayId, job)
-    }
-  }
-  return map
-}
-
-function statusForActiveJob(job: JobRecord): MarketDayStatus {
-  switch (job.kind) {
-    case "delete_replay_dataset":
-    case "delete_raw_market_data":
-      return "deleting"
-    default:
-      return "loading"
-  }
-}
-
-function actionLabel(action: DatasetAction) {
-  switch (action) {
-    case "openReplay":
-      return "Open Replay"
-    case "prepare":
-      return "Prepare"
-    case "rebuild":
-      return "Rebuild"
-    case "validate":
-      return "Validate"
-    case "deleteCache":
-      return "Remove From Cache"
-    case "deleteReplay":
-      return "Delete ReplayDataset"
-    case "deleteRaw":
-      return "Delete Raw Data"
-    case "history":
-      return "Job History"
-  }
-}
-
-function startDatasetAction(day: MarketDay, action: DatasetAction) {
-  switch (action) {
-    case "openReplay":
-      throw new Error("Open Replay is handled by the Charts session")
-    case "prepare":
-      return prepareReplayDataset(day.contract, day.marketDate)
-    case "rebuild":
-      return rebuildReplayDataset(day)
-    case "validate":
-      return validateReplayDataset(day)
-    case "deleteCache":
-      throw new Error("Replay cache removal is handled separately")
-    case "deleteReplay":
-      return deleteReplayDataset(day)
-    case "deleteRaw":
-      return deleteRawMarketData(day)
-    case "history":
-      throw new Error("Job history is not a mutating dataset action")
-  }
-}
-
-function sleep(ms: number) {
-  return new Promise((resolve) => window.setTimeout(resolve, ms))
-}
-
-function shortJobId(jobId: string) {
-  return jobId.slice(0, 8)
-}
-
-function formatBytes(bytes: number) {
-  return new Intl.NumberFormat("en-US", {
-    maximumFractionDigits: bytes >= 1_000_000_000 ? 2 : 1,
-    notation: "compact",
-  }).format(bytes)
-}
-
-function HeaderTab({ active, onClick, children }: { active: boolean; onClick: () => void; children: ReactNode }) {
-  return (
-    <button
-      type="button"
-      className={`h-8 border-b-2 px-2 text-xs transition-colors ${
-        active
-          ? "border-foreground text-foreground"
-          : "border-transparent text-muted-foreground hover:text-foreground"
-      }`}
-      onClick={onClick}
-    >
-      {children}
-    </button>
-  )
-}
-
-function PrepareControls({
-  contract,
-  marketDate,
-  pending,
-  onContractChange,
-  onDateChange,
-  onPrepare,
+function DeleteObjectDialog({
+  object,
+  deleting,
+  onOpenChange,
+  onConfirm,
 }: {
-  contract: string
-  marketDate: string
-  pending: boolean
-  onContractChange: (value: string) => void
-  onDateChange: (value: string) => void
-  onPrepare: () => void
+  object: StoreObject | null
+  deleting: boolean
+  onOpenChange: (open: boolean) => void
+  onConfirm: () => void
 }) {
   return (
-    <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
-      <Input
-        className="h-7 w-24 text-xs uppercase"
-        value={contract}
-        onChange={(event) => onContractChange(event.target.value)}
-        placeholder="ESH6"
-        disabled={pending}
-      />
-      <Input
-        className="h-7 w-36 text-xs"
-        type="date"
-        value={marketDate}
-        onChange={(event) => onDateChange(event.target.value)}
-        disabled={pending}
-      />
-      <Button type="button" variant="outline" size="sm" onClick={onPrepare} disabled={pending}>
-        <Send className={pending ? "size-3.5 animate-pulse" : "size-3.5"} />
-        Prepare
-      </Button>
-    </div>
-  )
-}
-
-function JobsTab({
-  activeJobs,
-  history,
-  historyLoading,
-  onClearHistory,
-}: {
-  activeJobs: JobRecord[]
-  history: { title: string; jobs: JobRecord[] }
-  historyLoading: boolean
-  onClearHistory?: () => void
-}) {
-  return (
-    <>
-      {activeJobs.length > 0 ? <ActiveJobTable jobs={activeJobs} /> : null}
-      <JobHistoryTable title={history.title} jobs={history.jobs} loading={historyLoading} onClear={onClearHistory} />
-    </>
+    <Dialog open={object !== null} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Delete store object</DialogTitle>
+          <DialogDescription>
+            This removes the exact object descriptor, local object, R2 object,
+            and R2 descriptor mirror when present.
+          </DialogDescription>
+        </DialogHeader>
+        {object ? (
+          <div className="space-y-1 text-xs">
+            <DetailRow label="File" value={object.fileName} />
+            <DetailRow label="Role" value={object.role} />
+            <DetailRow label="Kind" value={object.kind} wrap />
+            <DetailRow label="ID" value={object.id} wrap />
+            <DetailRow label="Remote" value={object.remote?.key ?? "-"} wrap />
+          </div>
+        ) : null}
+        <DialogFooter>
+          <Button
+            type="button"
+            variant="outline"
+            disabled={deleting}
+            onClick={() => onOpenChange(false)}
+          >
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            variant="destructive"
+            disabled={deleting}
+            onClick={onConfirm}
+          >
+            <Trash2
+              className={deleting ? "size-3.5 animate-pulse" : "size-3.5"}
+            />
+            Delete
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -501,13 +319,43 @@ function DataCenterStatePanel({
         <AlertTriangle className="size-4 text-muted-foreground" />
         {title}
       </div>
-      <p className="max-w-xl text-xs leading-5 text-muted-foreground">{message}</p>
+      <p className="max-w-xl text-xs leading-5 text-muted-foreground">
+        {message}
+      </p>
       {onRetry ? (
-        <Button type="button" variant="outline" size="sm" className="mt-4" onClick={() => void onRetry()}>
-          <RefreshCw className="size-3.5" />
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="mt-4"
+          onClick={() => void onRetry()}
+        >
           Retry
         </Button>
       ) : null}
+    </div>
+  )
+}
+
+function DetailRow({
+  label,
+  value,
+  wrap = false,
+}: {
+  label: string
+  value: string
+  wrap?: boolean
+}) {
+  return (
+    <div className="grid grid-cols-[5rem_minmax(0,1fr)] gap-2 py-0.5">
+      <div className="text-muted-foreground">{label}</div>
+      <div
+        className={
+          wrap ? "break-all text-foreground" : "truncate text-foreground"
+        }
+      >
+        {value}
+      </div>
     </div>
   )
 }

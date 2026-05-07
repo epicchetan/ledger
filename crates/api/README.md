@@ -1,75 +1,23 @@
 # ledger-api
 
-`ledger-api` is the HTTP transport adapter for Ledger and Lens.
+`ledger-api` is the HTTP transport adapter for Lens.
 
-It should stay thin: route parsing, response serialization, job tracking, and
-local development CORS live here. Market-day lifecycle behavior, replay dataset
-staging, validation composition, ingest orchestration, and later active
-session ownership belong in `ledger`.
+At this stage it exposes the generic `store` object registry only. It stays thin:
+HTTP routing and Lens-facing DTOs live here, while object behavior belongs in
+`store`.
 
 ## Routes
 
 ```text
-GET  /health
-GET  /market-days
-GET  /market-days/:symbol/:date
-GET  /market-days/:symbol/:date?verify=true
-GET  /market-days/:symbol/:date/jobs
-POST /market-days/:symbol/:date/prepare
-POST /market-days/:symbol/:date/replay/build
-POST /market-days/:symbol/:date/replay/validate
-DELETE /market-days/:symbol/:date/replay
-DELETE /market-days/:symbol/:date/replay/cache
-DELETE /market-days/:symbol/:date/raw
-GET  /jobs?active=true
-GET  /jobs?active=false&limit=50
-GET  /jobs/:id
-GET  /sessions/ws
+GET    /health
+GET    /store/objects?role=raw&kind=databento.dbn.zst&id_prefix=sha256-af
+GET    /store/objects/:id
+DELETE /store/objects/:id
 ```
 
-Market-day status is cheap by default. It reports durable Layer 1 raw data,
-durable Layer 2 replay dataset state, artifact metadata, and latest validation
-summary from SQLite. Use `verify=true` when a caller explicitly wants R2 object
-metadata checked.
-
-Long-running lifecycle operations return a job immediately. Lens polls
-`GET /jobs?active=true` and `GET /jobs/:id` for active progress and terminal
-status. `GET /jobs?active=false&limit=50` returns recent job history, and
-`GET /market-days/:symbol/:date/jobs` returns history for one MarketDay. Jobs
-are persisted in SQLite so API restarts do not leave Lens with invisible
-in-memory state. Market-day jobs include `market_day_id` and a `target` object
-so Lens can overlay active job state onto the exact table row without guessing
-from display text. `prepare` runs the normal one-click path: ensure raw DBN is
-durable in R2, build replay artifacts when needed, run light readiness checks,
-and leave a ReplayDataset with current validation status.
-`replay/build` forces the Layer 2 rebuild path while preserving Layer 1 raw
-data. `replay/validate` is the heavier audit path.
-`replay/cache` removes only local cached replay artifacts; it does not touch R2
-or durable catalog records.
-
-`GET /sessions/ws` exposes the active feed-driven `Session` runtime over a
-WebSocket. The socket is intentionally transport-only: it opens a replay-backed
-session, subscribes projections, advances/plays/seeks the session, and returns
-`SessionSnapshot` plus Ledger `ProjectionFrame` payloads. The API does not
-recompute bars, BBO, trades, or projection dependencies.
-
-Session socket commands:
-
-```text
-open_session
-subscribe_projection
-unsubscribe_projection
-advance
-play
-pause
-set_speed
-seek
-snapshot
-close_session
-```
-
-One WebSocket currently owns at most one active Session. Shared sessions,
-live feeds, order entry, and Lens replay rendering are intentionally deferred.
+`DELETE /store/objects/:id` removes the exact object from the local descriptor
+registry, local object, R2 object, and R2 descriptor mirror when those locations
+exist. It does not cascade into related objects.
 
 ## Development
 

@@ -1,7 +1,5 @@
-use crate::jobs::JobRecord;
-use chrono::NaiveDate;
-use ledger_domain::{MarketDayStatus, StorageKind};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
@@ -9,240 +7,61 @@ pub struct HealthResponse {
     pub service: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ValidateReplayDatasetBody {
-    #[serde(default)]
-    pub skip_book_check: bool,
-    pub replay_batches: Option<usize>,
-    #[serde(default)]
-    pub replay_all: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeleteRawMarketDataBody {
-    #[serde(default)]
-    pub cascade: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateJobResponse {
-    pub job: JobRecord,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JobResponse {
-    pub job: JobRecord,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeleteReplayDatasetCacheResponse {
-    pub replay_dataset_id: Option<String>,
-    pub market_day_id: String,
-    pub deleted_files: usize,
-    pub deleted_dirs: usize,
-    pub bytes_deleted: u64,
-}
-
 #[derive(Debug, Clone, Deserialize)]
-pub struct MarketDayListQuery {
-    pub root: Option<String>,
-    pub symbol: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct MarketDayStatusQuery {
-    #[serde(default)]
-    pub verify: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct JobsQuery {
-    pub active: Option<bool>,
-    pub limit: Option<usize>,
+pub struct StoreObjectListQuery {
+    pub role: Option<String>,
+    pub kind: Option<String>,
+    pub id_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DataCenterMarketDay {
+pub struct StoreObject {
     pub id: String,
-    pub root: String,
-    pub contract: String,
-    pub market_date: NaiveDate,
-    pub timezone: String,
-    pub data_start_ns: String,
-    pub data_start_iso: String,
-    pub data_end_ns: String,
-    pub data_end_iso: String,
-    pub rth_start_ns: String,
-    pub rth_start_iso: String,
-    pub rth_end_ns: String,
-    pub rth_end_iso: String,
-    pub market_day_status: MarketDayStatus,
-    pub catalog_found: bool,
-    pub raw: DataCenterRawDataLayer,
-    pub replay_dataset: DataCenterReplayDatasetLayer,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum DataCenterRawDataStatus {
-    Missing,
-    Available,
-    Error,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DataCenterRawDataLayer {
-    pub status: DataCenterRawDataStatus,
-    pub provider: Option<String>,
-    pub dataset: Option<String>,
-    pub schema: Option<String>,
-    pub source_symbol: Option<String>,
-    pub object: Option<DataCenterObjectSummary>,
-    pub updated_at_ns: Option<String>,
-    pub updated_at_iso: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DataCenterObjectSummary {
-    pub kind: StorageKind,
-    pub logical_key: String,
-    pub format: String,
-    pub schema_version: i64,
+    pub role: String,
+    pub kind: String,
+    pub file_name: String,
     pub content_sha256: String,
-    pub size_bytes: i64,
-    pub remote_key: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum DataCenterReplayDatasetStatus {
-    Missing,
-    Building,
-    Available,
-    Invalid,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DataCenterReplayDatasetLayer {
-    pub status: DataCenterReplayDatasetStatus,
-    pub id: Option<String>,
-    pub raw_object_key: Option<String>,
-    pub schema_version: Option<i64>,
-    pub producer: Option<String>,
-    pub producer_version: Option<String>,
-    pub artifact_set_hash: Option<String>,
-    pub updated_at_ns: Option<String>,
-    pub updated_at_iso: Option<String>,
-    pub artifacts_available: bool,
-    pub objects_valid: bool,
-    pub cache: Option<DataCenterReplayCacheSummary>,
-    pub artifacts: Vec<DataCenterReplayArtifact>,
-    pub validation: Option<DataCenterValidationSummary>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DataCenterReplayCacheSummary {
-    pub cached: bool,
-    pub artifact_count: u64,
     pub size_bytes: u64,
-    pub last_accessed_at_ns: Option<String>,
-    pub last_accessed_iso: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DataCenterReplayArtifact {
-    pub kind: StorageKind,
-    pub remote_key: Option<String>,
-    pub size_bytes: Option<i64>,
-    pub content_sha256: Option<String>,
-    pub object_valid: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum DataCenterValidationMode {
-    Light,
-    Full,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum DataCenterValidationStatus {
-    Valid,
-    Warning,
-    Invalid,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum DataCenterValidationTrigger {
-    Prepare,
-    Rebuild,
-    Manual,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum DataCenterTrustStatus {
-    Missing,
-    RawAvailable,
-    ReplayDatasetAvailable,
-    ReadyToTrain,
-    ReadyWithWarnings,
-    Invalid,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum DataCenterValidationCheckStatus {
-    Pass,
-    Warning,
-    Fail,
-    Skipped,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DataCenterValidationCheck {
-    pub id: String,
-    pub label: String,
-    pub status: DataCenterValidationCheckStatus,
-    pub summary: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum DataCenterValidationIssueSeverity {
-    Warning,
-    Error,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DataCenterValidationIssue {
-    pub severity: DataCenterValidationIssueSeverity,
-    pub code: String,
-    pub message: String,
-    pub check_id: String,
-    pub recommended_action: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DataCenterValidationSummary {
-    pub mode: DataCenterValidationMode,
-    pub status: DataCenterValidationStatus,
-    pub trigger: DataCenterValidationTrigger,
-    pub trust_status: DataCenterTrustStatus,
-    pub summary: String,
-    pub recommended_action: Option<String>,
+    pub format: Option<String>,
+    pub media_type: Option<String>,
+    pub remote: Option<StoreRemoteObject>,
+    pub local: Option<LocalStoreObject>,
+    pub lineage: Vec<String>,
+    pub metadata_json: Value,
     pub created_at_ns: String,
     pub created_at_iso: String,
-    pub event_count: Option<u64>,
-    pub batch_count: Option<u64>,
-    pub trade_count: Option<u64>,
-    pub check_count: u64,
-    pub passed_check_count: u64,
-    pub warning_count: u64,
-    pub error_count: u64,
-    pub checks: Vec<DataCenterValidationCheck>,
-    pub issues: Vec<DataCenterValidationIssue>,
-    pub warnings: Vec<String>,
+    pub updated_at_ns: String,
+    pub updated_at_iso: String,
+    pub last_accessed_at_ns: Option<String>,
+    pub last_accessed_at_iso: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreRemoteObject {
+    pub bucket: String,
+    pub key: String,
+    pub size_bytes: u64,
+    pub sha256: Option<String>,
+    pub etag: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalStoreObject {
+    pub relative_path: String,
+    pub size_bytes: u64,
+    pub last_accessed_at_ns: String,
+    pub last_accessed_at_iso: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteStoreObjectResponse {
+    pub id: Option<String>,
+    pub descriptor_removed: bool,
+    pub remote_object_deleted: bool,
+    pub remote_descriptor_deleted: bool,
+    pub local_deleted: bool,
+    pub remote_key: Option<String>,
+    pub remote_descriptor_key: Option<String>,
+    pub local_path: Option<String>,
+    pub bytes_deleted: u64,
 }

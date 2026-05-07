@@ -345,50 +345,33 @@ docs/study_graph_vision.md
 docs/study_graph_phased_implementation.md
 ```
 
-## Repository Layout
+## Current Repository Layout
 
 ```text
-crates/domain   shared pure types, market-day resolution, codecs, storage names
-crates/book     deterministic L3 order-book truth
-crates/replay   headless replay simulator, visibility, execution, latency, queue-ahead
-crates/store    SQLite control plane, R2 object storage, jobs, validation summaries
-crates/ingest   Databento/raw DBN ingest, preprocessing, replay artifact creation
-crates/ledger   application orchestration shared by CLI and API
-crates/api      HTTP transport adapter for Lens
-crates/cli      terminal adapter for ingest, status, validation, session runs
-lens            web operating surface
+crates/store           generic object registry, R2 persistence, local cache
+crates/ledger-runtime  generic runtime data plane and scheduler
+crates/api             HTTP transport adapter for Lens
+crates/cli             terminal adapter for store operations
+lens                   web operating surface
 ```
 
 ## CLI Examples
 
 ```bash
-# Resolve an ES market day
-cargo run -p ledger-cli -- resolve --symbol ESH6 --date 2026-03-12
+# List registered objects
+cargo run -p ledger-cli -- store list
 
-# Ingest raw data and prepare replay artifacts
-cargo run -p ledger-cli -- ingest --symbol ESH6 --date 2026-03-12
+# Import a local file into store
+cargo run -p ledger-cli -- store import-file \
+  --path /path/to/raw.dbn.zst \
+  --role raw \
+  --kind databento.dbn.zst
 
-# Check catalog/storage status
-cargo run -p ledger-cli -- status --symbol ESH6 --date 2026-03-12
+# Hydrate a cached local copy
+cargo run -p ledger-cli -- store hydrate --id sha256-...
 
-# Validate replay readiness
-cargo run -p ledger-cli -- session validate --symbol ESH6 --date 2026-03-12 --replay-batches 10000
-
-# Run an active Session headlessly with a replay feed
-cargo run -p ledger-cli -- session run --symbol ESH6 --date 2026-03-12 --batches 1000
-
-# Validate clock-driven Session advancement without wall-clock sleeps
-cargo run -p ledger-cli -- session clock-run \
-  --symbol ESH6 \
-  --date 2026-03-12 \
-  --projection bars:v1 \
-  --params '{"seconds":60}' \
-  --speed 60 \
-  --tick-ms 16 \
-  --ticks 1000 \
-  --budget-batches 500 \
-  --digest \
-  --truth-visibility
+# Delete an exact object
+cargo run -p ledger-cli -- store delete --id sha256-...
 ```
 
 ## Lens
@@ -399,9 +382,9 @@ npm install
 npm run dev
 ```
 
-Lens currently focuses on data ownership and trust: market days, raw/replay layer status, jobs, validation, cache state, and Data Center actions.
-
-Replay controls, charts, DOM, journal workflows, and agentic study creation come after the Session WebSocket boundary is connected to Lens.
+Lens currently exposes the Data Center object explorer. It can list and delete
+store objects through `ledger-api`; data preparation, feeds, runtime sessions,
+charts, and journal workflows are later layers.
 
 ## Philosophy
 

@@ -33,13 +33,6 @@ impl ApiError {
             message: err.to_string(),
         }
     }
-
-    pub(crate) fn conflict(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::CONFLICT,
-            message: message.into(),
-        }
-    }
 }
 
 impl fmt::Display for ApiError {
