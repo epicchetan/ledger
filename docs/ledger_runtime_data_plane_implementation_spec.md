@@ -158,6 +158,10 @@ crates/ledger-runtime/src/key.rs
 crates/ledger-runtime/src/cell.rs
 crates/ledger-runtime/src/data_plane.rs
 crates/ledger-runtime/src/error.rs
+crates/ledger-runtime/src/projection.rs
+crates/ledger-runtime/tests/key.rs
+crates/ledger-runtime/tests/data_plane.rs
+crates/ledger-runtime/tests/projection.rs
 ```
 
 Suggested dependencies:
@@ -806,18 +810,16 @@ update_array_can_perform_custom_mutation
 array_mutation_returns_changed_key
 ```
 
-### Type Safety Tests
+### Public API Tests
 
 ```text
 typed_handles_expose_registered_key
-crate_internal_wrong_kind_handle_errors
-crate_internal_wrong_payload_type_handle_errors
-crate_internal_type_mismatch_does_not_change_cell
 ```
 
-The "no public handle constructor" rule is an API review criterion. It is not a
-normal runtime test unless a later compile-fail test harness such as `trybuild`
-is added.
+Typed handle constructors are crate-private. Integration tests should validate
+the public API shape; impossible forged-handle states do not need normal runtime
+tests. A later compile-fail test harness such as `trybuild` can lock this down
+if it becomes important.
 
 ### Concurrency Tests
 
