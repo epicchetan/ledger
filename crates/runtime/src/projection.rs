@@ -1,8 +1,7 @@
 use std::{fmt, ops::Range};
 
+use cache::{ArrayKey, Cache, CacheError, CellOwner, Key, ValueKey, WriteEffects};
 use thiserror::Error;
-
-use crate::{ArrayKey, CellOwner, DataPlane, DataPlaneError, Key, ValueKey, WriteEffects};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ProjectionId(Key);
@@ -20,7 +19,7 @@ impl ProjectionId {
     }
 
     pub fn owner(&self) -> CellOwner {
-        CellOwner::Projection(self.as_str().to_string())
+        CellOwner::new(self.as_str()).expect("projection id already validates as a cache owner")
     }
 }
 
@@ -49,15 +48,15 @@ pub trait Projection: Send {
 }
 
 pub struct ProjectionContext<'a> {
-    data_plane: &'a DataPlane,
+    cache: &'a Cache,
     projection_id: ProjectionId,
     changed_keys: Vec<Key>,
 }
 
 impl<'a> ProjectionContext<'a> {
-    pub fn new(data_plane: &'a DataPlane, projection_id: ProjectionId) -> Self {
+    pub fn new(cache: &'a Cache, projection_id: ProjectionId) -> Self {
         Self {
-            data_plane,
+            cache,
             projection_id,
             changed_keys: Vec::new(),
         }
@@ -81,14 +80,14 @@ impl<'a> ProjectionContext<'a> {
     where
         T: Clone + Send + Sync + 'static,
     {
-        Ok(self.data_plane.read_value(key)?)
+        Ok(self.cache.read_value(key)?)
     }
 
     pub fn read_array<T>(&self, key: &ArrayKey<T>) -> Result<Vec<T>, ProjectionError>
     where
         T: Clone + Send + Sync + 'static,
     {
-        Ok(self.data_plane.read_array(key)?)
+        Ok(self.cache.read_array(key)?)
     }
 
     pub fn read_array_range<T>(
@@ -99,7 +98,7 @@ impl<'a> ProjectionContext<'a> {
     where
         T: Clone + Send + Sync + 'static,
     {
-        Ok(self.data_plane.read_array_range(key, range)?)
+        Ok(self.cache.read_array_range(key, range)?)
     }
 
     pub fn set_value<T>(&mut self, key: &ValueKey<T>, value: T) -> Result<(), ProjectionError>
@@ -107,7 +106,7 @@ impl<'a> ProjectionContext<'a> {
         T: Clone + Send + Sync + 'static,
     {
         let effects = self
-            .data_plane
+            .cache
             .set_value(&self.projection_id.owner(), key, value)?;
         self.record_effects(effects);
         Ok(())
@@ -117,9 +116,7 @@ impl<'a> ProjectionContext<'a> {
     where
         T: Clone + Send + Sync + 'static,
     {
-        let effects = self
-            .data_plane
-            .clear_value(&self.projection_id.owner(), key)?;
+        let effects = self.cache.clear_value(&self.projection_id.owner(), key)?;
         self.record_effects(effects);
         Ok(())
     }
@@ -133,7 +130,7 @@ impl<'a> ProjectionContext<'a> {
         T: Clone + Send + Sync + 'static,
     {
         let (result, effects) =
-            self.data_plane
+            self.cache
                 .update_value(&self.projection_id.owner(), key, update)?;
         self.record_effects(effects);
         Ok(result)
@@ -148,7 +145,7 @@ impl<'a> ProjectionContext<'a> {
         T: Clone + Send + Sync + 'static,
     {
         let effects = self
-            .data_plane
+            .cache
             .replace_array(&self.projection_id.owner(), key, items)?;
         self.record_effects(effects);
         Ok(())
@@ -159,7 +156,7 @@ impl<'a> ProjectionContext<'a> {
         T: Clone + Send + Sync + 'static,
     {
         let effects = self
-            .data_plane
+            .cache
             .push_array(&self.projection_id.owner(), key, items)?;
         self.record_effects(effects);
         Ok(())
@@ -174,9 +171,9 @@ impl<'a> ProjectionContext<'a> {
     where
         T: Clone + Send + Sync + 'static,
     {
-        let effects =
-            self.data_plane
-                .insert_array(&self.projection_id.owner(), key, index, items)?;
+        let effects = self
+            .cache
+            .insert_array(&self.projection_id.owner(), key, index, items)?;
         self.record_effects(effects);
         Ok(())
     }
@@ -191,7 +188,7 @@ impl<'a> ProjectionContext<'a> {
         T: Clone + Send + Sync + 'static,
     {
         let effects =
-            self.data_plane
+            self.cache
                 .replace_array_range(&self.projection_id.owner(), key, range, items)?;
         self.record_effects(effects);
         Ok(())
@@ -205,9 +202,9 @@ impl<'a> ProjectionContext<'a> {
     where
         T: Clone + Send + Sync + 'static,
     {
-        let effects =
-            self.data_plane
-                .remove_array_range(&self.projection_id.owner(), key, range)?;
+        let effects = self
+            .cache
+            .remove_array_range(&self.projection_id.owner(), key, range)?;
         self.record_effects(effects);
         Ok(())
     }
@@ -216,9 +213,7 @@ impl<'a> ProjectionContext<'a> {
     where
         T: Clone + Send + Sync + 'static,
     {
-        let effects = self
-            .data_plane
-            .clear_array(&self.projection_id.owner(), key)?;
+        let effects = self.cache.clear_array(&self.projection_id.owner(), key)?;
         self.record_effects(effects);
         Ok(())
     }
@@ -232,7 +227,7 @@ impl<'a> ProjectionContext<'a> {
         T: Clone + Send + Sync + 'static,
     {
         let (result, effects) =
-            self.data_plane
+            self.cache
                 .update_array(&self.projection_id.owner(), key, update)?;
         self.record_effects(effects);
         Ok(result)
@@ -253,5 +248,5 @@ pub enum ProjectionError {
     InvalidProjectionId(String),
 
     #[error(transparent)]
-    DataPlane(#[from] DataPlaneError),
+    Cache(#[from] CacheError),
 }

@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 
+use cache::{Cache, CacheError, Key, WriteEffects};
 use thiserror::Error;
 
 mod dependency;
@@ -9,10 +10,7 @@ mod projection_registry;
 
 pub use external_write::ExternalWriteBatch;
 
-use crate::{
-    DataPlane, DataPlaneError, Key, Projection, ProjectionContext, ProjectionError, ProjectionId,
-    WriteEffects,
-};
+use crate::{Projection, ProjectionContext, ProjectionError, ProjectionId};
 
 use self::{
     dependency::DependencyIndex, projection_queue::ProjectionQueue,
@@ -20,7 +18,7 @@ use self::{
 };
 
 pub struct Runtime {
-    data_plane: DataPlane,
+    cache: Cache,
     projections: ProjectionRegistry,
     dependencies: DependencyIndex,
     external_writes: VecDeque<ExternalWriteBatch>,
@@ -28,9 +26,9 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    pub fn new(data_plane: DataPlane) -> Self {
+    pub fn new(cache: Cache) -> Self {
         Self {
-            data_plane,
+            cache,
             projections: ProjectionRegistry::new(),
             dependencies: DependencyIndex::new(),
             external_writes: VecDeque::new(),
@@ -38,8 +36,8 @@ impl Runtime {
         }
     }
 
-    pub fn data_plane(&self) -> &DataPlane {
-        &self.data_plane
+    pub fn cache(&self) -> &Cache {
+        &self.cache
     }
 
     pub fn register_projection<P>(&mut self, projection: P) -> Result<(), RuntimeError>
@@ -91,7 +89,7 @@ impl Runtime {
             let Some(batch) = self.external_writes.pop_front() else {
                 break;
             };
-            let (result, effects) = batch.apply(&self.data_plane);
+            let (result, effects) = batch.apply(&self.cache);
             step.external_write_batches_applied += 1;
             record_keys(&mut step.changed_keys, &effects.changed_keys);
             self.schedule_effects(&effects, &mut step.scheduled_projections);
@@ -158,7 +156,7 @@ impl Runtime {
         &mut self,
         projection_id: &ProjectionId,
     ) -> Result<(Result<(), ProjectionError>, WriteEffects), RuntimeError> {
-        let mut ctx = ProjectionContext::new(&self.data_plane, projection_id.clone());
+        let mut ctx = ProjectionContext::new(&self.cache, projection_id.clone());
         let result = {
             let projection = self.projections.get_mut(projection_id)?;
             projection.run(&mut ctx)
@@ -209,7 +207,7 @@ pub enum RuntimeError {
     MissingProjection(ProjectionId),
 
     #[error(transparent)]
-    DataPlane(#[from] DataPlaneError),
+    Cache(#[from] CacheError),
 
     #[error("projection `{id}` failed: {source}")]
     Projection {

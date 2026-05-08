@@ -1,6 +1,8 @@
 use std::ops::Range;
 
-use crate::{runtime::RuntimeError, ArrayKey, CellOwner, DataPlane, Key, ValueKey, WriteEffects};
+use cache::{ArrayKey, Cache, CellOwner, Key, ValueKey, WriteEffects};
+
+use crate::runtime::RuntimeError;
 
 pub struct ExternalWriteBatch {
     writer: CellOwner,
@@ -118,9 +120,9 @@ impl ExternalWriteBatch {
         self
     }
 
-    pub(crate) fn apply(self, data_plane: &DataPlane) -> (Result<(), RuntimeError>, WriteEffects) {
+    pub(crate) fn apply(self, cache: &Cache) -> (Result<(), RuntimeError>, WriteEffects) {
         let Self { writer, operations } = self;
-        let mut ctx = ExternalWriteContext::new(data_plane, writer);
+        let mut ctx = ExternalWriteContext::new(cache, writer);
         let result = Self::apply_operations(operations, &mut ctx);
         let effects = ctx.into_effects();
         (result, effects)
@@ -142,15 +144,15 @@ trait ExternalWriteOperation: Send {
 }
 
 pub(crate) struct ExternalWriteContext<'a> {
-    data_plane: &'a DataPlane,
+    cache: &'a Cache,
     writer: CellOwner,
     changed_keys: Vec<Key>,
 }
 
 impl<'a> ExternalWriteContext<'a> {
-    pub(crate) fn new(data_plane: &'a DataPlane, writer: CellOwner) -> Self {
+    pub(crate) fn new(cache: &'a Cache, writer: CellOwner) -> Self {
         Self {
-            data_plane,
+            cache,
             writer,
             changed_keys: Vec::new(),
         }
@@ -166,7 +168,7 @@ impl<'a> ExternalWriteContext<'a> {
     where
         T: Clone + Send + Sync + 'static,
     {
-        let effects = self.data_plane.set_value(&self.writer, key, value)?;
+        let effects = self.cache.set_value(&self.writer, key, value)?;
         self.record_effects(effects);
         Ok(())
     }
@@ -175,7 +177,7 @@ impl<'a> ExternalWriteContext<'a> {
     where
         T: Clone + Send + Sync + 'static,
     {
-        let effects = self.data_plane.clear_value(&self.writer, key)?;
+        let effects = self.cache.clear_value(&self.writer, key)?;
         self.record_effects(effects);
         Ok(())
     }
@@ -188,7 +190,7 @@ impl<'a> ExternalWriteContext<'a> {
     where
         T: Clone + Send + Sync + 'static,
     {
-        let effects = self.data_plane.replace_array(&self.writer, key, items)?;
+        let effects = self.cache.replace_array(&self.writer, key, items)?;
         self.record_effects(effects);
         Ok(())
     }
@@ -201,7 +203,7 @@ impl<'a> ExternalWriteContext<'a> {
     where
         T: Clone + Send + Sync + 'static,
     {
-        let effects = self.data_plane.push_array(&self.writer, key, items)?;
+        let effects = self.cache.push_array(&self.writer, key, items)?;
         self.record_effects(effects);
         Ok(())
     }
@@ -215,9 +217,7 @@ impl<'a> ExternalWriteContext<'a> {
     where
         T: Clone + Send + Sync + 'static,
     {
-        let effects = self
-            .data_plane
-            .insert_array(&self.writer, key, index, items)?;
+        let effects = self.cache.insert_array(&self.writer, key, index, items)?;
         self.record_effects(effects);
         Ok(())
     }
@@ -232,7 +232,7 @@ impl<'a> ExternalWriteContext<'a> {
         T: Clone + Send + Sync + 'static,
     {
         let effects = self
-            .data_plane
+            .cache
             .replace_array_range(&self.writer, key, range, items)?;
         self.record_effects(effects);
         Ok(())
@@ -246,9 +246,7 @@ impl<'a> ExternalWriteContext<'a> {
     where
         T: Clone + Send + Sync + 'static,
     {
-        let effects = self
-            .data_plane
-            .remove_array_range(&self.writer, key, range)?;
+        let effects = self.cache.remove_array_range(&self.writer, key, range)?;
         self.record_effects(effects);
         Ok(())
     }
@@ -257,7 +255,7 @@ impl<'a> ExternalWriteContext<'a> {
     where
         T: Clone + Send + Sync + 'static,
     {
-        let effects = self.data_plane.clear_array(&self.writer, key)?;
+        let effects = self.cache.clear_array(&self.writer, key)?;
         self.record_effects(effects);
         Ok(())
     }

@@ -3,7 +3,7 @@ use thiserror::Error;
 use crate::{CellKind, CellOwner, Key};
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum DataPlaneError {
+pub enum CacheError {
     #[error("invalid key `{0}`")]
     InvalidKey(String),
 
@@ -33,7 +33,7 @@ pub enum DataPlaneError {
     #[error("array range is out of bounds for cell `{key}`")]
     ArrayRangeOutOfBounds { key: Key },
 
-    #[error("data-plane registry lock poisoned")]
+    #[error("cache registry lock poisoned")]
     RegistryLockPoisoned,
 
     #[error("lock poisoned while accessing cell `{key}`")]

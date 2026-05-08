@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use crate::{Key, ProjectionId};
+use cache::Key;
+
+use crate::ProjectionId;
 
 #[derive(Debug, Default)]
 pub(crate) struct DependencyIndex {

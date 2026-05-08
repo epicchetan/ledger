@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::{runtime::RuntimeError, Key, Projection, ProjectionId};
+use cache::Key;
+
+use crate::{runtime::RuntimeError, Projection, ProjectionId};
 
 pub(crate) struct ProjectionRegistration {
     pub(crate) id: ProjectionId,

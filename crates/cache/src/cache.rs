@@ -7,15 +7,15 @@ use std::{
 
 use crate::{
     cell::{ArrayStorage, ValueStorage},
-    ArrayKey, CellDescriptor, CellKind, CellOwner, DataPlaneError, Key, ValueKey, WriteEffects,
+    ArrayKey, CacheError, CellDescriptor, CellKind, CellOwner, Key, ValueKey, WriteEffects,
 };
 
 #[derive(Clone)]
-pub struct DataPlane {
-    inner: Arc<DataPlaneInner>,
+pub struct Cache {
+    inner: Arc<CacheInner>,
 }
 
-struct DataPlaneInner {
+struct CacheInner {
     cells: RwLock<HashMap<Key, Arc<Cell>>>,
 }
 
@@ -24,10 +24,10 @@ struct Cell {
     storage: RwLock<Box<dyn Any + Send + Sync>>,
 }
 
-impl DataPlane {
+impl Cache {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(DataPlaneInner {
+            inner: Arc::new(CacheInner {
                 cells: RwLock::new(HashMap::new()),
             }),
         }
@@ -37,7 +37,7 @@ impl DataPlane {
         &self,
         descriptor: CellDescriptor,
         initial: Option<T>,
-    ) -> Result<ValueKey<T>, DataPlaneError>
+    ) -> Result<ValueKey<T>, CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -56,7 +56,7 @@ impl DataPlane {
         &self,
         descriptor: CellDescriptor,
         initial: Vec<T>,
-    ) -> Result<ArrayKey<T>, DataPlaneError>
+    ) -> Result<ArrayKey<T>, CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -71,11 +71,11 @@ impl DataPlane {
         Ok(ArrayKey::new(key))
     }
 
-    pub fn describe(&self, key: &Key) -> Result<CellDescriptor, DataPlaneError> {
+    pub fn describe(&self, key: &Key) -> Result<CellDescriptor, CacheError> {
         Ok(self.lookup_cell(key)?.descriptor.clone())
     }
 
-    pub fn read_value<T>(&self, key: &ValueKey<T>) -> Result<Option<T>, DataPlaneError>
+    pub fn read_value<T>(&self, key: &ValueKey<T>) -> Result<Option<T>, CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -84,17 +84,17 @@ impl DataPlane {
         let storage = cell
             .storage
             .read()
-            .map_err(|_| DataPlaneError::CellLockPoisoned {
+            .map_err(|_| CacheError::CellLockPoisoned {
                 key: key.key().clone(),
             })?;
         let storage = storage
             .as_ref()
             .downcast_ref::<ValueStorage<T>>()
-            .ok_or_else(|| DataPlaneError::TypeMismatch(key.key().clone()))?;
+            .ok_or_else(|| CacheError::TypeMismatch(key.key().clone()))?;
         Ok(storage.value.clone())
     }
 
-    pub fn read_array<T>(&self, key: &ArrayKey<T>) -> Result<Vec<T>, DataPlaneError>
+    pub fn read_array<T>(&self, key: &ArrayKey<T>) -> Result<Vec<T>, CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -103,13 +103,13 @@ impl DataPlane {
         let storage = cell
             .storage
             .read()
-            .map_err(|_| DataPlaneError::CellLockPoisoned {
+            .map_err(|_| CacheError::CellLockPoisoned {
                 key: key.key().clone(),
             })?;
         let storage = storage
             .as_ref()
             .downcast_ref::<ArrayStorage<T>>()
-            .ok_or_else(|| DataPlaneError::TypeMismatch(key.key().clone()))?;
+            .ok_or_else(|| CacheError::TypeMismatch(key.key().clone()))?;
         Ok(storage.items.clone())
     }
 
@@ -117,7 +117,7 @@ impl DataPlane {
         &self,
         key: &ArrayKey<T>,
         range: Range<usize>,
-    ) -> Result<Vec<T>, DataPlaneError>
+    ) -> Result<Vec<T>, CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -126,13 +126,13 @@ impl DataPlane {
         let storage = cell
             .storage
             .read()
-            .map_err(|_| DataPlaneError::CellLockPoisoned {
+            .map_err(|_| CacheError::CellLockPoisoned {
                 key: key.key().clone(),
             })?;
         let storage = storage
             .as_ref()
             .downcast_ref::<ArrayStorage<T>>()
-            .ok_or_else(|| DataPlaneError::TypeMismatch(key.key().clone()))?;
+            .ok_or_else(|| CacheError::TypeMismatch(key.key().clone()))?;
         validate_range(key.key(), &range, storage.items.len())?;
         Ok(storage.items[range].to_vec())
     }
@@ -142,7 +142,7 @@ impl DataPlane {
         writer: &CellOwner,
         key: &ValueKey<T>,
         value: T,
-    ) -> Result<WriteEffects, DataPlaneError>
+    ) -> Result<WriteEffects, CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -156,7 +156,7 @@ impl DataPlane {
         &self,
         writer: &CellOwner,
         key: &ValueKey<T>,
-    ) -> Result<WriteEffects, DataPlaneError>
+    ) -> Result<WriteEffects, CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -171,7 +171,7 @@ impl DataPlane {
         writer: &CellOwner,
         key: &ValueKey<T>,
         update: impl FnOnce(&mut Option<T>) -> R,
-    ) -> Result<(R, WriteEffects), DataPlaneError>
+    ) -> Result<(R, WriteEffects), CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -184,7 +184,7 @@ impl DataPlane {
         writer: &CellOwner,
         key: &ArrayKey<T>,
         items: Vec<T>,
-    ) -> Result<WriteEffects, DataPlaneError>
+    ) -> Result<WriteEffects, CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -199,7 +199,7 @@ impl DataPlane {
         writer: &CellOwner,
         key: &ArrayKey<T>,
         items: Vec<T>,
-    ) -> Result<WriteEffects, DataPlaneError>
+    ) -> Result<WriteEffects, CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -215,7 +215,7 @@ impl DataPlane {
         key: &ArrayKey<T>,
         index: usize,
         items: Vec<T>,
-    ) -> Result<WriteEffects, DataPlaneError>
+    ) -> Result<WriteEffects, CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -233,7 +233,7 @@ impl DataPlane {
         key: &ArrayKey<T>,
         range: Range<usize>,
         items: Vec<T>,
-    ) -> Result<WriteEffects, DataPlaneError>
+    ) -> Result<WriteEffects, CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -250,7 +250,7 @@ impl DataPlane {
         writer: &CellOwner,
         key: &ArrayKey<T>,
         range: Range<usize>,
-    ) -> Result<WriteEffects, DataPlaneError>
+    ) -> Result<WriteEffects, CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -266,7 +266,7 @@ impl DataPlane {
         &self,
         writer: &CellOwner,
         key: &ArrayKey<T>,
-    ) -> Result<WriteEffects, DataPlaneError>
+    ) -> Result<WriteEffects, CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -281,7 +281,7 @@ impl DataPlane {
         writer: &CellOwner,
         key: &ArrayKey<T>,
         update: impl FnOnce(&mut Vec<T>) -> R,
-    ) -> Result<(R, WriteEffects), DataPlaneError>
+    ) -> Result<(R, WriteEffects), CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -289,40 +289,40 @@ impl DataPlane {
         Ok((result, WriteEffects::changed(key.key())))
     }
 
-    fn insert_cell(&self, key: Key, cell: Arc<Cell>) -> Result<(), DataPlaneError> {
+    fn insert_cell(&self, key: Key, cell: Arc<Cell>) -> Result<(), CacheError> {
         let mut cells = self
             .inner
             .cells
             .write()
-            .map_err(|_| DataPlaneError::RegistryLockPoisoned)?;
+            .map_err(|_| CacheError::RegistryLockPoisoned)?;
         if cells.contains_key(&key) {
-            return Err(DataPlaneError::DuplicateCell(key));
+            return Err(CacheError::DuplicateCell(key));
         }
         cells.insert(key, cell);
         Ok(())
     }
 
-    fn lookup_cell(&self, key: &Key) -> Result<Arc<Cell>, DataPlaneError> {
+    fn lookup_cell(&self, key: &Key) -> Result<Arc<Cell>, CacheError> {
         let cells = self
             .inner
             .cells
             .read()
-            .map_err(|_| DataPlaneError::RegistryLockPoisoned)?;
+            .map_err(|_| CacheError::RegistryLockPoisoned)?;
         cells
             .get(key)
             .cloned()
-            .ok_or_else(|| DataPlaneError::MissingCell(key.clone()))
+            .ok_or_else(|| CacheError::MissingCell(key.clone()))
     }
 
     fn ensure_descriptor_kind(
         &self,
         descriptor: &CellDescriptor,
         expected: CellKind,
-    ) -> Result<(), DataPlaneError> {
+    ) -> Result<(), CacheError> {
         if descriptor.kind == expected {
             Ok(())
         } else {
-            Err(DataPlaneError::WrongCellKind {
+            Err(CacheError::WrongCellKind {
                 key: descriptor.key.clone(),
                 expected,
                 found: descriptor.kind,
@@ -335,11 +335,11 @@ impl DataPlane {
         cell: &Cell,
         key: &Key,
         expected: CellKind,
-    ) -> Result<(), DataPlaneError> {
+    ) -> Result<(), CacheError> {
         if cell.descriptor.kind == expected {
             Ok(())
         } else {
-            Err(DataPlaneError::WrongCellKind {
+            Err(CacheError::WrongCellKind {
                 key: key.clone(),
                 expected,
                 found: cell.descriptor.kind,
@@ -347,16 +347,11 @@ impl DataPlane {
         }
     }
 
-    fn ensure_owner(
-        &self,
-        cell: &Cell,
-        writer: &CellOwner,
-        key: &Key,
-    ) -> Result<(), DataPlaneError> {
+    fn ensure_owner(&self, cell: &Cell, writer: &CellOwner, key: &Key) -> Result<(), CacheError> {
         if &cell.descriptor.owner == writer {
             Ok(())
         } else {
-            Err(DataPlaneError::OwnerMismatch {
+            Err(CacheError::OwnerMismatch {
                 key: key.clone(),
                 writer: writer.clone(),
                 owner: cell.descriptor.owner.clone(),
@@ -369,7 +364,7 @@ impl DataPlane {
         writer: &CellOwner,
         key: &ValueKey<T>,
         update: impl FnOnce(&mut ValueStorage<T>) -> R,
-    ) -> Result<R, DataPlaneError>
+    ) -> Result<R, CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -379,13 +374,13 @@ impl DataPlane {
         let mut storage = cell
             .storage
             .write()
-            .map_err(|_| DataPlaneError::CellLockPoisoned {
+            .map_err(|_| CacheError::CellLockPoisoned {
                 key: key.key().clone(),
             })?;
         let storage = storage
             .as_mut()
             .downcast_mut::<ValueStorage<T>>()
-            .ok_or_else(|| DataPlaneError::TypeMismatch(key.key().clone()))?;
+            .ok_or_else(|| CacheError::TypeMismatch(key.key().clone()))?;
         Ok(update(storage))
     }
 
@@ -394,7 +389,7 @@ impl DataPlane {
         writer: &CellOwner,
         key: &ArrayKey<T>,
         update: impl FnOnce(&mut ArrayStorage<T>) -> R,
-    ) -> Result<R, DataPlaneError>
+    ) -> Result<R, CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -404,35 +399,35 @@ impl DataPlane {
         let mut storage = cell
             .storage
             .write()
-            .map_err(|_| DataPlaneError::CellLockPoisoned {
+            .map_err(|_| CacheError::CellLockPoisoned {
                 key: key.key().clone(),
             })?;
         let storage = storage
             .as_mut()
             .downcast_mut::<ArrayStorage<T>>()
-            .ok_or_else(|| DataPlaneError::TypeMismatch(key.key().clone()))?;
+            .ok_or_else(|| CacheError::TypeMismatch(key.key().clone()))?;
         Ok(update(storage))
     }
 }
 
-impl Default for DataPlane {
+impl Default for Cache {
     fn default() -> Self {
         Self::new()
     }
 }
 
-fn validate_range(key: &Key, range: &Range<usize>, len: usize) -> Result<(), DataPlaneError> {
+fn validate_range(key: &Key, range: &Range<usize>, len: usize) -> Result<(), CacheError> {
     if range.start <= range.end && range.end <= len {
         Ok(())
     } else {
-        Err(DataPlaneError::ArrayRangeOutOfBounds { key: key.clone() })
+        Err(CacheError::ArrayRangeOutOfBounds { key: key.clone() })
     }
 }
 
-fn validate_insert_index(key: &Key, index: usize, len: usize) -> Result<(), DataPlaneError> {
+fn validate_insert_index(key: &Key, index: usize, len: usize) -> Result<(), CacheError> {
     if index <= len {
         Ok(())
     } else {
-        Err(DataPlaneError::ArrayRangeOutOfBounds { key: key.clone() })
+        Err(CacheError::ArrayRangeOutOfBounds { key: key.clone() })
     }
 }

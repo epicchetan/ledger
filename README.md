@@ -349,7 +349,8 @@ docs/study_graph_phased_implementation.md
 
 ```text
 crates/store           generic object registry, R2 persistence, local cache
-crates/ledger-runtime  generic runtime data plane and scheduler
+crates/cache           standalone typed active state cells
+crates/runtime         generic projection scheduler over cache
 crates/api             HTTP transport adapter for Lens
 crates/cli             terminal adapter for store operations
 lens                   web operating surface

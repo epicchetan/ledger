@@ -1,17 +1,17 @@
 use std::fmt;
 
-use crate::error::DataPlaneError;
+use crate::error::CacheError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Key(String);
 
 impl Key {
-    pub fn new(value: impl Into<String>) -> Result<Self, DataPlaneError> {
+    pub fn new(value: impl Into<String>) -> Result<Self, CacheError> {
         let value = value.into();
         if is_valid_key(&value) {
             Ok(Self(value))
         } else {
-            Err(DataPlaneError::InvalidKey(value))
+            Err(CacheError::InvalidKey(value))
         }
     }
 

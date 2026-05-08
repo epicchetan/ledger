@@ -1,12 +1,18 @@
 use std::marker::PhantomData;
 
-use crate::Key;
+use crate::{CacheError, Key};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum CellOwner {
-    Runtime,
-    Origin(String),
-    Projection(String),
+pub struct CellOwner(Key);
+
+impl CellOwner {
+    pub fn new(value: impl Into<String>) -> Result<Self, CacheError> {
+        Ok(Self(Key::new(value)?))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

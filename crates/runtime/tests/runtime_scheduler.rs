@@ -1,9 +1,9 @@
 use std::sync::{Arc, Mutex};
 
-use ledger_runtime::{
-    CellDescriptor, CellKind, CellOwner, DataPlane, DataPlaneError, ExternalWriteBatch, Key,
-    Projection, ProjectionContext, ProjectionDescriptor, ProjectionError, ProjectionId, Runtime,
-    RuntimeError, ValueKey,
+use cache::{Cache, CacheError, CellDescriptor, CellKind, CellOwner, Key, ValueKey};
+use runtime::{
+    ExternalWriteBatch, Projection, ProjectionContext, ProjectionDescriptor, ProjectionError,
+    ProjectionId, Runtime, RuntimeError,
 };
 
 fn key(value: &str) -> Key {
@@ -23,21 +23,21 @@ fn descriptor(key_path: &str, owner: CellOwner, kind: CellKind) -> CellDescripto
     }
 }
 
-fn origin_owner() -> CellOwner {
-    CellOwner::Origin("origin.es_mbo".to_string())
+fn feed_owner() -> CellOwner {
+    CellOwner::new("feed.databento.es_mbo").unwrap()
 }
 
-fn source_cell(data_plane: &DataPlane) -> ValueKey<i32> {
-    data_plane
+fn source_cell(cache: &Cache) -> ValueKey<i32> {
+    cache
         .register_value(
-            descriptor("origin.es_mbo.value", origin_owner(), CellKind::Value),
+            descriptor("feed.databento.es_mbo.value", feed_owner(), CellKind::Value),
             None,
         )
         .unwrap()
 }
 
-fn projection_cell(data_plane: &DataPlane, key_path: &str, id: &ProjectionId) -> ValueKey<i32> {
-    data_plane
+fn projection_cell(cache: &Cache, key_path: &str, id: &ProjectionId) -> ValueKey<i32> {
+    cache
         .register_value(descriptor(key_path, id.owner(), CellKind::Value), None)
         .unwrap()
 }
@@ -149,12 +149,12 @@ impl Projection for IncrementSelfProjection {
 
 #[test]
 fn external_write_changed_key_queues_and_runs_dependent_projection() {
-    let data_plane = DataPlane::new();
-    let source = source_cell(&data_plane);
+    let cache = Cache::new();
+    let source = source_cell(&cache);
     let projection_id = projection_id("projection.copy");
-    let output = projection_cell(&data_plane, "projection.copy.output", &projection_id);
+    let output = projection_cell(&cache, "projection.copy.output", &projection_id);
     let log = Arc::new(Mutex::new(Vec::new()));
-    let mut runtime = Runtime::new(data_plane.clone());
+    let mut runtime = Runtime::new(cache.clone());
     runtime
         .register_projection(CopyProjection::new(
             projection_id.clone(),
@@ -166,23 +166,23 @@ fn external_write_changed_key_queues_and_runs_dependent_projection() {
         ))
         .unwrap();
 
-    runtime.submit_external_writes(external_set(origin_owner(), &source, 7));
+    runtime.submit_external_writes(external_set(feed_owner(), &source, 7));
     let step = runtime.run_once().unwrap();
 
     assert_eq!(step.projection_run, Some(projection_id.clone()));
     assert_eq!(step.scheduled_projections, vec![projection_id]);
-    assert_eq!(data_plane.read_value(&output).unwrap(), Some(7));
+    assert_eq!(cache.read_value(&output).unwrap(), Some(7));
     assert_eq!(log_snapshot(&log), vec!["copy"]);
 }
 
 #[test]
 fn duplicate_dependency_changes_run_projection_once() {
-    let data_plane = DataPlane::new();
-    let source = source_cell(&data_plane);
+    let cache = Cache::new();
+    let source = source_cell(&cache);
     let projection_id = projection_id("projection.copy");
-    let output = projection_cell(&data_plane, "projection.copy.output", &projection_id);
+    let output = projection_cell(&cache, "projection.copy.output", &projection_id);
     let log = Arc::new(Mutex::new(Vec::new()));
-    let mut runtime = Runtime::new(data_plane.clone());
+    let mut runtime = Runtime::new(cache.clone());
     runtime
         .register_projection(CopyProjection::new(
             projection_id,
@@ -193,7 +193,7 @@ fn duplicate_dependency_changes_run_projection_once() {
             log.clone(),
         ))
         .unwrap();
-    let mut batch = ExternalWriteBatch::new(origin_owner());
+    let mut batch = ExternalWriteBatch::new(feed_owner());
     batch.set_value(&source, 1).set_value(&source, 2);
 
     runtime.submit_external_writes(batch);
@@ -204,14 +204,14 @@ fn duplicate_dependency_changes_run_projection_once() {
 
 #[test]
 fn projection_write_queues_downstream_projection() {
-    let data_plane = DataPlane::new();
-    let source = source_cell(&data_plane);
+    let cache = Cache::new();
+    let source = source_cell(&cache);
     let first_id = projection_id("projection.first");
     let second_id = projection_id("projection.second");
-    let first_output = projection_cell(&data_plane, "projection.first.output", &first_id);
-    let second_output = projection_cell(&data_plane, "projection.second.output", &second_id);
+    let first_output = projection_cell(&cache, "projection.first.output", &first_id);
+    let second_output = projection_cell(&cache, "projection.second.output", &second_id);
     let log = Arc::new(Mutex::new(Vec::new()));
-    let mut runtime = Runtime::new(data_plane.clone());
+    let mut runtime = Runtime::new(cache.clone());
     runtime
         .register_projection(
             CopyProjection::new(
@@ -239,7 +239,7 @@ fn projection_write_queues_downstream_projection() {
         )
         .unwrap();
 
-    runtime.submit_external_writes(external_set(origin_owner(), &source, 1));
+    runtime.submit_external_writes(external_set(feed_owner(), &source, 1));
     let first_step = runtime.run_once().unwrap();
     let second_step = runtime.run_once().unwrap();
 
@@ -249,20 +249,20 @@ fn projection_write_queues_downstream_projection() {
         vec![projection_id("projection.first"), second_id.clone()]
     );
     assert_eq!(second_step.projection_run, Some(second_id));
-    assert_eq!(data_plane.read_value(&second_output).unwrap(), Some(111));
+    assert_eq!(cache.read_value(&second_output).unwrap(), Some(111));
     assert_eq!(log_snapshot(&log), vec!["first", "second"]);
 }
 
 #[test]
 fn downstream_projections_run_in_registration_order() {
-    let data_plane = DataPlane::new();
-    let source = source_cell(&data_plane);
+    let cache = Cache::new();
+    let source = source_cell(&cache);
     let first_id = projection_id("projection.first");
     let second_id = projection_id("projection.second");
-    let first_output = projection_cell(&data_plane, "projection.first.output", &first_id);
-    let second_output = projection_cell(&data_plane, "projection.second.output", &second_id);
+    let first_output = projection_cell(&cache, "projection.first.output", &first_id);
+    let second_output = projection_cell(&cache, "projection.second.output", &second_id);
     let log = Arc::new(Mutex::new(Vec::new()));
-    let mut runtime = Runtime::new(data_plane.clone());
+    let mut runtime = Runtime::new(cache.clone());
     runtime
         .register_projection(CopyProjection::new(
             first_id,
@@ -284,7 +284,7 @@ fn downstream_projections_run_in_registration_order() {
         ))
         .unwrap();
 
-    runtime.submit_external_writes(external_set(origin_owner(), &source, 1));
+    runtime.submit_external_writes(external_set(feed_owner(), &source, 1));
     runtime.run_until_idle(10).unwrap();
 
     assert_eq!(log_snapshot(&log), vec!["first", "second"]);
@@ -292,12 +292,12 @@ fn downstream_projections_run_in_registration_order() {
 
 #[test]
 fn external_writes_are_applied_before_projection_runs() {
-    let data_plane = DataPlane::new();
-    let source = source_cell(&data_plane);
+    let cache = Cache::new();
+    let source = source_cell(&cache);
     let projection_id = projection_id("projection.copy");
-    let output = projection_cell(&data_plane, "projection.copy.output", &projection_id);
+    let output = projection_cell(&cache, "projection.copy.output", &projection_id);
     let log = Arc::new(Mutex::new(Vec::new()));
-    let mut runtime = Runtime::new(data_plane.clone());
+    let mut runtime = Runtime::new(cache.clone());
     runtime
         .register_projection(CopyProjection::new(
             projection_id.clone(),
@@ -309,37 +309,37 @@ fn external_writes_are_applied_before_projection_runs() {
         ))
         .unwrap();
     runtime.queue_projection(&projection_id).unwrap();
-    runtime.submit_external_writes(external_set(origin_owner(), &source, 42));
+    runtime.submit_external_writes(external_set(feed_owner(), &source, 42));
 
     runtime.run_once().unwrap();
 
-    assert_eq!(data_plane.read_value(&output).unwrap(), Some(42));
+    assert_eq!(cache.read_value(&output).unwrap(), Some(42));
 }
 
 #[test]
 fn external_write_batches_are_fifo() {
-    let data_plane = DataPlane::new();
-    let source = source_cell(&data_plane);
-    let mut runtime = Runtime::new(data_plane.clone());
+    let cache = Cache::new();
+    let source = source_cell(&cache);
+    let mut runtime = Runtime::new(cache.clone());
 
-    runtime.submit_external_writes(external_set(origin_owner(), &source, 1));
-    runtime.submit_external_writes(external_set(origin_owner(), &source, 2));
+    runtime.submit_external_writes(external_set(feed_owner(), &source, 1));
+    runtime.submit_external_writes(external_set(feed_owner(), &source, 2));
     let step = runtime.run_once().unwrap();
 
     assert_eq!(step.external_write_batches_applied, 2);
-    assert_eq!(data_plane.read_value(&source).unwrap(), Some(2));
+    assert_eq!(cache.read_value(&source).unwrap(), Some(2));
 }
 
 #[test]
 fn one_run_once_runs_at_most_one_projection() {
-    let data_plane = DataPlane::new();
-    let source = source_cell(&data_plane);
+    let cache = Cache::new();
+    let source = source_cell(&cache);
     let first_id = projection_id("projection.first");
     let second_id = projection_id("projection.second");
-    let first_output = projection_cell(&data_plane, "projection.first.output", &first_id);
-    let second_output = projection_cell(&data_plane, "projection.second.output", &second_id);
+    let first_output = projection_cell(&cache, "projection.first.output", &first_id);
+    let second_output = projection_cell(&cache, "projection.second.output", &second_id);
     let log = Arc::new(Mutex::new(Vec::new()));
-    let mut runtime = Runtime::new(data_plane);
+    let mut runtime = Runtime::new(cache);
     runtime
         .register_projection(CopyProjection::new(
             first_id.clone(),
@@ -372,8 +372,8 @@ fn one_run_once_runs_at_most_one_projection() {
 
 #[test]
 fn run_once_returns_idle_when_no_work_exists() {
-    let data_plane = DataPlane::new();
-    let mut runtime = Runtime::new(data_plane);
+    let cache = Cache::new();
+    let mut runtime = Runtime::new(cache);
 
     let step = runtime.run_once().unwrap();
 
@@ -386,12 +386,12 @@ fn run_once_returns_idle_when_no_work_exists() {
 
 #[test]
 fn run_until_idle_drains_external_writes_and_projections() {
-    let data_plane = DataPlane::new();
-    let source = source_cell(&data_plane);
+    let cache = Cache::new();
+    let source = source_cell(&cache);
     let projection_id = projection_id("projection.copy");
-    let output = projection_cell(&data_plane, "projection.copy.output", &projection_id);
+    let output = projection_cell(&cache, "projection.copy.output", &projection_id);
     let log = Arc::new(Mutex::new(Vec::new()));
-    let mut runtime = Runtime::new(data_plane.clone());
+    let mut runtime = Runtime::new(cache.clone());
     runtime
         .register_projection(CopyProjection::new(
             projection_id,
@@ -403,7 +403,7 @@ fn run_until_idle_drains_external_writes_and_projections() {
         ))
         .unwrap();
 
-    runtime.submit_external_writes(external_set(origin_owner(), &source, 9));
+    runtime.submit_external_writes(external_set(feed_owner(), &source, 9));
     let stats = runtime.run_until_idle(10).unwrap();
 
     assert_eq!(stats.steps, 1);
@@ -411,18 +411,21 @@ fn run_until_idle_drains_external_writes_and_projections() {
     assert_eq!(stats.projections_run, 1);
     assert_eq!(
         stats.changed_keys,
-        vec![key("origin.es_mbo.value"), key("projection.copy.output")]
+        vec![
+            key("feed.databento.es_mbo.value"),
+            key("projection.copy.output")
+        ]
     );
-    assert_eq!(data_plane.read_value(&output).unwrap(), Some(9));
+    assert_eq!(cache.read_value(&output).unwrap(), Some(9));
 }
 
 #[test]
 fn run_until_idle_returns_limit_exceeded_for_cycle() {
-    let data_plane = DataPlane::new();
+    let cache = Cache::new();
     let projection_id = projection_id("projection.loop");
-    let output = projection_cell(&data_plane, "projection.loop.output", &projection_id);
+    let output = projection_cell(&cache, "projection.loop.output", &projection_id);
     let descriptor = ProjectionDescriptor::new(projection_id.clone(), vec![output.key().clone()]);
-    let mut runtime = Runtime::new(data_plane);
+    let mut runtime = Runtime::new(cache);
     runtime
         .register_projection(IncrementSelfProjection {
             descriptor,
@@ -438,10 +441,10 @@ fn run_until_idle_returns_limit_exceeded_for_cycle() {
 
 #[test]
 fn projection_errors_are_wrapped_with_projection_id() {
-    let data_plane = DataPlane::new();
+    let cache = Cache::new();
     let projection_id = projection_id("projection.failing");
     let log = Arc::new(Mutex::new(Vec::new()));
-    let mut runtime = Runtime::new(data_plane);
+    let mut runtime = Runtime::new(cache);
     runtime
         .register_projection(FailingProjection {
             descriptor: ProjectionDescriptor::new(projection_id.clone(), Vec::new()),
@@ -463,15 +466,14 @@ fn projection_errors_are_wrapped_with_projection_id() {
 
 #[test]
 fn projection_committed_writes_schedule_dependents_before_error_returns() {
-    let data_plane = DataPlane::new();
-    let source = source_cell(&data_plane);
+    let cache = Cache::new();
+    let source = source_cell(&cache);
     let failing_id = projection_id("projection.failing");
     let downstream_id = projection_id("projection.downstream");
-    let failing_output = projection_cell(&data_plane, "projection.failing.output", &failing_id);
-    let downstream_output =
-        projection_cell(&data_plane, "projection.downstream.output", &downstream_id);
+    let failing_output = projection_cell(&cache, "projection.failing.output", &failing_id);
+    let downstream_output = projection_cell(&cache, "projection.downstream.output", &downstream_id);
     let log = Arc::new(Mutex::new(Vec::new()));
-    let mut runtime = Runtime::new(data_plane.clone());
+    let mut runtime = Runtime::new(cache.clone());
     runtime
         .register_projection(
             CopyProjection::new(
@@ -495,35 +497,35 @@ fn projection_committed_writes_schedule_dependents_before_error_returns() {
             log.clone(),
         ))
         .unwrap();
-    runtime.submit_external_writes(external_set(origin_owner(), &source, 3));
+    runtime.submit_external_writes(external_set(feed_owner(), &source, 3));
 
     let err = runtime.run_once().unwrap_err();
     assert!(matches!(err, RuntimeError::Projection { .. }));
     let step = runtime.run_once().unwrap();
 
     assert_eq!(step.projection_run, Some(downstream_id));
-    assert_eq!(data_plane.read_value(&downstream_output).unwrap(), Some(3));
+    assert_eq!(cache.read_value(&downstream_output).unwrap(), Some(3));
     assert_eq!(log_snapshot(&log), vec!["failing", "downstream"]);
 }
 
 #[test]
 fn external_write_committed_writes_schedule_dependents_before_error_returns() {
-    let data_plane = DataPlane::new();
-    let source = source_cell(&data_plane);
-    let wrong_owner_cell = data_plane
+    let cache = Cache::new();
+    let source = source_cell(&cache);
+    let wrong_owner_cell = cache
         .register_value(
             descriptor(
                 "projection.wrong.output",
-                CellOwner::Projection("projection.wrong".to_string()),
+                CellOwner::new("projection.wrong").unwrap(),
                 CellKind::Value,
             ),
             None::<i32>,
         )
         .unwrap();
     let projection_id = projection_id("projection.copy");
-    let output = projection_cell(&data_plane, "projection.copy.output", &projection_id);
+    let output = projection_cell(&cache, "projection.copy.output", &projection_id);
     let log = Arc::new(Mutex::new(Vec::new()));
-    let mut runtime = Runtime::new(data_plane.clone());
+    let mut runtime = Runtime::new(cache.clone());
     runtime
         .register_projection(CopyProjection::new(
             projection_id.clone(),
@@ -534,32 +536,32 @@ fn external_write_committed_writes_schedule_dependents_before_error_returns() {
             log,
         ))
         .unwrap();
-    let mut failing_batch = ExternalWriteBatch::new(origin_owner());
+    let mut failing_batch = ExternalWriteBatch::new(feed_owner());
     failing_batch
         .set_value(&source, 1)
         .set_value(&wrong_owner_cell, 100);
     runtime.submit_external_writes(failing_batch);
-    runtime.submit_external_writes(external_set(origin_owner(), &source, 2));
+    runtime.submit_external_writes(external_set(feed_owner(), &source, 2));
 
     let err = runtime.run_once().unwrap_err();
     assert!(matches!(
         err,
-        RuntimeError::DataPlane(DataPlaneError::OwnerMismatch { .. })
+        RuntimeError::Cache(CacheError::OwnerMismatch { .. })
     ));
     let step = runtime.run_once().unwrap();
 
     assert_eq!(step.external_write_batches_applied, 1);
     assert_eq!(step.projection_run, Some(projection_id));
-    assert_eq!(data_plane.read_value(&output).unwrap(), Some(2));
+    assert_eq!(cache.read_value(&output).unwrap(), Some(2));
 }
 
 #[test]
 fn phase_local_scheduling_allows_popped_projection_to_requeue_itself() {
-    let data_plane = DataPlane::new();
+    let cache = Cache::new();
     let projection_id = projection_id("projection.loop");
-    let output = projection_cell(&data_plane, "projection.loop.output", &projection_id);
+    let output = projection_cell(&cache, "projection.loop.output", &projection_id);
     let descriptor = ProjectionDescriptor::new(projection_id.clone(), vec![output.key().clone()]);
-    let mut runtime = Runtime::new(data_plane.clone());
+    let mut runtime = Runtime::new(cache.clone());
     runtime
         .register_projection(IncrementSelfProjection {
             descriptor,
@@ -573,17 +575,17 @@ fn phase_local_scheduling_allows_popped_projection_to_requeue_itself() {
     assert_eq!(step.projection_run, Some(projection_id.clone()));
     assert_eq!(step.scheduled_projections, vec![projection_id]);
     assert!(!step.idle_after);
-    assert_eq!(data_plane.read_value(&output).unwrap(), Some(1));
+    assert_eq!(cache.read_value(&output).unwrap(), Some(1));
 }
 
 #[test]
-fn direct_data_plane_writes_do_not_schedule_projections() {
-    let data_plane = DataPlane::new();
-    let source = source_cell(&data_plane);
+fn direct_cache_writes_do_not_schedule_projections() {
+    let cache = Cache::new();
+    let source = source_cell(&cache);
     let projection_id = projection_id("projection.copy");
-    let output = projection_cell(&data_plane, "projection.copy.output", &projection_id);
+    let output = projection_cell(&cache, "projection.copy.output", &projection_id);
     let log = Arc::new(Mutex::new(Vec::new()));
-    let mut runtime = Runtime::new(data_plane.clone());
+    let mut runtime = Runtime::new(cache.clone());
     runtime
         .register_projection(CopyProjection::new(
             projection_id,
@@ -595,24 +597,24 @@ fn direct_data_plane_writes_do_not_schedule_projections() {
         ))
         .unwrap();
 
-    data_plane
-        .set_value(&origin_owner(), &source, 5)
+    cache
+        .set_value(&feed_owner(), &source, 5)
         .expect("direct setup write should succeed");
     let stats = runtime.run_until_idle(10).unwrap();
 
     assert_eq!(stats.steps, 0);
-    assert_eq!(data_plane.read_value(&output).unwrap(), None);
+    assert_eq!(cache.read_value(&output).unwrap(), None);
     assert!(log_snapshot(&log).is_empty());
 }
 
 #[test]
 fn duplicate_projection_registration_is_rejected() {
-    let data_plane = DataPlane::new();
-    let source = source_cell(&data_plane);
+    let cache = Cache::new();
+    let source = source_cell(&cache);
     let projection_id = projection_id("projection.copy");
-    let first_output = projection_cell(&data_plane, "projection.copy.first", &projection_id);
+    let first_output = projection_cell(&cache, "projection.copy.first", &projection_id);
     let log = Arc::new(Mutex::new(Vec::new()));
-    let mut runtime = Runtime::new(data_plane.clone());
+    let mut runtime = Runtime::new(cache.clone());
     runtime
         .register_projection(CopyProjection::new(
             projection_id.clone(),
@@ -628,7 +630,7 @@ fn duplicate_projection_registration_is_rejected() {
         projection_id.clone(),
         source.key().clone(),
         source,
-        projection_cell(&data_plane, "projection.copy.second", &projection_id),
+        projection_cell(&cache, "projection.copy.second", &projection_id),
         "copy2",
         log,
     );
@@ -639,8 +641,8 @@ fn duplicate_projection_registration_is_rejected() {
 
 #[test]
 fn queue_projection_rejects_unknown_projection_id() {
-    let data_plane = DataPlane::new();
-    let mut runtime = Runtime::new(data_plane);
+    let cache = Cache::new();
+    let mut runtime = Runtime::new(cache);
     let unknown = projection_id("projection.unknown");
 
     let err = runtime.queue_projection(&unknown).unwrap_err();
@@ -650,10 +652,10 @@ fn queue_projection_rejects_unknown_projection_id() {
 
 #[test]
 fn duplicate_dependencies_in_one_descriptor_are_indexed_once() {
-    let data_plane = DataPlane::new();
-    let source = source_cell(&data_plane);
+    let cache = Cache::new();
+    let source = source_cell(&cache);
     let projection_id = projection_id("projection.copy");
-    let output = projection_cell(&data_plane, "projection.copy.output", &projection_id);
+    let output = projection_cell(&cache, "projection.copy.output", &projection_id);
     let log = Arc::new(Mutex::new(Vec::new()));
     let descriptor = ProjectionDescriptor::new(
         projection_id,
@@ -668,10 +670,10 @@ fn duplicate_dependencies_in_one_descriptor_are_indexed_once() {
         log.clone(),
     );
     projection.descriptor = descriptor;
-    let mut runtime = Runtime::new(data_plane);
+    let mut runtime = Runtime::new(cache);
     runtime.register_projection(projection).unwrap();
 
-    runtime.submit_external_writes(external_set(origin_owner(), &source, 1));
+    runtime.submit_external_writes(external_set(feed_owner(), &source, 1));
     runtime.run_until_idle(10).unwrap();
 
     assert_eq!(log_snapshot(&log), vec!["copy"]);
@@ -679,10 +681,10 @@ fn duplicate_dependencies_in_one_descriptor_are_indexed_once() {
 
 #[test]
 fn empty_dependencies_are_allowed() {
-    let data_plane = DataPlane::new();
+    let cache = Cache::new();
     let projection_id = projection_id("projection.failing");
     let log = Arc::new(Mutex::new(Vec::new()));
-    let mut runtime = Runtime::new(data_plane);
+    let mut runtime = Runtime::new(cache);
     runtime
         .register_projection(FailingProjection {
             descriptor: ProjectionDescriptor::new(projection_id.clone(), Vec::new()),
