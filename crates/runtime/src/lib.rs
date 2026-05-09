@@ -1,13 +1,28 @@
-//! Generic scheduler and projection runtime.
+//! Generic component runtime.
 //!
-//! This crate intentionally does not know about Ledger domain payloads or feed
-//! implementations. It schedules external cache writes and projection runs
-//! against the standalone `cache` crate.
+//! This crate intentionally does not know about Ledger domain payloads, feeds,
+//! studies, replay, playback, or trade concepts. It owns process execution,
+//! finite task scheduling, and cache write application against the standalone
+//! `cache` crate.
 
-mod projection;
+mod component;
+mod error;
+mod handle;
+mod process;
 mod runtime;
+mod task;
+mod worker;
+mod write;
 
-pub use projection::{
-    Projection, ProjectionContext, ProjectionDescriptor, ProjectionError, ProjectionId,
+pub use component::{
+    ComponentDescriptor, ComponentId, ComponentKind, ComponentStatus, TaskDescriptor,
 };
-pub use runtime::{ExternalWriteBatch, RunStats, Runtime, RuntimeError, RuntimeStep};
+pub use error::{ComponentError, RuntimeError};
+pub use handle::{ComponentHandle, RuntimeHandle};
+pub use process::{ProcessContext, ProcessPrepareContext, RuntimeProcess, ShutdownReceiver};
+pub use runtime::{
+    ExternalWriteBatch, ExternalWriteReceiver, ExternalWriteSink, RunStats, Runtime, RuntimeStep,
+};
+pub use task::{RuntimeTask, TaskContext, TaskPrepareContext, TaskWake};
+pub use worker::RuntimeWorker;
+pub use write::ComponentWriteContext;

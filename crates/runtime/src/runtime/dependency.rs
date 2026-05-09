@@ -2,11 +2,11 @@ use std::collections::HashMap;
 
 use cache::Key;
 
-use crate::ProjectionId;
+use crate::ComponentId;
 
 #[derive(Debug, Default)]
 pub(crate) struct DependencyIndex {
-    dependents: HashMap<Key, Vec<ProjectionId>>,
+    dependents: HashMap<Key, Vec<ComponentId>>,
 }
 
 impl DependencyIndex {
@@ -14,7 +14,7 @@ impl DependencyIndex {
         Self::default()
     }
 
-    pub(crate) fn add_projection(&mut self, id: &ProjectionId, dependencies: &[Key]) {
+    pub(crate) fn add_task(&mut self, id: &ComponentId, dependencies: &[Key]) {
         for dependency in dependencies {
             self.dependents
                 .entry(dependency.clone())
@@ -23,7 +23,7 @@ impl DependencyIndex {
         }
     }
 
-    pub(crate) fn dependents_for(&self, key: &Key) -> &[ProjectionId] {
+    pub(crate) fn dependents_for(&self, key: &Key) -> &[ComponentId] {
         self.dependents.get(key).map(Vec::as_slice).unwrap_or(&[])
     }
 }

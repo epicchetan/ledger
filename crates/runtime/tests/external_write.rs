@@ -19,8 +19,8 @@ fn feed_owner() -> CellOwner {
     CellOwner::new("feed.databento.es_mbo").unwrap()
 }
 
-fn projection_owner() -> CellOwner {
-    CellOwner::new("projection.candles_1m").unwrap()
+fn task_owner() -> CellOwner {
+    CellOwner::new("task.candles_1m").unwrap()
 }
 
 fn other_owner() -> CellOwner {
@@ -58,8 +58,8 @@ fn runtime_with_cache(cache: &Cache) -> Runtime {
     Runtime::new(cache.clone())
 }
 
-#[test]
-fn external_batch_set_value_writes_through_cache() {
+#[tokio::test]
+async fn external_batch_set_value_writes_through_cache() {
     let cache = Cache::new();
     let owner = feed_owner();
     let status = status_cell(&cache, owner.clone());
@@ -68,7 +68,7 @@ fn external_batch_set_value_writes_through_cache() {
     batch.set_value(&status, Status { playing: true });
 
     runtime.submit_external_writes(batch);
-    let step = runtime.run_once().unwrap();
+    let step = runtime.run_once().await.unwrap();
 
     assert_eq!(
         cache.read_value(&status).unwrap(),
@@ -78,8 +78,8 @@ fn external_batch_set_value_writes_through_cache() {
     assert!(step.idle_after);
 }
 
-#[test]
-fn external_batch_clear_value_clears_through_cache() {
+#[tokio::test]
+async fn external_batch_clear_value_clears_through_cache() {
     let cache = Cache::new();
     let owner = feed_owner();
     let status = status_cell(&cache, owner.clone());
@@ -91,13 +91,13 @@ fn external_batch_clear_value_clears_through_cache() {
     batch.clear_value(&status);
 
     runtime.submit_external_writes(batch);
-    runtime.run_once().unwrap();
+    runtime.run_once().await.unwrap();
 
     assert_eq!(cache.read_value(&status).unwrap(), None);
 }
 
-#[test]
-fn external_batch_push_array_preserves_item_order() {
+#[tokio::test]
+async fn external_batch_push_array_preserves_item_order() {
     let cache = Cache::new();
     let owner = feed_owner();
     let batches = batches_cell(&cache, owner.clone());
@@ -106,7 +106,7 @@ fn external_batch_push_array_preserves_item_order() {
     batch.push_array(&batches, vec![Batch { seq: 1 }, Batch { seq: 2 }]);
 
     runtime.submit_external_writes(batch);
-    runtime.run_once().unwrap();
+    runtime.run_once().await.unwrap();
 
     assert_eq!(
         cache.read_array(&batches).unwrap(),
@@ -114,8 +114,8 @@ fn external_batch_push_array_preserves_item_order() {
     );
 }
 
-#[test]
-fn external_batch_replace_array_replaces_existing_items() {
+#[tokio::test]
+async fn external_batch_replace_array_replaces_existing_items() {
     let cache = Cache::new();
     let owner = feed_owner();
     let batches = batches_cell(&cache, owner.clone());
@@ -127,13 +127,13 @@ fn external_batch_replace_array_replaces_existing_items() {
     batch.replace_array(&batches, vec![Batch { seq: 10 }]);
 
     runtime.submit_external_writes(batch);
-    runtime.run_once().unwrap();
+    runtime.run_once().await.unwrap();
 
     assert_eq!(cache.read_array(&batches).unwrap(), vec![Batch { seq: 10 }]);
 }
 
-#[test]
-fn external_batch_insert_array_validates_bounds_through_cache() {
+#[tokio::test]
+async fn external_batch_insert_array_validates_bounds_through_cache() {
     let cache = Cache::new();
     let owner = feed_owner();
     let batches = batches_cell(&cache, owner.clone());
@@ -142,7 +142,7 @@ fn external_batch_insert_array_validates_bounds_through_cache() {
     batch.insert_array(&batches, 1, vec![Batch { seq: 1 }]);
 
     runtime.submit_external_writes(batch);
-    let err = runtime.run_once().unwrap_err();
+    let err = runtime.run_once().await.unwrap_err();
 
     assert_eq!(
         err,
@@ -153,8 +153,8 @@ fn external_batch_insert_array_validates_bounds_through_cache() {
     assert!(cache.read_array(&batches).unwrap().is_empty());
 }
 
-#[test]
-fn external_batch_replace_array_range_validates_bounds_through_cache() {
+#[tokio::test]
+async fn external_batch_replace_array_range_validates_bounds_through_cache() {
     let cache = Cache::new();
     let owner = feed_owner();
     let batches = batches_cell(&cache, owner.clone());
@@ -163,7 +163,7 @@ fn external_batch_replace_array_range_validates_bounds_through_cache() {
     batch.replace_array_range(&batches, 0..1, vec![Batch { seq: 1 }]);
 
     runtime.submit_external_writes(batch);
-    let err = runtime.run_once().unwrap_err();
+    let err = runtime.run_once().await.unwrap_err();
 
     assert_eq!(
         err,
@@ -173,8 +173,8 @@ fn external_batch_replace_array_range_validates_bounds_through_cache() {
     );
 }
 
-#[test]
-fn external_batch_remove_array_range_validates_bounds_through_cache() {
+#[tokio::test]
+async fn external_batch_remove_array_range_validates_bounds_through_cache() {
     let cache = Cache::new();
     let owner = feed_owner();
     let batches = batches_cell(&cache, owner.clone());
@@ -183,7 +183,7 @@ fn external_batch_remove_array_range_validates_bounds_through_cache() {
     batch.remove_array_range(&batches, 0..1);
 
     runtime.submit_external_writes(batch);
-    let err = runtime.run_once().unwrap_err();
+    let err = runtime.run_once().await.unwrap_err();
 
     assert_eq!(
         err,
@@ -193,8 +193,8 @@ fn external_batch_remove_array_range_validates_bounds_through_cache() {
     );
 }
 
-#[test]
-fn external_batch_clear_array_clears_through_cache() {
+#[tokio::test]
+async fn external_batch_clear_array_clears_through_cache() {
     let cache = Cache::new();
     let owner = feed_owner();
     let batches = batches_cell(&cache, owner.clone());
@@ -206,13 +206,13 @@ fn external_batch_clear_array_clears_through_cache() {
     batch.clear_array(&batches);
 
     runtime.submit_external_writes(batch);
-    runtime.run_once().unwrap();
+    runtime.run_once().await.unwrap();
 
     assert!(cache.read_array(&batches).unwrap().is_empty());
 }
 
-#[test]
-fn external_batch_records_each_changed_key_once_and_preserves_operation_order() {
+#[tokio::test]
+async fn external_batch_records_each_changed_key_once_and_preserves_operation_order() {
     let cache = Cache::new();
     let owner = feed_owner();
     let status = status_cell(&cache, owner.clone());
@@ -226,7 +226,7 @@ fn external_batch_records_each_changed_key_once_and_preserves_operation_order() 
         .push_array(&batches, vec![Batch { seq: 2 }]);
 
     runtime.submit_external_writes(batch);
-    let step = runtime.run_once().unwrap();
+    let step = runtime.run_once().await.unwrap();
 
     assert_eq!(
         cache.read_value(&status).unwrap(),
@@ -245,8 +245,8 @@ fn external_batch_records_each_changed_key_once_and_preserves_operation_order() 
     );
 }
 
-#[test]
-fn external_batch_fails_on_owner_mismatch() {
+#[tokio::test]
+async fn external_batch_fails_on_owner_mismatch() {
     let cache = Cache::new();
     let owner = feed_owner();
     let status = status_cell(&cache, owner.clone());
@@ -256,7 +256,7 @@ fn external_batch_fails_on_owner_mismatch() {
     batch.set_value(&status, Status { playing: true });
 
     runtime.submit_external_writes(batch);
-    let err = runtime.run_once().unwrap_err();
+    let err = runtime.run_once().await.unwrap_err();
 
     assert_eq!(
         err,
@@ -269,18 +269,14 @@ fn external_batch_fails_on_owner_mismatch() {
     assert_eq!(cache.read_value(&status).unwrap(), None);
 }
 
-#[test]
-fn failed_external_batch_consumes_committed_writes_and_skips_later_operations() {
+#[tokio::test]
+async fn failed_external_batch_consumes_committed_writes_and_skips_later_operations() {
     let cache = Cache::new();
     let owner = feed_owner();
     let status = status_cell(&cache, owner.clone());
-    let projection_batches = cache
+    let task_batches = cache
         .register_array(
-            descriptor(
-                "projection.candles_1m.batches",
-                projection_owner(),
-                CellKind::Array,
-            ),
+            descriptor("task.candles_1m.batches", task_owner(), CellKind::Array),
             Vec::<Batch>::new(),
         )
         .unwrap();
@@ -288,11 +284,11 @@ fn failed_external_batch_consumes_committed_writes_and_skips_later_operations() 
     let mut batch = ExternalWriteBatch::new(owner);
     batch
         .set_value(&status, Status { playing: true })
-        .push_array(&projection_batches, vec![Batch { seq: 1 }])
+        .push_array(&task_batches, vec![Batch { seq: 1 }])
         .clear_value(&status);
 
     runtime.submit_external_writes(batch);
-    let err = runtime.run_once().unwrap_err();
+    let err = runtime.run_once().await.unwrap_err();
 
     assert!(matches!(
         err,
@@ -302,18 +298,18 @@ fn failed_external_batch_consumes_committed_writes_and_skips_later_operations() 
         cache.read_value(&status).unwrap(),
         Some(Status { playing: true })
     );
-    assert!(cache.read_array(&projection_batches).unwrap().is_empty());
+    assert!(cache.read_array(&task_batches).unwrap().is_empty());
     assert!(runtime.is_idle());
 }
 
-#[test]
-fn empty_external_batch_is_ignored_by_runtime() {
+#[tokio::test]
+async fn empty_external_batch_is_ignored_by_runtime() {
     let cache = Cache::new();
     let owner = feed_owner();
     let mut runtime = runtime_with_cache(&cache);
     runtime.submit_external_writes(ExternalWriteBatch::new(owner));
 
-    let step = runtime.run_once().unwrap();
+    let step = runtime.run_once().await.unwrap();
 
     assert_eq!(step.external_write_batches_applied, 0);
     assert!(step.idle_after);

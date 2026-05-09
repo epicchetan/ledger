@@ -5,11 +5,10 @@ It is intentionally conceptual. Detailed implementation requirements live in
 the narrower specs:
 
 ```text
-docs/ledger_runtime_data_plane_implementation_spec.md
-docs/ledger_runtime_scheduler_implementation_spec.md
+docs/store_implementation_spec.md
+docs/ledger_feed_system_implementation_spec.md
 ```
 
-Those specs describe what has already been implemented in `crates/ledger-runtime`.
 This document describes the shape we are moving toward and the responsibility
 boundaries we should keep in mind while replacing the old replay/session system.
 

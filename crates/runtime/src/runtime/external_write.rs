@@ -1,8 +1,38 @@
 use std::ops::Range;
 
-use cache::{ArrayKey, Cache, CellOwner, Key, ValueKey, WriteEffects};
+use cache::{ArrayKey, Cache, CacheError, CellOwner, Key, ValueKey, WriteEffects};
+use tokio::sync::mpsc;
 
-use crate::runtime::RuntimeError;
+use crate::RuntimeError;
+
+pub type ExternalWriteReceiver = mpsc::Receiver<ExternalWriteBatch>;
+
+#[derive(Clone)]
+pub struct ExternalWriteSink {
+    tx: mpsc::Sender<ExternalWriteBatch>,
+}
+
+impl ExternalWriteSink {
+    pub fn channel(capacity: usize) -> (Self, ExternalWriteReceiver) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (Self { tx }, rx)
+    }
+
+    pub async fn submit(&self, batch: ExternalWriteBatch) -> Result<(), RuntimeError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        self.tx
+            .send(batch)
+            .await
+            .map_err(|_| RuntimeError::RuntimeIngressClosed)
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+}
 
 pub struct ExternalWriteBatch {
     writer: CellOwner,
@@ -120,7 +150,7 @@ impl ExternalWriteBatch {
         self
     }
 
-    pub(crate) fn apply(self, cache: &Cache) -> (Result<(), RuntimeError>, WriteEffects) {
+    pub(crate) fn apply(self, cache: &Cache) -> (Result<(), CacheError>, WriteEffects) {
         let Self { writer, operations } = self;
         let mut ctx = ExternalWriteContext::new(cache, writer);
         let result = Self::apply_operations(operations, &mut ctx);
@@ -131,7 +161,7 @@ impl ExternalWriteBatch {
     fn apply_operations(
         operations: Vec<Box<dyn ExternalWriteOperation>>,
         ctx: &mut ExternalWriteContext<'_>,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<(), CacheError> {
         for operation in operations {
             operation.apply(ctx)?;
         }
@@ -140,7 +170,7 @@ impl ExternalWriteBatch {
 }
 
 trait ExternalWriteOperation: Send {
-    fn apply(self: Box<Self>, ctx: &mut ExternalWriteContext<'_>) -> Result<(), RuntimeError>;
+    fn apply(self: Box<Self>, ctx: &mut ExternalWriteContext<'_>) -> Result<(), CacheError>;
 }
 
 pub(crate) struct ExternalWriteContext<'a> {
@@ -164,7 +194,7 @@ impl<'a> ExternalWriteContext<'a> {
         }
     }
 
-    pub(crate) fn set_value<T>(&mut self, key: &ValueKey<T>, value: T) -> Result<(), RuntimeError>
+    pub(crate) fn set_value<T>(&mut self, key: &ValueKey<T>, value: T) -> Result<(), CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -173,7 +203,7 @@ impl<'a> ExternalWriteContext<'a> {
         Ok(())
     }
 
-    pub(crate) fn clear_value<T>(&mut self, key: &ValueKey<T>) -> Result<(), RuntimeError>
+    pub(crate) fn clear_value<T>(&mut self, key: &ValueKey<T>) -> Result<(), CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -186,7 +216,7 @@ impl<'a> ExternalWriteContext<'a> {
         &mut self,
         key: &ArrayKey<T>,
         items: Vec<T>,
-    ) -> Result<(), RuntimeError>
+    ) -> Result<(), CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -199,7 +229,7 @@ impl<'a> ExternalWriteContext<'a> {
         &mut self,
         key: &ArrayKey<T>,
         items: Vec<T>,
-    ) -> Result<(), RuntimeError>
+    ) -> Result<(), CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -213,7 +243,7 @@ impl<'a> ExternalWriteContext<'a> {
         key: &ArrayKey<T>,
         index: usize,
         items: Vec<T>,
-    ) -> Result<(), RuntimeError>
+    ) -> Result<(), CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -227,7 +257,7 @@ impl<'a> ExternalWriteContext<'a> {
         key: &ArrayKey<T>,
         range: Range<usize>,
         items: Vec<T>,
-    ) -> Result<(), RuntimeError>
+    ) -> Result<(), CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -242,7 +272,7 @@ impl<'a> ExternalWriteContext<'a> {
         &mut self,
         key: &ArrayKey<T>,
         range: Range<usize>,
-    ) -> Result<(), RuntimeError>
+    ) -> Result<(), CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -251,7 +281,7 @@ impl<'a> ExternalWriteContext<'a> {
         Ok(())
     }
 
-    pub(crate) fn clear_array<T>(&mut self, key: &ArrayKey<T>) -> Result<(), RuntimeError>
+    pub(crate) fn clear_array<T>(&mut self, key: &ArrayKey<T>) -> Result<(), CacheError>
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -278,7 +308,7 @@ impl<T> ExternalWriteOperation for SetValue<T>
 where
     T: Clone + Send + Sync + 'static,
 {
-    fn apply(self: Box<Self>, ctx: &mut ExternalWriteContext<'_>) -> Result<(), RuntimeError> {
+    fn apply(self: Box<Self>, ctx: &mut ExternalWriteContext<'_>) -> Result<(), CacheError> {
         ctx.set_value(&self.key, self.value)
     }
 }
@@ -291,7 +321,7 @@ impl<T> ExternalWriteOperation for ClearValue<T>
 where
     T: Clone + Send + Sync + 'static,
 {
-    fn apply(self: Box<Self>, ctx: &mut ExternalWriteContext<'_>) -> Result<(), RuntimeError> {
+    fn apply(self: Box<Self>, ctx: &mut ExternalWriteContext<'_>) -> Result<(), CacheError> {
         ctx.clear_value(&self.key)
     }
 }
@@ -305,7 +335,7 @@ impl<T> ExternalWriteOperation for ReplaceArray<T>
 where
     T: Clone + Send + Sync + 'static,
 {
-    fn apply(self: Box<Self>, ctx: &mut ExternalWriteContext<'_>) -> Result<(), RuntimeError> {
+    fn apply(self: Box<Self>, ctx: &mut ExternalWriteContext<'_>) -> Result<(), CacheError> {
         ctx.replace_array(&self.key, self.items)
     }
 }
@@ -319,7 +349,7 @@ impl<T> ExternalWriteOperation for PushArray<T>
 where
     T: Clone + Send + Sync + 'static,
 {
-    fn apply(self: Box<Self>, ctx: &mut ExternalWriteContext<'_>) -> Result<(), RuntimeError> {
+    fn apply(self: Box<Self>, ctx: &mut ExternalWriteContext<'_>) -> Result<(), CacheError> {
         ctx.push_array(&self.key, self.items)
     }
 }
@@ -334,7 +364,7 @@ impl<T> ExternalWriteOperation for InsertArray<T>
 where
     T: Clone + Send + Sync + 'static,
 {
-    fn apply(self: Box<Self>, ctx: &mut ExternalWriteContext<'_>) -> Result<(), RuntimeError> {
+    fn apply(self: Box<Self>, ctx: &mut ExternalWriteContext<'_>) -> Result<(), CacheError> {
         ctx.insert_array(&self.key, self.index, self.items)
     }
 }
@@ -349,7 +379,7 @@ impl<T> ExternalWriteOperation for ReplaceArrayRange<T>
 where
     T: Clone + Send + Sync + 'static,
 {
-    fn apply(self: Box<Self>, ctx: &mut ExternalWriteContext<'_>) -> Result<(), RuntimeError> {
+    fn apply(self: Box<Self>, ctx: &mut ExternalWriteContext<'_>) -> Result<(), CacheError> {
         ctx.replace_array_range(&self.key, self.range, self.items)
     }
 }
@@ -363,7 +393,7 @@ impl<T> ExternalWriteOperation for RemoveArrayRange<T>
 where
     T: Clone + Send + Sync + 'static,
 {
-    fn apply(self: Box<Self>, ctx: &mut ExternalWriteContext<'_>) -> Result<(), RuntimeError> {
+    fn apply(self: Box<Self>, ctx: &mut ExternalWriteContext<'_>) -> Result<(), CacheError> {
         ctx.remove_array_range(&self.key, self.range)
     }
 }
@@ -376,7 +406,7 @@ impl<T> ExternalWriteOperation for ClearArray<T>
 where
     T: Clone + Send + Sync + 'static,
 {
-    fn apply(self: Box<Self>, ctx: &mut ExternalWriteContext<'_>) -> Result<(), RuntimeError> {
+    fn apply(self: Box<Self>, ctx: &mut ExternalWriteContext<'_>) -> Result<(), CacheError> {
         ctx.clear_array(&self.key)
     }
 }
