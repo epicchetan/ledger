@@ -41,6 +41,7 @@ enum StoreSubcommand {
     Delete(StoreShowArgs),
     LocalStatus,
     LocalPrune,
+    Sync(StoreSyncArgs),
     Validate(StoreValidateArgs),
 }
 
@@ -76,6 +77,14 @@ struct StoreImportFileArgs {
     media_type: Option<String>,
     #[arg(long, default_value = "{}")]
     metadata_json: String,
+}
+
+#[derive(Args, Clone)]
+struct StoreSyncArgs {
+    #[arg(long)]
+    overwrite: bool,
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Args, Clone)]
@@ -152,6 +161,12 @@ async fn run_store_command(ledger_store: R2Store, command: StoreCommand) -> Resu
         }
         StoreSubcommand::LocalPrune => {
             let report = ledger_store.enforce_local_limit(None)?;
+            print_json(&report)?;
+        }
+        StoreSubcommand::Sync(args) => {
+            let report = ledger_store
+                .sync_registry(args.overwrite, args.dry_run)
+                .await?;
             print_json(&report)?;
         }
         StoreSubcommand::Validate(args) => {

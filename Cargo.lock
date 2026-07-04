@@ -1667,6 +1667,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ledger-remux"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "dotenvy",
+ "serde",
+ "serde_json",
+ "store",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"

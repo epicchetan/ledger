@@ -1,0 +1,648 @@
+use crate::error::RpcError;
+use crate::hydrate::HydrateJobs;
+use crate::rpc::{OutboundSender, Request};
+use chrono::{DateTime, SecondsFormat, Utc};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::Value;
+use store::{
+    DeleteObjectReport, LocalObjectEntry, LocalStoreStatus, ObjectFilter, RemoteObjectLocation,
+    RemoteStore, Store, StoreObjectDescriptor, StoreObjectId, StoreObjectRole,
+};
+
+const PING_METHOD: &str = "remux/ledger/ping";
+const STORE_LIST_METHOD: &str = "remux/ledger/store/list";
+const STORE_GET_METHOD: &str = "remux/ledger/store/get";
+const STORE_DELETE_METHOD: &str = "remux/ledger/store/delete";
+const STORE_HYDRATE_METHOD: &str = "remux/ledger/store/hydrate";
+const STORE_LOCAL_STATUS_METHOD: &str = "remux/ledger/store/localStatus";
+
+#[derive(Clone)]
+pub struct LedgerRemux<S: RemoteStore + 'static> {
+    store: Store<S>,
+    hydrate_jobs: HydrateJobs,
+    output_tx: OutboundSender,
+}
+
+impl<S: RemoteStore + 'static> LedgerRemux<S> {
+    pub fn new(store: Store<S>, output_tx: OutboundSender) -> Self {
+        Self {
+            store,
+            hydrate_jobs: HydrateJobs::default(),
+            output_tx,
+        }
+    }
+
+    pub async fn handle(&self, request: Request) -> Result<Value, RpcError> {
+        match request.method.as_str() {
+            PING_METHOD => to_value(PingDto {
+                ok: true,
+                service: "ledger-remux".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            }),
+            STORE_LIST_METHOD => self.list_store_objects(request.params),
+            STORE_GET_METHOD => self.get_store_object(request.params),
+            STORE_DELETE_METHOD => self.delete_store_object(request.params).await,
+            STORE_HYDRATE_METHOD => self.hydrate_store_object(request.params),
+            STORE_LOCAL_STATUS_METHOD => self.local_status(),
+            method => Err(RpcError::method_not_found(method)),
+        }
+    }
+
+    fn list_store_objects(&self, params: Value) -> Result<Value, RpcError> {
+        let params = parse_params::<StoreListParams>(params)?;
+        let objects = self
+            .store
+            .list_objects(object_filter(params)?)?
+            .into_iter()
+            .map(StoreObjectDto::from)
+            .collect::<Vec<_>>();
+        to_value(StoreListResultDto { objects })
+    }
+
+    fn get_store_object(&self, params: Value) -> Result<Value, RpcError> {
+        let params = parse_params::<IdParams>(params)?;
+        let id = parse_object_id(&params.id)?;
+        let object = self
+            .store
+            .get_object(&id)?
+            .map(StoreObjectDto::from)
+            .ok_or_else(|| RpcError::object_not_found(&params.id))?;
+        to_value(StoreGetResultDto { object })
+    }
+
+    async fn delete_store_object(&self, params: Value) -> Result<Value, RpcError> {
+        let params = parse_params::<IdParams>(params)?;
+        let id = parse_object_id(&params.id)?;
+        let report = self.store.delete_object(&id).await?;
+        if !report.descriptor_removed {
+            return Err(RpcError::object_not_found(&params.id));
+        }
+        to_value(DeleteReportDto::from(report))
+    }
+
+    fn hydrate_store_object(&self, params: Value) -> Result<Value, RpcError> {
+        let params = parse_params::<IdParams>(params)?;
+        let id = parse_object_id(&params.id)?;
+        if self.store.get_object(&id)?.is_none() {
+            return Err(RpcError::object_not_found(&params.id));
+        }
+        let response = self
+            .hydrate_jobs
+            .start(self.store.clone(), id, self.output_tx.clone())?;
+        to_value(response)
+    }
+
+    fn local_status(&self) -> Result<Value, RpcError> {
+        to_value(LocalStatusDto::from(self.store.local_status()?))
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PingDto {
+    ok: bool,
+    service: String,
+    version: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoreListParams {
+    role: Option<String>,
+    kind: Option<String>,
+    id_prefix: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IdParams {
+    id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoreListResultDto {
+    objects: Vec<StoreObjectDto>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoreGetResultDto {
+    object: StoreObjectDto,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoreObjectDto {
+    id: String,
+    role: String,
+    kind: String,
+    file_name: String,
+    content_sha256: String,
+    size_bytes: u64,
+    format: Option<String>,
+    media_type: Option<String>,
+    remote: Option<StoreRemoteObjectDto>,
+    local: Option<LocalStoreObjectDto>,
+    lineage: Vec<String>,
+    metadata_json: Value,
+    created_at_ns: String,
+    created_at_iso: String,
+    updated_at_ns: String,
+    updated_at_iso: String,
+    last_accessed_at_ns: Option<String>,
+    last_accessed_at_iso: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoreRemoteObjectDto {
+    bucket: String,
+    key: String,
+    size_bytes: u64,
+    sha256: Option<String>,
+    etag: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalStoreObjectDto {
+    relative_path: String,
+    size_bytes: u64,
+    last_accessed_at_ns: String,
+    last_accessed_at_iso: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteReportDto {
+    id: Option<String>,
+    descriptor_removed: bool,
+    remote_object_deleted: bool,
+    remote_descriptor_deleted: bool,
+    local_deleted: bool,
+    remote_key: Option<String>,
+    remote_descriptor_key: Option<String>,
+    local_path: Option<String>,
+    bytes_deleted: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalStatusDto {
+    root: String,
+    local_objects: usize,
+    size_bytes: u64,
+    max_bytes: u64,
+}
+
+impl From<StoreObjectDescriptor> for StoreObjectDto {
+    fn from(descriptor: StoreObjectDescriptor) -> Self {
+        Self {
+            id: descriptor.id.to_string(),
+            role: descriptor.role.as_str().to_string(),
+            kind: descriptor.kind,
+            file_name: descriptor.file_name,
+            content_sha256: descriptor.content_sha256,
+            size_bytes: descriptor.size_bytes,
+            format: descriptor.format,
+            media_type: descriptor.media_type,
+            remote: descriptor.remote.map(StoreRemoteObjectDto::from),
+            local: descriptor.local.map(LocalStoreObjectDto::from),
+            lineage: descriptor
+                .lineage
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect(),
+            metadata_json: descriptor.metadata_json,
+            created_at_ns: ns_string(descriptor.created_at_ns),
+            created_at_iso: ns_iso(descriptor.created_at_ns),
+            updated_at_ns: ns_string(descriptor.updated_at_ns),
+            updated_at_iso: ns_iso(descriptor.updated_at_ns),
+            last_accessed_at_ns: descriptor.last_accessed_at_ns.map(ns_string),
+            last_accessed_at_iso: descriptor.last_accessed_at_ns.map(ns_iso),
+        }
+    }
+}
+
+impl From<RemoteObjectLocation> for StoreRemoteObjectDto {
+    fn from(remote: RemoteObjectLocation) -> Self {
+        Self {
+            bucket: remote.bucket,
+            key: remote.key,
+            size_bytes: remote.size_bytes,
+            sha256: remote.sha256,
+            etag: remote.etag,
+        }
+    }
+}
+
+impl From<LocalObjectEntry> for LocalStoreObjectDto {
+    fn from(local: LocalObjectEntry) -> Self {
+        Self {
+            relative_path: local.relative_path.display().to_string(),
+            size_bytes: local.size_bytes,
+            last_accessed_at_ns: ns_string(local.last_accessed_at_ns),
+            last_accessed_at_iso: ns_iso(local.last_accessed_at_ns),
+        }
+    }
+}
+
+impl From<DeleteObjectReport> for DeleteReportDto {
+    fn from(report: DeleteObjectReport) -> Self {
+        Self {
+            id: report.id.map(|id| id.to_string()),
+            descriptor_removed: report.descriptor_removed,
+            remote_object_deleted: report.remote_object_deleted,
+            remote_descriptor_deleted: report.remote_descriptor_deleted,
+            local_deleted: report.local_deleted,
+            remote_key: report.remote_key,
+            remote_descriptor_key: report.remote_descriptor_key,
+            local_path: report.local_path.map(|path| path.display().to_string()),
+            bytes_deleted: report.bytes_deleted,
+        }
+    }
+}
+
+impl From<LocalStoreStatus> for LocalStatusDto {
+    fn from(status: LocalStoreStatus) -> Self {
+        Self {
+            root: status.root.display().to_string(),
+            local_objects: status.local_objects,
+            size_bytes: status.size_bytes,
+            max_bytes: status.max_bytes,
+        }
+    }
+}
+
+fn parse_params<T: DeserializeOwned>(params: Value) -> Result<T, RpcError> {
+    let params = if params.is_null() {
+        serde_json::json!({})
+    } else {
+        params
+    };
+    serde_json::from_value(params).map_err(|err| RpcError::invalid_params(err.to_string()))
+}
+
+fn parse_object_id(value: &str) -> Result<StoreObjectId, RpcError> {
+    StoreObjectId::new(value.to_string())
+        .map_err(|err| RpcError::invalid_object_id(value, err.to_string()))
+}
+
+fn object_filter(params: StoreListParams) -> Result<ObjectFilter, RpcError> {
+    Ok(ObjectFilter {
+        role: params
+            .role
+            .as_deref()
+            .map(StoreObjectRole::parse)
+            .transpose()
+            .map_err(|err| RpcError::invalid_params(err.to_string()))?,
+        kind: params.kind,
+        id_prefix: params.id_prefix,
+    })
+}
+
+fn to_value<T: Serialize>(value: T) -> Result<Value, RpcError> {
+    serde_json::to_value(value).map_err(|err| RpcError::domain(err.to_string()))
+}
+
+fn ns_string(ns: u64) -> String {
+    ns.to_string()
+}
+
+fn ns_iso(ns: u64) -> String {
+    ns_to_datetime(ns).to_rfc3339_opts(SecondsFormat::Nanos, true)
+}
+
+fn ns_to_datetime(ns: u64) -> DateTime<Utc> {
+    let secs = (ns / 1_000_000_000) as i64;
+    let nanos = (ns % 1_000_000_000) as u32;
+    DateTime::<Utc>::from_timestamp(secs, nanos).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::{INVALID_PARAMS, METHOD_NOT_FOUND};
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use store::{ObjectMetadata, RegisterFileRequest, RemoteObject, StoreConfig};
+    use tempfile::{tempdir, TempDir};
+    use tokio::io::AsyncWriteExt;
+    use tokio::sync::mpsc;
+
+    #[derive(Clone, Default)]
+    struct TestRemote {
+        bucket: String,
+        objects: Arc<Mutex<HashMap<String, (Vec<u8>, ObjectMetadata)>>>,
+    }
+
+    impl TestRemote {
+        fn new() -> Self {
+            Self {
+                bucket: "test-bucket".to_string(),
+                objects: Arc::new(Mutex::new(HashMap::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RemoteStore for TestRemote {
+        async fn put_path(
+            &self,
+            key: &str,
+            path: &Path,
+            metadata: &ObjectMetadata,
+        ) -> anyhow::Result<RemoteObject> {
+            let bytes = tokio::fs::read(path).await?;
+            self.put_bytes(key, &bytes, metadata).await
+        }
+
+        async fn get_to_path(&self, key: &str, dest: &Path) -> anyhow::Result<RemoteObject> {
+            let (bytes, metadata) = self
+                .objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing object {key}"))?;
+            if let Some(parent) = dest.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            let mut file = tokio::fs::File::create(dest).await?;
+            file.write_all(&bytes).await?;
+            file.sync_all().await?;
+            Ok(remote_object(
+                &self.bucket,
+                key,
+                bytes.len() as u64,
+                &metadata,
+            ))
+        }
+
+        async fn head(&self, key: &str) -> anyhow::Result<Option<RemoteObject>> {
+            Ok(self
+                .objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .map(|(bytes, metadata)| {
+                    remote_object(&self.bucket, key, bytes.len() as u64, metadata)
+                }))
+        }
+
+        async fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.objects.lock().unwrap().remove(key);
+            Ok(())
+        }
+
+        async fn put_bytes(
+            &self,
+            key: &str,
+            bytes: &[u8],
+            metadata: &ObjectMetadata,
+        ) -> anyhow::Result<RemoteObject> {
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), (bytes.to_vec(), metadata.clone()));
+            Ok(remote_object(
+                &self.bucket,
+                key,
+                bytes.len() as u64,
+                metadata,
+            ))
+        }
+
+        async fn get_bytes(&self, key: &str) -> anyhow::Result<Vec<u8>> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .map(|(bytes, _)| bytes.clone())
+                .ok_or_else(|| anyhow::anyhow!("missing object {key}"))
+        }
+
+        async fn list_keys(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+            Ok(self
+                .objects
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|key| key.starts_with(prefix))
+                .cloned()
+                .collect())
+        }
+
+        fn bucket(&self) -> &str {
+            &self.bucket
+        }
+    }
+
+    fn remote_object(
+        bucket: &str,
+        key: &str,
+        size_bytes: u64,
+        metadata: &ObjectMetadata,
+    ) -> RemoteObject {
+        RemoteObject {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            size_bytes,
+            sha256: Some(metadata.sha256.clone()),
+            etag: None,
+            metadata: metadata.user_metadata.clone(),
+        }
+    }
+
+    fn open_methods(data: &TempDir) -> LedgerRemux<TestRemote> {
+        let store = Store::open(
+            data.path(),
+            StoreConfig {
+                local_max_bytes: 1024,
+            },
+            Arc::new(TestRemote::new()),
+        )
+        .unwrap();
+        let (output_tx, _output_rx) = mpsc::channel(8);
+        LedgerRemux::new(store, output_tx)
+    }
+
+    async fn register_object(
+        methods: &LedgerRemux<TestRemote>,
+        data: &TempDir,
+        role: StoreObjectRole,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> StoreObjectDescriptor {
+        let source = data.path().join(file_name);
+        tokio::fs::write(&source, bytes).await.unwrap();
+        methods
+            .store
+            .register_file(RegisterFileRequest {
+                path: &source,
+                role,
+                kind: "runtime.artifact".to_string(),
+                file_name: None,
+                format: None,
+                media_type: None,
+                lineage: Vec::new(),
+                metadata_json: json!({}),
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn unknown_method_returns_method_not_found() {
+        let data = tempdir().unwrap();
+        let methods = open_methods(&data);
+
+        let err = methods
+            .handle(Request {
+                method: "remux/ledger/missing".to_string(),
+                params: Value::Null,
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, METHOD_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn invalid_params_return_invalid_params() {
+        let data = tempdir().unwrap();
+        let methods = open_methods(&data);
+
+        let err = methods
+            .handle(Request {
+                method: STORE_LIST_METHOD.to_string(),
+                params: json!({ "role": "bogus" }),
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn invalid_object_id_returns_invalid_params_with_id() {
+        let data = tempdir().unwrap();
+        let methods = open_methods(&data);
+
+        let err = methods
+            .handle(Request {
+                method: STORE_GET_METHOD.to_string(),
+                params: json!({ "id": "bad" }),
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(err.data, Some(json!({ "id": "bad" })));
+    }
+
+    #[tokio::test]
+    async fn list_maps_filters_and_returns_wrapped_objects() {
+        let data = tempdir().unwrap();
+        let methods = open_methods(&data);
+        register_object(
+            &methods,
+            &data,
+            StoreObjectRole::Raw,
+            "raw.bin",
+            b"raw bytes",
+        )
+        .await;
+        register_object(
+            &methods,
+            &data,
+            StoreObjectRole::Artifact,
+            "artifact.bin",
+            b"artifact bytes",
+        )
+        .await;
+
+        let result = methods
+            .handle(Request {
+                method: STORE_LIST_METHOD.to_string(),
+                params: json!({ "role": "raw" }),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result["objects"].as_array().unwrap().len(), 1);
+        assert_eq!(result["objects"][0]["role"], "raw");
+        assert!(result["objects"][0].get("fileName").is_some());
+        assert!(result["objects"][0].get("file_name").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_returns_object_not_found_for_unknown_id() {
+        let data = tempdir().unwrap();
+        let methods = open_methods(&data);
+        let id = format!("sha256-{}", "0".repeat(64));
+
+        let err = methods
+            .handle(Request {
+                method: STORE_GET_METHOD.to_string(),
+                params: json!({ "id": id }),
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.message, "objectNotFound");
+    }
+
+    #[tokio::test]
+    async fn delete_reports_removal() {
+        let data = tempdir().unwrap();
+        let methods = open_methods(&data);
+        let descriptor = register_object(
+            &methods,
+            &data,
+            StoreObjectRole::Artifact,
+            "delete.bin",
+            b"delete bytes",
+        )
+        .await;
+
+        let result = methods
+            .handle(Request {
+                method: STORE_DELETE_METHOD.to_string(),
+                params: json!({ "id": descriptor.id.to_string() }),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result["descriptorRemoved"], true);
+        assert_eq!(result["remoteObjectDeleted"], true);
+    }
+
+    #[tokio::test]
+    async fn hydrate_returns_already_local_for_valid_local_object() {
+        let data = tempdir().unwrap();
+        let methods = open_methods(&data);
+        let descriptor = register_object(
+            &methods,
+            &data,
+            StoreObjectRole::Artifact,
+            "hydrate.bin",
+            b"hydrate bytes",
+        )
+        .await;
+
+        let result = methods
+            .handle(Request {
+                method: STORE_HYDRATE_METHOD.to_string(),
+                params: json!({ "id": descriptor.id.to_string() }),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result, json!({ "alreadyLocal": true, "started": false }));
+    }
+}

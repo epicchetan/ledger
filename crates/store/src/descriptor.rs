@@ -150,6 +150,22 @@ pub struct LocalStorePruneReport {
     pub removed: Vec<RemoveLocalObjectReport>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct RegistrySyncReport {
+    pub dry_run: bool,
+    pub scanned: usize,
+    pub added: Vec<StoreObjectId>,
+    pub overwritten: Vec<StoreObjectId>,
+    pub skipped: Vec<StoreObjectId>,
+    pub failed: Vec<RegistrySyncFailure>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RegistrySyncFailure {
+    pub key: String,
+    pub error: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectValidationStatus {

@@ -1,0 +1,22 @@
+[package]
+name = "ledger-remux"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ledger-remux"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+dotenvy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+store = { path = "../store" }
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tempfile.workspace = true

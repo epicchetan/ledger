@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "id": "ledger",
+  "name": "Ledger",
+  "display": {
+    "title": "Ledger",
+    "icon": "assets/remux/ledger.png"
+  },
+  "server": {
+    "transport": "stdio",
+    "command": "cargo",
+    "args": ["run", "--quiet", "-p", "ledger-remux", "--"],
+    "cwd": "."
+  },
+  "views": {
+    "main": {
+      "route": "/viewers/ledger",
+      "entry": "lens/dist/index.html"
+    }
+  },
+  "launchers": [
+    {
+      "id": "data-center",
+      "view": "main",
+      "label": "Ledger"
+    }
+  ],
+  "fileHandlers": []
+}

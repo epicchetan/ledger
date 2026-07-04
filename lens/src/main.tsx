@@ -1,19 +1,8 @@
-import { StrictMode } from "react"
-import { createRoot } from "react-dom/client"
+import { initializeIpc } from "@remux/viewer-kit/ipc"
+import { mountViewer } from "@remux/viewer-kit/react"
+import "@remux/viewer-kit/ui/styles.css"
 
+import App from "./App"
 import "./index.css"
-import App from "./App.tsx"
-import { ThemeProvider } from "@/components/theme-provider"
 
-createRoot(document.getElementById("root")!).render(
-  <StrictMode>
-    <ThemeProvider
-      attribute="class"
-      defaultTheme="system"
-      enableSystem
-      disableTransitionOnChange
-    >
-      <App />
-    </ThemeProvider>
-  </StrictMode>
-)
+mountViewer(<App />, { name: "ledger", initialize: initializeIpc })

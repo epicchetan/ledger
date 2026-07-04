@@ -32,6 +32,8 @@ pub trait RemoteStore: Send + Sync {
         bytes: &[u8],
         metadata: &ObjectMetadata,
     ) -> Result<RemoteObject>;
+    async fn get_bytes(&self, key: &str) -> Result<Vec<u8>>;
+    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>>;
     fn bucket(&self) -> &str;
 }
 
@@ -388,6 +390,56 @@ impl RemoteStore for R2RemoteStore {
             etag: out.e_tag().map(str::to_string),
             metadata: Self::metadata_map(metadata),
         })
+    }
+
+    async fn get_bytes(&self, key: &str) -> Result<Vec<u8>> {
+        let client = self.client().await?.clone();
+        let out = client
+            .get_object()
+            .bucket(self.bucket())
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("reading s3://{}/{}", self.bucket(), key))?;
+        let bytes = out
+            .body
+            .collect()
+            .await
+            .with_context(|| format!("reading body of s3://{}/{}", self.bucket(), key))?;
+        Ok(bytes.into_bytes().to_vec())
+    }
+
+    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>> {
+        let client = self.client().await?.clone();
+        let mut keys = Vec::new();
+        let mut continuation: Option<String> = None;
+        loop {
+            let mut req = client
+                .list_objects_v2()
+                .bucket(self.bucket())
+                .prefix(prefix);
+            if let Some(token) = &continuation {
+                req = req.continuation_token(token);
+            }
+            let out = req
+                .send()
+                .await
+                .with_context(|| format!("listing s3://{}/{}", self.bucket(), prefix))?;
+            for object in out.contents() {
+                if let Some(key) = object.key() {
+                    keys.push(key.to_string());
+                }
+            }
+            continuation = if out.is_truncated().unwrap_or(false) {
+                out.next_continuation_token().map(str::to_string)
+            } else {
+                None
+            };
+            if continuation.is_none() {
+                break;
+            }
+        }
+        Ok(keys)
     }
 
     fn bucket(&self) -> &str {

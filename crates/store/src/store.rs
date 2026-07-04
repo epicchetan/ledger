@@ -3,20 +3,31 @@ use crate::{
     sanitize_file_name, sha256_bytes, sha256_file, DeleteObjectReport, HydratedObject,
     JsonObjectRegistry, LocalStore, LocalStorePruneReport, LocalStoreStatus, ObjectFilter,
     ObjectMetadata, ObjectValidationReport, ObjectValidationStatus, R2Config, R2RemoteStore,
-    RegisterFileRequest, RemoteObjectLocation, RemoteStore, RemoveLocalObjectReport, StoreConfig,
-    StoreObjectDescriptor, StoreObjectId, StoreObjectRole, StoreValidationReport,
+    RegisterFileRequest, RegistrySyncFailure, RegistrySyncReport, RemoteObjectLocation,
+    RemoteStore, RemoveLocalObjectReport, StoreConfig, StoreObjectDescriptor, StoreObjectId,
+    StoreObjectRole, StoreValidationReport,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-#[derive(Clone)]
 pub struct Store<S: RemoteStore + 'static> {
     local: LocalStore,
     registry: JsonObjectRegistry,
     remote: Arc<S>,
     config: StoreConfig,
+}
+
+impl<S: RemoteStore + 'static> Clone for Store<S> {
+    fn clone(&self) -> Self {
+        Self {
+            local: self.local.clone(),
+            registry: self.registry.clone(),
+            remote: self.remote.clone(),
+            config: self.config.clone(),
+        }
+    }
 }
 
 pub type R2Store = Store<R2RemoteStore>;
@@ -133,6 +144,28 @@ impl<S: RemoteStore + 'static> Store<S> {
 
     pub fn get_object(&self, id: &StoreObjectId) -> Result<Option<StoreObjectDescriptor>> {
         self.registry.get(id)
+    }
+
+    pub fn touch_valid_local_copy(&self, id: &StoreObjectId) -> Result<bool> {
+        let mut descriptor = self
+            .registry
+            .get(id)?
+            .ok_or_else(|| anyhow!("store object {id} not found"))?;
+
+        let Some(local) = &descriptor.local else {
+            return Ok(false);
+        };
+
+        let path = self.local.absolute_from_root(&local.relative_path);
+        if !local_path_valid(&descriptor, &path)? {
+            return Ok(false);
+        }
+
+        let now = crate::now_ns();
+        descriptor.last_accessed_at_ns = Some(now);
+        descriptor.local = Some(local_entry(&self.local, &path, descriptor.size_bytes)?);
+        self.registry.put(&descriptor)?;
+        Ok(true)
     }
 
     pub async fn hydrate(&self, id: &StoreObjectId) -> Result<HydratedObject> {
@@ -359,6 +392,81 @@ impl<S: RemoteStore + 'static> Store<S> {
         Ok(Ok(()))
     }
 
+    pub async fn sync_registry(
+        &self,
+        overwrite: bool,
+        dry_run: bool,
+    ) -> Result<RegistrySyncReport> {
+        let mut report = RegistrySyncReport {
+            dry_run,
+            ..Default::default()
+        };
+        for key in self.remote.list_keys(REGISTRY_MIRROR_PREFIX).await? {
+            if !key.ends_with(".json") {
+                continue;
+            }
+            report.scanned += 1;
+            match self
+                .sync_mirrored_descriptor(&key, overwrite, dry_run)
+                .await
+            {
+                Ok(SyncOutcome::Added(id)) => report.added.push(id),
+                Ok(SyncOutcome::Overwritten(id)) => report.overwritten.push(id),
+                Ok(SyncOutcome::Skipped(id)) => report.skipped.push(id),
+                Err(error) => report.failed.push(RegistrySyncFailure {
+                    key,
+                    error: format!("{error:#}"),
+                }),
+            }
+        }
+        Ok(report)
+    }
+
+    async fn sync_mirrored_descriptor(
+        &self,
+        key: &str,
+        overwrite: bool,
+        dry_run: bool,
+    ) -> Result<SyncOutcome> {
+        let bytes = self.remote.get_bytes(key).await?;
+        let mut descriptor: StoreObjectDescriptor = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing descriptor mirror {key}"))?;
+        let expected_key = descriptor_key(&descriptor.id);
+        if expected_key != key {
+            bail!(
+                "descriptor mirror {key} declares id {} which maps to {expected_key}",
+                descriptor.id
+            );
+        }
+
+        let existing = self.registry.get(&descriptor.id)?;
+        if existing.is_some() && !overwrite {
+            return Ok(SyncOutcome::Skipped(descriptor.id.clone()));
+        }
+
+        // The mirror carries the registering machine's local-copy state; keep a
+        // local entry only when the bytes actually validate on this machine.
+        let mirror_local = descriptor.local.take();
+        let existing_local = existing.as_ref().and_then(|current| current.local.clone());
+        for candidate in existing_local.into_iter().chain(mirror_local) {
+            let path = self.local.absolute_from_root(&candidate.relative_path);
+            if local_path_valid(&descriptor, &path)? {
+                descriptor.local = Some(candidate);
+                break;
+            }
+        }
+
+        let outcome = if existing.is_some() {
+            SyncOutcome::Overwritten(descriptor.id.clone())
+        } else {
+            SyncOutcome::Added(descriptor.id.clone())
+        };
+        if !dry_run {
+            self.registry.put(&descriptor)?;
+        }
+        Ok(outcome)
+    }
+
     pub fn local_status(&self) -> Result<LocalStoreStatus> {
         local_status(&self.local, &self.registry, self.config.local_max_bytes)
     }
@@ -449,6 +557,14 @@ fn validation_report(
         remote_valid,
         issues,
     }
+}
+
+const REGISTRY_MIRROR_PREFIX: &str = "store/registry/objects/";
+
+enum SyncOutcome {
+    Added(StoreObjectId),
+    Overwritten(StoreObjectId),
+    Skipped(StoreObjectId),
 }
 
 fn object_object_key(id: &StoreObjectId, file_name: &str) -> String {

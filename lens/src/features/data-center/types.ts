@@ -28,6 +28,7 @@ export interface StoreObject {
   metadataJson: unknown
   createdAt: string
   updatedAt: string
+  updatedAtMs: number
   lastAccessedAt: string | null
 }
 
@@ -36,6 +37,8 @@ export interface StoreObjectFilters {
   kind: string
   idPrefix: string
 }
+
+export type ObjectSortKey = "updated" | "size" | "name" | "kind"
 
 export interface DeleteStoreObjectReport {
   id: string | null
@@ -47,6 +50,26 @@ export interface DeleteStoreObjectReport {
   remoteDescriptorKey: string | null
   localPath: string | null
   bytesDeleted: number
+}
+
+export interface HydrateStoreObjectResult {
+  started: boolean
+  alreadyLocal?: boolean
+}
+
+export interface HydratedStoreObjectEvent {
+  id: string
+  ok: boolean
+  error?: string
+}
+
+export interface LocalStoreStatus {
+  root: string
+  localObjects: number
+  sizeBytes: number
+  maxBytes: number
+  size: string
+  max: string
 }
 
 export interface DataCenterLoadState {

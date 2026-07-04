@@ -301,7 +301,7 @@ The cache can be deleted. Durable raw and replay artifacts remain in R2, with SQ
 The foundation currently includes:
 
 ```text
-Data Center API and Lens surface
+Data Center store surface through CLI, API, and Remux
 SQLite control plane + R2 durable object storage
 raw/replay layer separation
 validation and trust summaries
@@ -351,9 +351,10 @@ docs/study_graph_phased_implementation.md
 crates/store           generic object registry, R2 persistence, local cache
 crates/cache           standalone typed active state cells
 crates/runtime         generic projection scheduler over cache
-crates/api             HTTP transport adapter for Lens
+crates/api             HTTP transport adapter, kept working during the Remux transition
 crates/cli             terminal adapter for store operations
-lens                   web operating surface
+crates/remux           stdio JSON-RPC adapter for Remux
+lens                   Remux viewer for the Data Center surface
 ```
 
 ## CLI Examples
@@ -368,6 +369,9 @@ cargo run -p ledger-cli -- store import-file \
   --role raw \
   --kind databento.dbn.zst
 
+# Pull descriptor mirrors from R2 into the local registry (fresh machine)
+cargo run -p ledger-cli -- store sync
+
 # Hydrate a cached local copy
 cargo run -p ledger-cli -- store hydrate --id sha256-...
 
@@ -377,15 +381,39 @@ cargo run -p ledger-cli -- store delete --id sha256-...
 
 ## Lens
 
+Lens is now the Ledger Remux viewer. It is built as static assets and talks to
+`ledger-remux` through Remux IPC, not directly to `ledger-api` over HTTP.
+
 ```bash
 cd lens
 npm install
+npm run build
+```
+
+Then register the ledger parent directory in `<remux>/.remux/config.toml`
+and start Remux:
+
+```toml
+extension_roots = ["extensions", "<parent-of-ledger>"]
+```
+
+```bash
+cd <remux>
 npm run dev
 ```
 
-Lens currently exposes the Data Center object explorer. It can list and delete
-store objects through `ledger-api`; data preparation, feeds, runtime sessions,
-charts, and journal workflows are later layers.
+The ledger repository root is the extension directory; `extension_roots`
+entries are parent directories scanned for children containing
+`remux-extension.json`, and configured roots replace the default, so
+`"extensions"` must stay listed (`REMUX_EXTENSION_ROOTS` remains an
+environment override). The built viewer entry is `lens/dist/index.html`.
+The implementation boundary is documented in
+`docs/remux_extension_implementation_spec.md`.
+
+Lens currently exposes the Data Center object explorer. It can list, filter,
+delete, hydrate, and report local store status through `ledger-remux`; data
+preparation, feeds, runtime sessions, charts, and journal workflows are later
+layers.
 
 ## Philosophy
 

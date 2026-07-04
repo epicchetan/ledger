@@ -1,169 +1,179 @@
+import {
+  requestIpc,
+  subscribeIpcEvents,
+  type JsonRpcMessage,
+} from "@remux/viewer-kit/ipc"
+
 import type {
   DeleteStoreObjectReport,
+  HydratedStoreObjectEvent,
+  HydrateStoreObjectResult,
   LocalStoreObject,
+  LocalStoreStatus,
   StoreObject,
   StoreObjectFilters,
   StoreRemoteObject,
 } from "@/features/data-center/types"
 
-const API_BASE = import.meta.env.VITE_LEDGER_API_URL ?? "http://127.0.0.1:3001"
-const REQUEST_TIMEOUT_MS = 20_000
+interface StoreListResult {
+  objects: RemuxStoreObject[]
+}
 
-interface ApiStoreObject {
+interface StoreDeleteResult {
+  id: string | null
+  descriptorRemoved: boolean
+  remoteObjectDeleted: boolean
+  remoteDescriptorDeleted: boolean
+  localDeleted: boolean
+  remoteKey: string | null
+  remoteDescriptorKey: string | null
+  localPath: string | null
+  bytesDeleted: number
+}
+
+interface RemuxStoreObject {
   id: string
   role: string
   kind: string
-  file_name: string
-  content_sha256: string
-  size_bytes: number
+  fileName: string
+  contentSha256: string
+  sizeBytes: number
   format: string | null
-  media_type: string | null
-  remote: ApiStoreRemoteObject | null
-  local: ApiLocalStoreObject | null
+  mediaType: string | null
+  remote: RemuxStoreRemoteObject | null
+  local: RemuxLocalStoreObject | null
   lineage: string[]
-  metadata_json: unknown
-  created_at_ns: string
-  created_at_iso: string
-  updated_at_ns: string
-  updated_at_iso: string
-  last_accessed_at_ns: string | null
-  last_accessed_at_iso: string | null
+  metadataJson: unknown
+  createdAtNs: string
+  createdAtIso: string
+  updatedAtNs: string
+  updatedAtIso: string
+  lastAccessedAtNs: string | null
+  lastAccessedAtIso: string | null
 }
 
-interface ApiStoreRemoteObject {
+interface RemuxStoreRemoteObject {
   bucket: string
   key: string
-  size_bytes: number
+  sizeBytes: number
   sha256: string | null
   etag: string | null
 }
 
-interface ApiLocalStoreObject {
-  relative_path: string
-  size_bytes: number
-  last_accessed_at_ns: string
-  last_accessed_at_iso: string
+interface RemuxLocalStoreObject {
+  relativePath: string
+  sizeBytes: number
+  lastAccessedAtNs: string
+  lastAccessedAtIso: string
 }
 
-interface ApiDeleteStoreObjectReport {
-  id: string | null
-  descriptor_removed: boolean
-  remote_object_deleted: boolean
-  remote_descriptor_deleted: boolean
-  local_deleted: boolean
-  remote_key: string | null
-  remote_descriptor_key: string | null
-  local_path: string | null
-  bytes_deleted: number
+export async function fetchStoreObjects(
+  filters: StoreObjectFilters
+): Promise<StoreObject[]> {
+  const result = await requestIpc<StoreListResult>(
+    "remux/ledger/store/list",
+    storeListParams(filters)
+  )
+  return result.objects.map(formatStoreObject)
 }
 
-interface RequestOptions extends RequestInit {
-  emptyBody?: boolean
-}
-
-export async function fetchStoreObjects(filters: StoreObjectFilters): Promise<StoreObject[]> {
-  const params = new URLSearchParams()
-  if (filters.role) params.set("role", filters.role)
-  if (filters.kind) params.set("kind", filters.kind)
-  if (filters.idPrefix) params.set("id_prefix", filters.idPrefix)
-  const suffix = params.size ? `?${params.toString()}` : ""
-  const records = await request<ApiStoreObject[]>(`/store/objects${suffix}`)
-  return records.map(mapStoreObject)
-}
-
-export async function deleteStoreObject(id: string): Promise<DeleteStoreObjectReport> {
-  const report = await request<ApiDeleteStoreObjectReport>(`/store/objects/${encodeURIComponent(id)}`, {
-    method: "DELETE",
-  })
+export async function fetchLocalStatus(): Promise<LocalStoreStatus> {
+  const status = await requestIpc<LocalStoreStatus>(
+    "remux/ledger/store/localStatus"
+  )
   return {
-    id: report.id,
-    descriptorRemoved: report.descriptor_removed,
-    remoteObjectDeleted: report.remote_object_deleted,
-    remoteDescriptorDeleted: report.remote_descriptor_deleted,
-    localDeleted: report.local_deleted,
-    remoteKey: report.remote_key,
-    remoteDescriptorKey: report.remote_descriptor_key,
-    localPath: report.local_path,
-    bytesDeleted: report.bytes_deleted,
+    ...status,
+    size: formatBytes(status.sizeBytes),
+    max: formatBytes(status.maxBytes),
   }
 }
 
-async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const controller = new AbortController()
-  const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
-  let response: Response
+export async function deleteStoreObject(
+  id: string
+): Promise<DeleteStoreObjectReport> {
+  return requestIpc<StoreDeleteResult>("remux/ledger/store/delete", { id })
+}
 
-  try {
-    response = await fetch(`${API_BASE}${path}`, {
-      ...options,
-      signal: options.signal ?? controller.signal,
-    })
-  } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") {
-      throw new Error(`Request timed out after ${REQUEST_TIMEOUT_MS / 1000}s: ${path}`)
+export async function hydrateStoreObject(
+  id: string
+): Promise<HydrateStoreObjectResult> {
+  return requestIpc<HydrateStoreObjectResult>("remux/ledger/store/hydrate", {
+    id,
+  })
+}
+
+export function subscribeHydratedStoreObjects(
+  subscriber: (event: HydratedStoreObjectEvent) => void
+) {
+  return subscribeIpcEvents((events) => {
+    for (const message of events) {
+      const event = parseHydratedEvent(message)
+      if (event) subscriber(event)
     }
-    throw error
-  } finally {
-    window.clearTimeout(timeout)
-  }
-
-  if (!response.ok) {
-    const message = await errorMessage(response)
-    throw new Error(message)
-  }
-
-  if (options.emptyBody) {
-    return undefined as T
-  }
-
-  return (await response.json()) as T
+  })
 }
 
-async function errorMessage(response: Response) {
-  try {
-    const body = (await response.json()) as { error?: string }
-    return body.error ?? `${response.status} ${response.statusText}`
-  } catch {
-    return `${response.status} ${response.statusText}`
+function storeListParams(filters: StoreObjectFilters) {
+  return {
+    ...(filters.role ? { role: filters.role } : {}),
+    ...(filters.kind ? { kind: filters.kind } : {}),
+    ...(filters.idPrefix ? { idPrefix: filters.idPrefix } : {}),
   }
 }
 
-function mapStoreObject(record: ApiStoreObject): StoreObject {
+function parseHydratedEvent(
+  message: JsonRpcMessage
+): HydratedStoreObjectEvent | null {
+  if (message.method !== "remux/ledger/store/hydrated") return null
+  if (!message.params || typeof message.params !== "object") return null
+  const params = message.params as Partial<HydratedStoreObjectEvent>
+  if (typeof params.id !== "string" || typeof params.ok !== "boolean") {
+    return null
+  }
+  return {
+    id: params.id,
+    ok: params.ok,
+    error: typeof params.error === "string" ? params.error : undefined,
+  }
+}
+
+function formatStoreObject(record: RemuxStoreObject): StoreObject {
   return {
     id: record.id,
     role: record.role,
     kind: record.kind,
-    fileName: record.file_name,
-    contentSha256: record.content_sha256,
-    sizeBytes: record.size_bytes,
-    size: formatBytes(record.size_bytes),
+    fileName: record.fileName,
+    contentSha256: record.contentSha256,
+    sizeBytes: record.sizeBytes,
+    size: formatBytes(record.sizeBytes),
     format: record.format,
-    mediaType: record.media_type,
-    remote: record.remote ? mapRemote(record.remote) : null,
-    local: record.local ? mapLocal(record.local) : null,
+    mediaType: record.mediaType,
+    remote: record.remote ? formatRemote(record.remote) : null,
+    local: record.local ? formatLocal(record.local) : null,
     lineage: record.lineage,
-    metadataJson: record.metadata_json,
-    createdAt: formatIso(record.created_at_iso) ?? "-",
-    updatedAt: formatIso(record.updated_at_iso) ?? "-",
-    lastAccessedAt: formatIso(record.last_accessed_at_iso),
+    metadataJson: record.metadataJson,
+    createdAt: formatIso(record.createdAtIso) ?? "-",
+    updatedAt: formatIso(record.updatedAtIso) ?? "-",
+    updatedAtMs: parseIsoMs(record.updatedAtIso),
+    lastAccessedAt: formatIso(record.lastAccessedAtIso),
   }
 }
 
-function mapRemote(remote: ApiStoreRemoteObject): StoreRemoteObject {
+function formatRemote(remote: RemuxStoreRemoteObject): StoreRemoteObject {
   return {
     bucket: remote.bucket,
     key: remote.key,
-    sizeBytes: remote.size_bytes,
+    sizeBytes: remote.sizeBytes,
     sha256: remote.sha256,
     etag: remote.etag,
   }
 }
 
-function mapLocal(local: ApiLocalStoreObject): LocalStoreObject {
+function formatLocal(local: RemuxLocalStoreObject): LocalStoreObject {
   return {
-    relativePath: local.relative_path,
-    sizeBytes: local.size_bytes,
-    lastAccessedAt: formatIso(local.last_accessed_at_iso) ?? "-",
+    relativePath: local.relativePath,
+    sizeBytes: local.sizeBytes,
+    lastAccessedAt: formatIso(local.lastAccessedAtIso) ?? "-",
   }
 }
 
@@ -177,6 +187,12 @@ export function formatBytes(bytes: number) {
   }
   const maximumFractionDigits = unit === 0 ? 0 : value >= 100 ? 1 : 2
   return `${new Intl.NumberFormat("en-US", { maximumFractionDigits }).format(value)} ${units[unit]}`
+}
+
+function parseIsoMs(iso: string | null) {
+  if (!iso) return 0
+  const ms = new Date(iso).getTime()
+  return Number.isNaN(ms) ? 0 : ms
 }
 
 function formatIso(iso: string | null) {
