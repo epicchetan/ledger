@@ -301,7 +301,7 @@ The cache can be deleted. Durable raw and replay artifacts remain in R2, with SQ
 The foundation currently includes:
 
 ```text
-Data Center store surface through CLI, API, and Remux
+Data Center store surface through CLI and Remux
 SQLite control plane + R2 durable object storage
 raw/replay layer separation
 validation and trust summaries
@@ -351,7 +351,6 @@ docs/study_graph_phased_implementation.md
 crates/store           generic object registry, R2 persistence, local cache
 crates/cache           standalone typed active state cells
 crates/runtime         generic projection scheduler over cache
-crates/api             HTTP transport adapter, kept working during the Remux transition
 crates/cli             terminal adapter for store operations
 crates/remux           stdio JSON-RPC adapter for Remux
 lens                   Remux viewer for the Data Center surface
@@ -382,7 +381,7 @@ cargo run -p ledger-cli -- store delete --id sha256-...
 ## Lens
 
 Lens is now the Ledger Remux viewer. It is built as static assets and talks to
-`ledger-remux` through Remux IPC, not directly to `ledger-api` over HTTP.
+`ledger-remux` through Remux IPC.
 
 ```bash
 cd lens

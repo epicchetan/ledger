@@ -1,11 +1,11 @@
 use crate::{
     enforce_local_limit, local_entry, local_path_valid, local_status, remove_local_copy,
     sanitize_file_name, sha256_bytes, sha256_file, DeleteObjectReport, HydratedObject,
-    JsonObjectRegistry, LocalStore, LocalStorePruneReport, LocalStoreStatus, ObjectFilter,
-    ObjectMetadata, ObjectValidationReport, ObjectValidationStatus, R2Config, R2RemoteStore,
-    RegisterFileRequest, RegistrySyncFailure, RegistrySyncReport, RemoteObjectLocation,
-    RemoteStore, RemoveLocalObjectReport, StoreConfig, StoreObjectDescriptor, StoreObjectId,
-    StoreObjectRole, StoreValidationReport,
+    IncompleteMultipartUpload, JsonObjectRegistry, LocalStore, LocalStorePruneReport,
+    LocalStoreStatus, ObjectFilter, ObjectMetadata, ObjectValidationReport, ObjectValidationStatus,
+    R2Config, R2RemoteStore, RegisterFileRequest, RegistrySyncFailure, RegistrySyncReport,
+    RemoteObjectLocation, RemoteStore, RemoveLocalObjectReport, StoreConfig, StoreObjectDescriptor,
+    StoreObjectId, StoreObjectRole, StoreValidationReport,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
@@ -36,6 +36,20 @@ impl R2Store {
     pub async fn from_env(data_dir: impl Into<PathBuf>) -> Result<Self> {
         let remote = Arc::new(R2RemoteStore::new(R2Config::from_env()?).await?);
         Self::open(data_dir, StoreConfig::from_env()?, remote)
+    }
+
+    /// List in-progress multipart uploads in the bucket under `prefix`
+    /// (leftovers from interrupted uploads). Maintenance only.
+    pub async fn list_incomplete_multipart_uploads(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<IncompleteMultipartUpload>> {
+        self.remote.list_incomplete_multipart_uploads(prefix).await
+    }
+
+    /// Abort one incomplete multipart upload by key + uploadId.
+    pub async fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> Result<()> {
+        self.remote.abort_multipart_upload(key, upload_id).await
     }
 }
 
@@ -144,6 +158,22 @@ impl<S: RemoteStore + 'static> Store<S> {
 
     pub fn get_object(&self, id: &StoreObjectId) -> Result<Option<StoreObjectDescriptor>> {
         self.registry.get(id)
+    }
+
+    pub async fn update_metadata(
+        &self,
+        id: &StoreObjectId,
+        metadata_json: serde_json::Value,
+    ) -> Result<StoreObjectDescriptor> {
+        let mut descriptor = self
+            .registry
+            .get(id)?
+            .ok_or_else(|| anyhow!("store object {id} not found"))?;
+        descriptor.metadata_json = metadata_json;
+        descriptor.updated_at_ns = crate::now_ns();
+        self.registry.put(&descriptor)?;
+        self.mirror_descriptor(&descriptor).await?;
+        Ok(descriptor)
     }
 
     pub fn touch_valid_local_copy(&self, id: &StoreObjectId) -> Result<bool> {

@@ -204,16 +204,29 @@ impl R2RemoteStore {
             .to_string();
 
         let mut file = tokio::fs::File::open(path).await?;
+        let part_size = self.inner.config.multipart_part_size_bytes;
         let mut part_number = 1;
         let mut completed = Vec::new();
-        let mut buf = vec![0_u8; self.inner.config.multipart_part_size_bytes];
+        let mut buf = vec![0_u8; part_size];
 
         loop {
-            let n = file.read(&mut buf).await?;
-            if n == 0 {
+            // Fill a whole part before uploading. A single read() may return a
+            // short count (files routinely return well under the buffer size),
+            // and S3/R2 reject any non-final part smaller than 5 MiB with
+            // EntityTooSmall at complete time. Read until the buffer is full or
+            // EOF; only the final part may be short.
+            let mut filled = 0;
+            while filled < part_size {
+                let n = file.read(&mut buf[filled..]).await?;
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+            if filled == 0 {
                 break;
             }
-            let body = ByteStream::from(buf[..n].to_vec());
+            let body = ByteStream::from(buf[..filled].to_vec());
             let part = client
                 .upload_part()
                 .bucket(&bucket)
@@ -243,12 +256,15 @@ impl R2RemoteStore {
                 }
             }
             part_number += 1;
+            if filled < part_size {
+                break;
+            }
         }
 
         let completed_upload = CompletedMultipartUpload::builder()
             .set_parts(Some(completed))
             .build();
-        let out = client
+        let out = match client
             .complete_multipart_upload()
             .bucket(&bucket)
             .key(key)
@@ -256,7 +272,22 @@ impl R2RemoteStore {
             .multipart_upload(completed_upload)
             .send()
             .await
-            .with_context(|| format!("completing multipart upload for s3://{}/{}", bucket, key))?;
+        {
+            Ok(out) => out,
+            Err(err) => {
+                // Don't leak the dangling upload if completion fails.
+                let _ = client
+                    .abort_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .send()
+                    .await;
+                return Err(err).with_context(|| {
+                    format!("completing multipart upload for s3://{}/{}", bucket, key)
+                });
+            }
+        };
 
         Ok(RemoteObject {
             bucket,
@@ -267,6 +298,80 @@ impl R2RemoteStore {
             metadata: Self::metadata_map(metadata),
         })
     }
+
+    /// List every in-progress multipart upload under `prefix` (empty = whole
+    /// bucket). These accumulate when an upload is interrupted before its
+    /// CompleteMultipartUpload; R2 keeps their uploaded parts (and bills for
+    /// them) until each is aborted or a lifecycle rule expires it.
+    pub async fn list_incomplete_multipart_uploads(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<IncompleteMultipartUpload>> {
+        let client = self.client().await?.clone();
+        let bucket = self.bucket().to_string();
+        let mut out = Vec::new();
+        let mut key_marker: Option<String> = None;
+        let mut upload_id_marker: Option<String> = None;
+        loop {
+            let mut req = client.list_multipart_uploads().bucket(&bucket);
+            if !prefix.is_empty() {
+                req = req.prefix(prefix);
+            }
+            if let Some(marker) = &key_marker {
+                req = req.key_marker(marker);
+            }
+            if let Some(marker) = &upload_id_marker {
+                req = req.upload_id_marker(marker);
+            }
+            let resp = req
+                .send()
+                .await
+                .with_context(|| format!("listing multipart uploads for s3://{bucket}"))?;
+            for upload in resp.uploads() {
+                if let (Some(key), Some(upload_id)) = (upload.key(), upload.upload_id()) {
+                    out.push(IncompleteMultipartUpload {
+                        key: key.to_string(),
+                        upload_id: upload_id.to_string(),
+                        initiated: upload.initiated().map(|ts| format!("{ts:?}")),
+                    });
+                }
+            }
+            if resp.is_truncated() == Some(true) {
+                key_marker = resp.next_key_marker().map(str::to_string);
+                upload_id_marker = resp.next_upload_id_marker().map(str::to_string);
+            } else {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Abort one incomplete multipart upload (key + uploadId), freeing its
+    /// uploaded parts. Idempotent from the caller's side: an already-aborted
+    /// or completed upload id returns an error that callers may ignore.
+    pub async fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> Result<()> {
+        let client = self.client().await?.clone();
+        let bucket = self.bucket().to_string();
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .with_context(|| {
+                format!("aborting multipart upload {upload_id} for s3://{bucket}/{key}")
+            })?;
+        Ok(())
+    }
+}
+
+/// An in-progress (incomplete) multipart upload left in the bucket.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct IncompleteMultipartUpload {
+    pub key: String,
+    pub upload_id: String,
+    pub initiated: Option<String>,
 }
 
 #[async_trait]

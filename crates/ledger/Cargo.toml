@@ -1,21 +1,19 @@
 [package]
-name = "ledger-remux"
+name = "ledger"
 version.workspace = true
 edition.workspace = true
-
-[[bin]]
-name = "ledger-remux"
-path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
-dotenvy.workspace = true
-ledger = { path = "../ledger" }
+chrono-tz.workspace = true
+databento.workspace = true
+dbn.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 store = { path = "../store" }
 thiserror.workspace = true
+time.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]

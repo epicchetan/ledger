@@ -1,9 +1,16 @@
 use crate::error::RpcError;
 use crate::hydrate::HydrateJobs;
-use crate::rpc::{OutboundSender, Request};
+use crate::jobs::{JobRecord, JobRegistry, JobStartDto};
+use crate::rpc::{send_notification, OutboundSender, Request};
 use chrono::{DateTime, SecondsFormat, Utc};
+use ledger::feed::es_replay::{
+    es_day_catalog, fetch_es_raw, prepare_es_replay_artifact, EsDayCatalog, EsDayEntry, EsRawState,
+    EsRawStatus, FetchProgress, PrepareProgress,
+};
+use ledger::market::MarketDay;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
+use std::path::PathBuf;
 use store::{
     DeleteObjectReport, LocalObjectEntry, LocalStoreStatus, ObjectFilter, RemoteObjectLocation,
     RemoteStore, Store, StoreObjectDescriptor, StoreObjectId, StoreObjectRole,
@@ -15,20 +22,30 @@ const STORE_GET_METHOD: &str = "remux/ledger/store/get";
 const STORE_DELETE_METHOD: &str = "remux/ledger/store/delete";
 const STORE_HYDRATE_METHOD: &str = "remux/ledger/store/hydrate";
 const STORE_LOCAL_STATUS_METHOD: &str = "remux/ledger/store/localStatus";
+const ES_DAYS_METHOD: &str = "remux/ledger/es/days";
+const ES_PREPARE_METHOD: &str = "remux/ledger/es/prepare";
+const ES_FETCH_METHOD: &str = "remux/ledger/es/fetch";
+const JOBS_LIST_METHOD: &str = "remux/ledger/jobs/list";
+const JOBS_PROGRESS_NOTIFICATION: &str = "remux/ledger/jobs/progress";
+const JOBS_FINISHED_NOTIFICATION: &str = "remux/ledger/jobs/finished";
 
 #[derive(Clone)]
 pub struct LedgerRemux<S: RemoteStore + 'static> {
     store: Store<S>,
     hydrate_jobs: HydrateJobs,
+    jobs: JobRegistry,
     output_tx: OutboundSender,
+    fetch_staging_root: PathBuf,
 }
 
 impl<S: RemoteStore + 'static> LedgerRemux<S> {
-    pub fn new(store: Store<S>, output_tx: OutboundSender) -> Self {
+    pub fn new(store: Store<S>, output_tx: OutboundSender, fetch_staging_root: PathBuf) -> Self {
         Self {
             store,
             hydrate_jobs: HydrateJobs::default(),
+            jobs: JobRegistry::default(),
             output_tx,
+            fetch_staging_root,
         }
     }
 
@@ -44,6 +61,10 @@ impl<S: RemoteStore + 'static> LedgerRemux<S> {
             STORE_DELETE_METHOD => self.delete_store_object(request.params).await,
             STORE_HYDRATE_METHOD => self.hydrate_store_object(request.params),
             STORE_LOCAL_STATUS_METHOD => self.local_status(),
+            ES_DAYS_METHOD => self.es_days(),
+            ES_PREPARE_METHOD => self.prepare_es(request.params),
+            ES_FETCH_METHOD => self.fetch_es(request.params),
+            JOBS_LIST_METHOD => self.jobs_list(),
             method => Err(RpcError::method_not_found(method)),
         }
     }
@@ -95,6 +116,163 @@ impl<S: RemoteStore + 'static> LedgerRemux<S> {
     fn local_status(&self) -> Result<Value, RpcError> {
         to_value(LocalStatusDto::from(self.store.local_status()?))
     }
+
+    fn es_days(&self) -> Result<Value, RpcError> {
+        let catalog =
+            es_day_catalog(&self.store).map_err(|err| RpcError::domain(err.to_string()))?;
+        to_value(EsDayCatalogDto::from(catalog))
+    }
+
+    fn prepare_es(&self, params: Value) -> Result<Value, RpcError> {
+        let params = parse_params::<EsPrepareParams>(params)?;
+        let raw_id = parse_object_id(&params.raw_id)?;
+        let subject = raw_id.to_string();
+        let start = self.jobs.start("es.prepare", &subject)?;
+        if !start.already_running {
+            self.spawn_prepare_job(start.id.clone(), raw_id, params.force.unwrap_or(false));
+        }
+        to_value(JobStartDto::from(start))
+    }
+
+    fn fetch_es(&self, params: Value) -> Result<Value, RpcError> {
+        let params = parse_params::<EsFetchParams>(params)?;
+        let market_day = MarketDay::parse(&params.market_day)
+            .map_err(|err| RpcError::invalid_params(err.to_string()))?;
+        let symbol = params.symbol.trim().to_string();
+        if symbol.is_empty() {
+            return Err(RpcError::invalid_params("symbol is required"));
+        }
+        let dataset = params.dataset.unwrap_or_else(|| "GLBX.MDP3".to_string());
+        let force = params.force.unwrap_or(false);
+        let subject = format!("{market_day} {symbol}");
+        let start = self.jobs.start("es.fetch", &subject)?;
+        if !start.already_running {
+            self.spawn_fetch_job(start.id.clone(), market_day, symbol, dataset, force);
+        }
+        to_value(JobStartDto::from(start))
+    }
+
+    fn jobs_list(&self) -> Result<Value, RpcError> {
+        to_value(JobsListDto {
+            jobs: self.jobs.list()?,
+        })
+    }
+
+    fn spawn_prepare_job(&self, job_id: String, raw_id: StoreObjectId, force: bool) {
+        let store = self.store.clone();
+        let jobs = self.jobs.clone();
+        let output_tx = self.output_tx.clone();
+        let subject = raw_id.to_string();
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let progress_jobs = jobs.clone();
+        let progress_output = output_tx.clone();
+        let progress_job_id = job_id.clone();
+        let progress_subject = subject.clone();
+        tokio::spawn(async move {
+            while let Some(progress) = progress_rx.recv().await {
+                let (stage, records) = prepare_progress_stage(progress);
+                progress_jobs.progress(&progress_job_id, stage.clone(), records);
+                let params = json!({
+                    "jobId": progress_job_id,
+                    "kind": "es.prepare",
+                    "subject": progress_subject,
+                    "stage": stage,
+                    "records": records,
+                });
+                if let Err(error) =
+                    send_notification(&progress_output, JOBS_PROGRESS_NOTIFICATION, params).await
+                {
+                    eprintln!("[ledger-remux] failed to broadcast job progress: {error}");
+                }
+            }
+        });
+        tokio::spawn(async move {
+            let result =
+                prepare_es_replay_artifact(&store, &raw_id, force, Some(progress_tx)).await;
+            match result {
+                Ok(artifact) => {
+                    let summary = match serde_json::to_value(artifact.summary(&raw_id)) {
+                        Ok(summary) => summary,
+                        Err(error) => json!({ "error": error.to_string() }),
+                    };
+                    jobs.complete(&job_id, summary.clone());
+                    send_job_finished(&output_tx, &job_id, true, Some(summary), None).await;
+                }
+                Err(error) => {
+                    let error = error.to_string();
+                    jobs.fail(&job_id, error.clone());
+                    send_job_finished(&output_tx, &job_id, false, None, Some(error)).await;
+                }
+            }
+        });
+    }
+
+    fn spawn_fetch_job(
+        &self,
+        job_id: String,
+        market_day: MarketDay,
+        symbol: String,
+        dataset: String,
+        force: bool,
+    ) {
+        let store = self.store.clone();
+        let jobs = self.jobs.clone();
+        let output_tx = self.output_tx.clone();
+        let subject = format!("{market_day} {symbol}");
+        let staging_dir = self
+            .fetch_staging_root
+            .join(&symbol)
+            .join(market_day.to_string());
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let progress_jobs = jobs.clone();
+        let progress_output = output_tx.clone();
+        let progress_job_id = job_id.clone();
+        let progress_subject = subject.clone();
+        tokio::spawn(async move {
+            while let Some(progress) = progress_rx.recv().await {
+                let stage = fetch_progress_stage(progress);
+                progress_jobs.progress(&progress_job_id, stage.clone(), None);
+                let params = json!({
+                    "jobId": progress_job_id,
+                    "kind": "es.fetch",
+                    "subject": progress_subject,
+                    "stage": stage,
+                });
+                if let Err(error) =
+                    send_notification(&progress_output, JOBS_PROGRESS_NOTIFICATION, params).await
+                {
+                    eprintln!("[ledger-remux] failed to broadcast job progress: {error}");
+                }
+            }
+        });
+        tokio::spawn(async move {
+            let result = fetch_es_raw(
+                &store,
+                market_day,
+                &symbol,
+                &dataset,
+                &staging_dir,
+                force,
+                Some(progress_tx),
+            )
+            .await;
+            match result {
+                Ok(summary) => {
+                    let summary = match serde_json::to_value(summary) {
+                        Ok(summary) => summary,
+                        Err(error) => json!({ "error": error.to_string() }),
+                    };
+                    jobs.complete(&job_id, summary.clone());
+                    send_job_finished(&output_tx, &job_id, true, Some(summary), None).await;
+                }
+                Err(error) => {
+                    let error = error.to_string();
+                    jobs.fail(&job_id, error.clone());
+                    send_job_finished(&output_tx, &job_id, false, None, Some(error)).await;
+                }
+            }
+        });
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -119,6 +297,22 @@ struct IdParams {
     id: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EsPrepareParams {
+    raw_id: String,
+    force: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EsFetchParams {
+    market_day: String,
+    symbol: String,
+    dataset: Option<String>,
+    force: Option<bool>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StoreListResultDto {
@@ -127,8 +321,68 @@ struct StoreListResultDto {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct JobsListDto {
+    jobs: Vec<JobRecord>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct StoreGetResultDto {
     object: StoreObjectDto,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EsDayCatalogDto {
+    days: Vec<EsDayEntryDto>,
+    unassigned: Vec<EsRawStatusDto>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EsDayEntryDto {
+    market_day: String,
+    raws: Vec<EsRawStatusDto>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EsRawStatusDto {
+    raw: StoreObjectDto,
+    artifact: Option<StoreObjectDto>,
+    state: EsRawState,
+}
+
+impl From<EsDayCatalog> for EsDayCatalogDto {
+    fn from(catalog: EsDayCatalog) -> Self {
+        Self {
+            days: catalog.days.into_iter().map(EsDayEntryDto::from).collect(),
+            unassigned: catalog
+                .unassigned
+                .into_iter()
+                .map(EsRawStatusDto::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<EsDayEntry> for EsDayEntryDto {
+    fn from(entry: EsDayEntry) -> Self {
+        Self {
+            market_day: entry.market_day.to_string(),
+            raws: entry.raws.into_iter().map(EsRawStatusDto::from).collect(),
+        }
+    }
+}
+
+impl From<EsRawStatus> for EsRawStatusDto {
+    fn from(status: EsRawStatus) -> Self {
+        Self {
+            raw: StoreObjectDto::from(status.raw),
+            artifact: status.artifact.map(StoreObjectDto::from),
+            state: status.state,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -306,6 +560,41 @@ fn to_value<T: Serialize>(value: T) -> Result<Value, RpcError> {
     serde_json::to_value(value).map_err(|err| RpcError::domain(err.to_string()))
 }
 
+fn prepare_progress_stage(progress: PrepareProgress) -> (String, Option<u64>) {
+    match progress {
+        PrepareProgress::Hydrating => ("hydrating".to_string(), None),
+        PrepareProgress::Decoding { records } => ("decoding".to_string(), Some(records)),
+        PrepareProgress::Encoding { events, .. } => ("encoding".to_string(), Some(events)),
+        PrepareProgress::Registering => ("registering".to_string(), None),
+    }
+}
+
+fn fetch_progress_stage(progress: FetchProgress) -> String {
+    match progress {
+        FetchProgress::Requesting => "requesting".to_string(),
+        FetchProgress::Downloading => "downloading".to_string(),
+        FetchProgress::Registering => "registering".to_string(),
+    }
+}
+
+async fn send_job_finished(
+    output_tx: &OutboundSender,
+    job_id: &str,
+    ok: bool,
+    summary: Option<Value>,
+    error: Option<String>,
+) {
+    let params = json!({
+        "jobId": job_id,
+        "ok": ok,
+        "summary": summary,
+        "error": error,
+    });
+    if let Err(error) = send_notification(output_tx, JOBS_FINISHED_NOTIFICATION, params).await {
+        eprintln!("[ledger-remux] failed to broadcast job completion: {error}");
+    }
+}
+
 fn ns_string(ns: u64) -> String {
     ns.to_string()
 }
@@ -468,7 +757,7 @@ mod tests {
         )
         .unwrap();
         let (output_tx, _output_rx) = mpsc::channel(8);
-        LedgerRemux::new(store, output_tx)
+        LedgerRemux::new(store, output_tx, data.path().join("tmp").join("fetch"))
     }
 
     async fn register_object(
@@ -578,6 +867,67 @@ mod tests {
         assert_eq!(result["objects"][0]["role"], "raw");
         assert!(result["objects"][0].get("fileName").is_some());
         assert!(result["objects"][0].get("file_name").is_none());
+    }
+
+    #[tokio::test]
+    async fn es_days_returns_camel_case_dtos() {
+        let data = tempdir().unwrap();
+        let methods = open_methods(&data);
+        let source = data.path().join("es-raw.dbn.zst");
+        tokio::fs::write(&source, b"es raw bytes").await.unwrap();
+        methods
+            .store
+            .register_file(RegisterFileRequest {
+                path: &source,
+                role: StoreObjectRole::Raw,
+                kind: "databento.dbn.zst".to_string(),
+                file_name: None,
+                format: None,
+                media_type: None,
+                lineage: Vec::new(),
+                metadata_json: json!({
+                    "market_day": "2026-03-10",
+                    "source_symbol": "ESH6",
+                }),
+            })
+            .await
+            .unwrap();
+        let unassigned_source = data.path().join("es-raw-unassigned.dbn.zst");
+        tokio::fs::write(&unassigned_source, b"unassigned raw bytes")
+            .await
+            .unwrap();
+        methods
+            .store
+            .register_file(RegisterFileRequest {
+                path: &unassigned_source,
+                role: StoreObjectRole::Raw,
+                kind: "databento.dbn.zst".to_string(),
+                file_name: None,
+                format: None,
+                media_type: None,
+                lineage: Vec::new(),
+                metadata_json: json!({ "source_symbol": "ESH6" }),
+            })
+            .await
+            .unwrap();
+
+        let result = methods
+            .handle(Request {
+                method: ES_DAYS_METHOD.to_string(),
+                params: Value::Null,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result["days"].as_array().unwrap().len(), 1);
+        assert_eq!(result["days"][0]["marketDay"], "2026-03-10");
+        assert_eq!(result["days"][0]["raws"][0]["state"], "unprepared");
+        let raw = &result["days"][0]["raws"][0]["raw"];
+        assert!(raw.get("fileName").is_some());
+        assert!(raw.get("file_name").is_none());
+        assert!(raw.get("sizeBytes").is_some());
+        assert!(raw["createdAtNs"].is_string());
+        assert_eq!(result["unassigned"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

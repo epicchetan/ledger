@@ -2,476 +2,388 @@
 
 ## Purpose
 
-This spec defines the first implementation of Ledger feeds after the
-`cache`/`runtime` split.
+Run the ES replay feed as a live emitter: a session clock in a cache cell,
+an `EsReplayFeed` runtime process that emits MBO exchange batches as they
+become due at session time, and a session wrapper the CLI (and later remux)
+drives.
 
-The goal is to introduce a new `ledger` crate that owns concrete feed workers,
-shared playback controls, ES replay startup preparation, and application
-composition around the generic `runtime` crate.
-
-The important boundary:
+This is the third phase of the feed build. Prerequisites, each with its own
+spec, must land first:
 
 ```text
-store
-  durable raw files and generated artifacts
+1. docs/cache_watch_implementation_spec.md
+   Cache::watch_key — park a task until a cell changes; no polling
 
-cache
-  active typed cells
-
-runtime
-  applies queued external write batches
-  schedules projections from changed keys
-
-ledger
-  concrete feeds
-  concrete market payloads
-  playback controls
-  session wiring
-  feed-owned startup preparation
+2. docs/es_data_management_implementation_spec.md
+   crates/ledger feed module: DBN -> validated es_mbo_event_store artifact,
+   market_day stamping, CLI `es prepare`, proven against the real raws
 ```
 
-`runtime` should not learn what replay, play, pause, speed, DBN, CME, ES, or MBO
-mean. It should continue to receive `ExternalWriteBatch` values and run
-projections from changed cache keys.
+This phase adds the process half on top of the module half. The DBN
+pipeline, codec, artifact rules, market-day contract, and Legacy Reference
+live in the data-management spec and are not repeated here.
+
+The boundary:
+
+```text
+store    durable raw files and generated artifacts
+cache    active typed cells + change watches
+runtime  external write application, task scheduling, process lifecycle
+         UNCHANGED by this spec
+ledger   session clock state, feed process, session wiring
+```
+
+The correctness constraints live in the base crates (cell ownership, write
+application, scheduling, lifecycle, watches); the app layer stays free.
+Feeds decide for themselves how to react to what they observe.
 
 ## Scope
 
-Implement the first `ledger` crate with:
-
 ```text
-shared playback state:
-  play
-  pause
-  playback speed
+session clock as a cell:
+  ClockState anchors in a session-owned `session.clock` value cell
+  written only on transitions by the session owner through external writes
+  play / pause / set_speed / seek_to (forward AND backward)
 
-feed worker infrastructure:
-  async feed tasks
-  runtime-owned write ingress
-  shutdown signaling
+ES replay feed process:
+  RuntimeProcess implementation over the prepared artifact
+  feed-owned pacing via clock-cell watches and exact wall deadlines
+  regression (backward seek) handling with an epoch contract
 
-ES replay feed:
-  hydrate a raw Databento DBN object from store
-  lazily build or reuse feed-owned replay artifacts
-  emit ES MBO exchange batches according to playback state
-  write feed state through ExternalWriteBatch
+session wrapper:
+  builder + handle owning the RuntimeWorker join and clock transitions
 
 CLI validation:
-  run a headless ES replay session from a store raw object
-  optionally prepare artifacts only
-  print JSON summaries for agentic validation
+  headless run; deterministic step mode with no wall sleeps and no polling
 ```
 
-Out of scope for this phase:
+Out of scope:
 
 ```text
-execution simulation
-order book reconstruction
-book validation
-Lens chart/session UI
-websocket frames
-seeking
-per-feed command enums
-multiple concurrently controlled sessions in API
-live market adapters
-0DTE feeds
+execution simulation, order book, book validation
+bars and other task components
+market-day catalog / days list / acquisition (delivered by the
+  data-management phase, alongside the Lens Days screen)
+Lens chart/session UI, websocket frames, user-facing seek UI
+multiple concurrent sessions
+live market adapters, 0DTE feeds
 feed checkpoint persistence
 memory-mapped artifact reads
 ```
 
-The previous replay system had useful DBN preparation logic. This phase keeps
-the useful part, but moves ownership into the ES replay feed startup path.
+## Crate Additions
 
-## Crate
-
-Add:
-
-```text
-crates/ledger
-```
-
-Package and library crate name:
-
-```text
-ledger
-```
-
-Workspace update:
-
-```toml
-[workspace]
-members = [
-    "crates/cache",
-    "crates/runtime",
-    "crates/store",
-    "crates/ledger",
-    "crates/api",
-    "crates/cli",
-]
-```
-
-Dependencies:
+`crates/ledger` (from the data-management phase) gains dependencies and
+modules:
 
 ```toml
 [dependencies]
-anyhow.workspace = true
 async-trait.workspace = true
 cache = { path = "../cache" }
 runtime = { path = "../runtime" }
-serde.workspace = true
-serde_json.workspace = true
-store = { path = "../store" }
-thiserror.workspace = true
-tokio.workspace = true
-dbn.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
 ```
-
-Add workspace dependency:
-
-```toml
-dbn = "0.55"
-```
-
-## Module Layout
-
-Recommended layout:
 
 ```text
 crates/ledger/src/
-  lib.rs
-  error.rs
-  playback.rs
+  clock.rs             ClockState, ClockMode, ClockSnapshot, pure helpers
+  session.rs           LedgerSessionBuilder, LedgerSessionHandle
+  feed/es_replay/
+    feed.rs            EsReplayFeed (RuntimeProcess implementation)
+    cells.rs           EsReplayCells
+
+crates/ledger/tests/
+  clock.rs
+  es_replay_feed.rs
   session.rs
-  feed/
-    mod.rs
-    context.rs
-    es_replay/
-      mod.rs
-      artifact.rs
-      cells.rs
-      codec.rs
-      dbn.rs
-      feed.rs
-  market/
-    mod.rs
-    es_mbo.rs
 ```
 
-Test layout:
+## Feed Module vs Feed Process
+
+Recap of the split (defined in the data-management spec):
 
 ```text
-crates/ledger/tests/
-  artifact_codec.rs
-  es_replay_prepare.rs
-  es_replay_feed.rs
-  playback.rs
-  session.rs
+feed module     free functions over &Store<S>; no session, no runtime
+feed process    the emitter instantiated into a session (this spec)
+```
+
+Feeds do not accept methods, commands, or RPC. Control is cell state: the
+session owner writes the clock cell, and feeds converge on what they
+observe. The rule:
+
+```text
+processes emit domain data
+control is cell state written by the session owner
+observation is cells: watch to wake, read to know
+lifecycle is runtime commands
+queries and jobs are module functions
 ```
 
 ## Core Flow
 
-The headless ES replay session should behave like this:
-
 ```text
-1. CLI/API asks Ledger to start ES replay for a raw store object id.
+1. CLI/transport asks Ledger to start ES replay for a raw store object id.
 2. Ledger creates Cache.
-3. Ledger registers ES replay feed cells.
-4. Ledger creates Runtime over that Cache.
-5. Ledger registers projections later when they exist.
-6. Ledger creates shared PlaybackController.
-7. Ledger starts runtime scheduling through runtime APIs.
-8. Ledger starts EsReplayFeed worker.
-9. EsReplayFeed hydrates the raw object through store.
-10. EsReplayFeed finds or builds its event-store artifact.
-11. EsReplayFeed opens the artifact.
-12. Playback starts or remains paused depending on configuration.
-13. EsReplayFeed emits ExternalWriteBatch values according to its own pacing.
-14. Runtime receives feed writes through its generic external-write path.
-15. Runtime applies queued writes, schedules projections, and drains projection work.
+3. Ledger registers the session.clock cell (session owner) and the ES
+   replay feed cells (feed owner).
+4. Ledger spawns RuntimeWorker::run, keeping the RuntimeHandle and worker join.
+5. Ledger publishes the initial ClockState (paused at session time 0)
+   through the external write path.
+6. Ledger installs EsReplayFeed through RuntimeHandle::install_process.
+7. Ledger installs task components later when they exist.
+8. EsReplayFeed::prepare loads the artifact via the module's prepare
+   (building it if this raw was never prepared).
+9. The runtime marks the feed Running and spawns EsReplayFeed::run.
+10. EsReplayFeed::run publishes initial cursor/status, then parks on the
+    clock cell watch.
+11. The session owner writes clock transitions (seek_to first batch ts,
+    then play or step).
+12. The feed wakes on each clock write, emits every batch due at session
+    time, and publishes cursor/status with each emission.
+13. The worker applies feed writes as they arrive and runs task components
+    to idle; cursor watchers (step driver, transport) wake in turn.
 ```
 
-Ledger does not need to protect projections from overwritten value
-cells. Cell semantics should be chosen correctly by the feed and projections.
+## Session Clock
 
-If a feed wants every emitted exchange batch to be available to projections, it
-should write an array cell. If a feed writes a value cell, overwrite behavior is
-the intended behavior of that cell.
-
-## Feed Batch Semantics
-
-The current runtime has an internal external-write queue and applies all queued
-external writes before running one projection. That remains acceptable for the
-feed system.
-
-The runtime does not semantically combine feed batches. It applies queued writes
-in FIFO order and records changed keys. The chosen cache primitive determines
-what projections see:
+Session time is a shared mapping owned by the session, not by feeds. The
+clock is **state in a cell**, not an object with an API and not a ticker:
 
 ```text
-Value<T>
-  current state
-  repeated writes overwrite previous values
-  appropriate for status, cursor, latest quote, current mode
-
-Array<T>
-  ordered collection
-  pushed writes accumulate
-  appropriate when projections may need every emitted item
+cell:   session.clock          Value<ClockState>
+owner:  session                (the session owner's CellOwner)
+reads:  public
+writes: only the session owner, only on transitions
 ```
 
-For ES replay, delivered exchange batches should use an array:
+Nothing ever ticks it. `ClockState` holds anchors; current time is computed
+by whoever reads it:
 
 ```text
-feed.databento.es_replay.batches
+paused:  now = anchor_session_ns
+running: now = anchor_session_ns + (wall_now - anchor_wall) * speed
 ```
 
-Projections that consume this array own their own progress cursor in projection
-state. The runtime should not introduce a generic feed cursor abstraction.
-
-The ES replay feed can still publish value cells for current state:
-
-```text
-feed.databento.es_replay.cursor
-feed.databento.es_replay.status
-```
-
-## Playback Model
-
-Playback is shared Ledger session state, not a runtime concept.
+Transitions are pushed (one cell write re-anchoring the mapping), time is
+pulled (computed on read). Between transitions the clock has zero activity.
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PlaybackMode {
-    Playing,
+pub enum ClockMode {
     Paused,
+    Running,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PlaybackState {
-    pub mode: PlaybackMode,
+/// Cell payload. Cells are in-process typed values, so the wall anchor is
+/// a plain Instant; ClockState is deliberately NOT serializable.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClockState {
+    pub mode: ClockMode,
     pub speed: f64,
+    pub anchor_session_ns: u64,
+    pub anchor_wall: std::time::Instant,
     pub revision: u64,
+}
+
+/// Derived, serializable view for status cells, CLI output, and transport.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClockSnapshot {
+    pub mode: ClockMode,
+    pub speed: f64,
+    pub session_now_ns: u64,
+    pub revision: u64,
+}
+```
+
+`clock.rs` provides pure helpers, no machinery:
+
+```rust
+impl ClockState {
+    pub fn initial() -> Self;                       // paused at 0, speed 1.0
+    pub fn now_ns(&self) -> u64;
+    pub fn snapshot(&self) -> ClockSnapshot;
+    /// Wall instant at which session time reaches target, if running.
+    pub fn wall_deadline(&self, target_ns: u64) -> Option<std::time::Instant>;
+    pub fn play(&self) -> ClockState;               // re-anchor transitions
+    pub fn pause(&self) -> ClockState;
+    pub fn with_speed(&self, speed: f64) -> Result<ClockState, LedgerError>;
+    pub fn seek_to(&self, session_ns: u64) -> ClockState;
 }
 ```
 
 Rules:
 
 ```text
-default mode: paused
-default speed: 1.0
-speed must be finite and greater than 0
-every state update increments revision
+initial state: paused at session time 0, speed 1.0
+speed must be finite and greater than 0 (validated by the writer)
+every transition re-anchors and increments revision
+seek_to may move session time forward OR backward — regression is legal
+  state; what it means is each feed's own business
+the clock never reads feed data and never waits for feeds
 ```
 
-Use `tokio::sync::watch`:
+Because the cell is owned by the session owner, "feeds never write clock
+state" is not a discipline rule — the cache's ownership enforcement makes a
+feed write to `session.clock` a hard error. The constraint lives in the
+base crate.
 
-```rust
-pub struct PlaybackController {
-    tx: watch::Sender<PlaybackState>,
-}
+Single-writer discipline: only the session handle performs transitions, and
+it performs them serially, so read-modify-write races on the clock cell do
+not arise.
 
-#[derive(Clone)]
-pub struct PlaybackReceiver {
-    rx: watch::Receiver<PlaybackState>,
-}
-```
+Missing-cell rule: a feed that reads `session.clock` before the initial
+publish treats `None` as `ClockState::initial()`.
 
-Controller methods:
+Clock transitions and data writes flow through the same FIFO external-write
+path, so components and watchers observe time changes and data changes in
+one consistent order.
 
-```rust
-impl PlaybackController {
-    pub fn state(&self) -> PlaybackState;
-    pub fn subscribe(&self) -> PlaybackReceiver;
-    pub fn play(&self) -> Result<(), LedgerError>;
-    pub fn pause(&self) -> Result<(), LedgerError>;
-    pub fn set_speed(&self, speed: f64) -> Result<(), LedgerError>;
-}
-```
-
-Feed behavior:
+Drivers are just write patterns, not machinery:
 
 ```text
-paused:
-  do not emit exchange batches
-
-playing:
-  emit the next exchange batch when source-time pacing says it is due
-
-speed changed:
-  recompute remaining sleep against the latest playback state
-
-shutdown:
-  exit cleanly
+realtime playback     play/pause/set_speed transitions; session time then
+                      advances continuously by definition (no writes)
+deterministic step    seek_to(next_due_ts) repeatedly; no wall sleeps
+live (future)         a driver keeps anchors pinned to wall time; the feed
+                      contract is unchanged
 ```
 
-The first batch after play can emit immediately. Later batches are paced from
-the previous emitted source timestamp:
+## Feed Processes
+
+Feeds are runtime processes. The component runtime already owns the
+execution model — `RuntimeProcess` with a prepare/run lifecycle,
+`ProcessContext` with owner-attributed writes and cache reads, runtime-owned
+shutdown, statuses, and joins. Ledger must not define a second feed worker
+abstraction (no `LedgerFeed` trait, no `FeedContext`, no ledger-owned
+shutdown or join plumbing for feeds).
 
 ```text
-wall_delay = source_timestamp_delta / speed
+runtime owns
+  install_process / stop_process / component_status
+  ComponentStatus: Preparing -> Running -> Completed / Failed
+  ProcessContext: batch()/submit(), read_value/read_array, cache(), shutdown()
+  per-process join handling and worker shutdown
+
+cache owns
+  cell ownership enforcement (who may write which cell)
+  change watches (how a parked process wakes)
+
+ledger owns
+  concrete feed structs implementing RuntimeProcess
+  the domain dependencies each feed carries as fields
+  each feed's own pacing, catch-up, and regression behavior
 ```
 
-For example:
-
-```text
-source delta: 100 ms
-speed: 1.0
-wall delay: 100 ms
-
-source delta: 100 ms
-speed: 10.0
-wall delay: 10 ms
-```
-
-The feed should wait in a way that can react to playback changes and shutdown.
-Use `tokio::select!` around sleep, playback `changed()`, and shutdown.
-
-## Feed Infrastructure
-
-Feeds are Ledger workers. They are not runtime projections and they do not write
-the cache directly.
-
-The first generic feed trait can live in `ledger`:
+A feed is a struct implementing `runtime::RuntimeProcess` that carries its
+domain dependencies as fields:
 
 ```rust
-#[async_trait]
-pub trait LedgerFeed<S>: Send + 'static
+pub struct EsReplayFeed<S>
 where
     S: store::RemoteStore + 'static,
 {
-    fn id(&self) -> &FeedId;
-
-    async fn run(self: Box<Self>, ctx: FeedContext<S>) -> Result<(), FeedError>;
+    descriptor: runtime::ComponentDescriptor,
+    raw_object_id: store::StoreObjectId,
+    store: Arc<store::Store<S>>,
+    clock_key: cache::ValueKey<ClockState>,
+    cells: EsReplayCells,
 }
 ```
 
-`FeedId` should be a thin validated id:
-
-```rust
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct FeedId(cache::Key);
-```
+There is no clock channel and no clock receiver: the feed reads the clock
+cell through `ProcessContext` like any other cell and parks on
+`ctx.cache().watch_key(...)` when it has nothing to do.
 
 For the first feed:
 
 ```text
-feed id: feed.databento.es_replay
-owner:   CellOwner::new(feed_id.as_str())
+component id: feed.databento.es_replay
+kind:         ComponentKind::Process
+owner:        ComponentId::owner(), also used when registering the feed cells
 ```
 
-`FeedContext`:
+Lifecycle mapping:
 
-```rust
-pub struct FeedContext<S>
-where
-    S: store::RemoteStore + 'static,
-{
-    feed_id: FeedId,
-    store: Arc<store::Store<S>>,
-    cache: FeedCacheReader,
-    writes: runtime::ExternalWriteSink,
-    playback: PlaybackReceiver,
-    shutdown: ShutdownReceiver,
-}
+```text
+RuntimeProcess::prepare
+  call the module's prepare_es_replay_artifact, decode the artifact
+  runtime reports ComponentStatus::Preparing while this runs
+
+RuntimeProcess::run
+  publish initial cursor/status, then the clock-observing emission loop
+  the process exits only on shutdown (see End Behavior — a feed that has
+  emitted everything parks rather than completing, so a backward seek can
+  revive it)
+
+domain errors
+  map into ComponentError::Message at the trait boundary
+  the runtime surfaces them as ComponentStatus::Failed
 ```
 
-Public methods:
-
-```rust
-impl<S> FeedContext<S>
-where
-    S: store::RemoteStore + 'static,
-{
-    pub fn feed_id(&self) -> &FeedId;
-    pub fn owner(&self) -> cache::CellOwner;
-    pub fn store(&self) -> &store::Store<S>;
-    pub fn playback(&self) -> &PlaybackReceiver;
-    pub fn shutdown(&self) -> &ShutdownReceiver;
-
-    pub fn batch(&self) -> runtime::ExternalWriteBatch;
-
-    pub async fn submit(
-        &self,
-        batch: runtime::ExternalWriteBatch,
-    ) -> Result<(), FeedError>;
-
-    pub fn read_value<T>(
-        &self,
-        key: &cache::ValueKey<T>,
-    ) -> Result<Option<T>, FeedError>
-    where
-        T: Clone + Send + Sync + 'static;
-
-    pub fn read_array<T>(
-        &self,
-        key: &cache::ArrayKey<T>,
-    ) -> Result<Vec<T>, FeedError>
-    where
-        T: Clone + Send + Sync + 'static;
-}
-```
-
-`FeedCacheReader` should wrap `Cache` and expose reads only. Do not hand feeds a
-raw `Cache` unless an implementation detail makes it unavoidable.
-
-`FeedContext::batch()` creates:
-
-```rust
-ExternalWriteBatch::new(self.owner())
-```
-
-That keeps `CellOwner` mechanics out of concrete feed code.
+`ProcessContext::batch()` already creates owner-attributed
+`ExternalWriteBatch` values and `submit` routes them through the runtime
+ingress, so ledger adds no write plumbing of its own.
 
 ## Runtime Boundary
 
-`runtime` owns external-write queueing and projection scheduling. Ledger should
-not implement a second scheduler.
+The runtime is an actor and is **unchanged by this spec**. `Runtime` is the
+synchronous core (cache write application plus task scheduling);
+`RuntimeWorker` wraps it in a single event loop selecting over a command
+channel, the external-write channel, and internal lifecycle events;
+`RuntimeHandle` is the cloneable client.
 
-The current runtime already has the core synchronous boundary:
-
-```rust
-runtime.submit_external_writes(batch);
-runtime.run_once();
-runtime.run_until_idle(max_steps);
-```
-
-If async feed tasks need a send handle, add the generic ingress to the `runtime`
-crate, not to `ledger`:
-
-```rust
-pub struct RuntimeWorker {
-    runtime: Runtime,
-    writes: ExternalWriteReceiver,
-}
-
-#[derive(Clone)]
-pub struct ExternalWriteSink {
-    // runtime-owned ingress handle
-}
-```
-
-Generic behavior:
+The handle bundles the planes of the system:
 
 ```text
-receive external writes
-submit them into Runtime
-run the scheduler
-publish diagnostics if needed
+control      commands over mpsc with oneshot replies — lifecycle only
+             install_process / install_task / stop_process /
+             component_status / drain / shutdown
+data in      a clone of the ExternalWriteSink
+data out     a clone of the Cache: direct reads plus watch_key
 ```
 
-This remains domain-agnostic. The runtime worker should not know about feeds,
-playback, ES, DBN, or replay. From runtime's perspective, a feed write is just
-an `ExternalWriteBatch`.
+Load-bearing worker behavior: when a write batch arrives, the worker
+immediately applies it and runs task components to idle. Applying the write
+bumps cell generations, which wakes parked watchers. Nobody polls anything,
+anywhere:
 
-For the first CLI validation, it is acceptable to use the existing synchronous
-runtime directly if that is simpler. The important boundary is that scheduler
-policy belongs to `runtime`, while feed source behavior belongs to `ledger`.
+```text
+driver writes clock cell -> worker applies -> feed's clock watch wakes ->
+feed emits -> worker applies -> cursor generation bumps -> driver's cursor
+watch wakes
+```
+
+Every hop is a direct scheduler wakeup.
+
+Synchronization rule: lifecycle flows through commands, data through
+writes, observation through cells. Synchronization is a form of
+observation, so it rides cell watches — never the command channel. `Drain`
+only runs work already queued inside the runtime; it cannot see an emission
+a feed has not submitted yet, so it is never a barrier.
+
+Feed processes submit through their `ProcessContext`; non-process writers
+(the session owner's clock transitions, future transports) use
+`RuntimeHandle::external_write_sink()`. Do not add a second ingress in
+`ledger`, and do not implement a second scheduler.
+
+## Feed Batch Semantics
+
+The runtime does not semantically combine feed batches. It applies queued
+writes in FIFO order and records changed keys. The chosen cache primitive
+determines what components see:
+
+```text
+Value<T>   current state; writes overwrite       clock, cursor, status
+Array<T>   ordered collection; pushes accumulate, batches
+           owner may replace/truncate/clear
+```
+
+For ES replay, delivered exchange batches use the array cell
+`feed.databento.es_replay.batches`. Components that consume it own their
+own progress cursor in component state, and reset it when the feed's
+`epoch` changes (see Regression). The runtime should not introduce a
+generic feed cursor abstraction.
 
 ## Session Shape
-
-`ledger` should expose a builder plus a handle.
 
 ```rust
 pub struct LedgerSessionBuilder<S>
@@ -480,9 +392,7 @@ where
 {
     store: Arc<store::Store<S>>,
     cache: cache::Cache,
-    runtime: runtime::Runtime,
-    playback: PlaybackController,
-    feeds: Vec<Box<dyn LedgerFeed<S>>>,
+    feeds: Vec<Box<dyn runtime::RuntimeProcess>>,
 }
 ```
 
@@ -490,12 +400,12 @@ Builder responsibilities:
 
 ```text
 create cache
+register the session.clock cell under the session owner
 register feed cells
-create runtime
-register projections when available
-add feeds
-start runtime-owned worker or use runtime's synchronous loop
-spawn feed tasks
+spawn RuntimeWorker::run, keeping the RuntimeHandle and the worker JoinHandle
+publish the initial ClockState through the external write path
+install feed processes through install_process
+install task components when available
 return session handle
 ```
 
@@ -503,84 +413,48 @@ Handle:
 
 ```rust
 pub struct LedgerSessionHandle {
-    playback: PlaybackController,
-    cache: cache::Cache,
-    shutdown: ShutdownController,
-    join_handles: Vec<JoinHandle<Result<(), LedgerError>>>,
+    runtime: runtime::RuntimeHandle,
+    worker: JoinHandle<Result<(), runtime::RuntimeError>>,
+    clock_key: cache::ValueKey<ClockState>,
+    clock_writes: runtime::ExternalWriteSink,   // session-owner attributed
 }
-```
 
-Handle methods:
-
-```rust
 impl LedgerSessionHandle {
     pub fn cache(&self) -> &cache::Cache;
-    pub fn playback_state(&self) -> PlaybackState;
-    pub fn play(&self) -> Result<(), LedgerError>;
-    pub fn pause(&self) -> Result<(), LedgerError>;
-    pub fn set_speed(&self, speed: f64) -> Result<(), LedgerError>;
+    pub fn runtime(&self) -> &runtime::RuntimeHandle;
+    pub fn clock_snapshot(&self) -> Result<ClockSnapshot, LedgerError>;
+
+    pub async fn play(&self) -> Result<(), LedgerError>;
+    pub async fn pause(&self) -> Result<(), LedgerError>;
+    pub async fn set_speed(&self, speed: f64) -> Result<(), LedgerError>;
+    pub async fn seek_to(&self, session_ns: u64) -> Result<(), LedgerError>;
+
     pub async fn shutdown(self) -> Result<(), LedgerError>;
 }
 ```
 
-No API-level session registry is required in this first crate implementation.
-The CLI can create one session, run it, print a report, then shut it down.
+The transition methods are thin: read the current clock cell, apply the
+matching pure `ClockState` helper, submit one `set_value` write through the
+session-owner sink. They are the only clock writers in the system.
 
-## ES MBO Market Types
+`shutdown()` first awaits `RuntimeHandle::shutdown()` — the worker signals
+every process, waits for them to stop, and applies final writes before
+replying — and then awaits the worker JoinHandle, which is where
+worker-level errors and panics surface (a worker that dies mid-run drops
+the shutdown reply; only the join holds the real error). Ledger keeps no
+per-feed shutdown channels or joins — the worker owns those. The one join
+the session owns is the RuntimeWorker task.
 
-Add the first concrete market payloads inside `ledger`, not `cache` or
-`runtime`.
+No session registry is required in this phase. The CLI creates one session,
+runs it, prints a report, and shuts it down. The future remux transport
+holds one `LedgerSessionHandle` in its state (one active session, per the
+vision).
+
+## Process Payload Types
+
+Added to `market/es_mbo.rs` alongside the data-phase types:
 
 ```rust
-pub type UnixNanos = u64;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PriceTicks(pub i64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BookSide {
-    Bid,
-    Ask,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BookAction {
-    Add,
-    Modify,
-    Cancel,
-    Clear,
-    Trade,
-    Fill,
-    None,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EsMboEvent {
-    pub ts_event_ns: UnixNanos,
-    pub ts_recv_ns: UnixNanos,
-    pub sequence: u64,
-    pub action: BookAction,
-    pub side: Option<BookSide>,
-    pub price_ticks: Option<PriceTicks>,
-    pub size: u32,
-    pub order_id: u64,
-    pub flags: u8,
-    pub is_last: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EsMboBatchSpan {
-    pub start_idx: usize,
-    pub end_idx: usize,
-    pub ts_event_ns: UnixNanos,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EsMboEventStore {
-    pub events: Vec<EsMboEvent>,
-    pub batches: Vec<EsMboBatchSpan>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EsMboFeedBatch {
     pub feed_seq: u64,
@@ -593,6 +467,7 @@ pub struct EsMboFeedBatch {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EsReplayCursor {
+    pub epoch: u64,
     pub feed_seq: u64,
     pub batch_idx: usize,
     pub total_batches: usize,
@@ -605,17 +480,12 @@ pub struct EsReplayCursor {
 pub struct EsReplayStatus {
     pub raw_object_id: String,
     pub artifact_object_id: Option<String>,
-    pub playback: PlaybackState,
+    pub clock: ClockSnapshot,
     pub cursor: EsReplayCursor,
 }
 ```
 
-This is intentionally not a revived `domain` crate. These are concrete Ledger
-feed payloads.
-
 ## ES Replay Cells
-
-Add a helper that registers the cells used by the first feed.
 
 ```rust
 pub struct EsReplayCells {
@@ -625,260 +495,91 @@ pub struct EsReplayCells {
 }
 ```
 
-Cell descriptors:
-
 ```text
-owner:
-  feed.databento.es_replay
-
-keys:
-  feed.databento.es_replay.batches
-  feed.databento.es_replay.cursor
-  feed.databento.es_replay.status
+owner:  feed.databento.es_replay
+keys:   feed.databento.es_replay.batches   public read: false
+        feed.databento.es_replay.cursor    public read: true
+        feed.databento.es_replay.status    public read: true
 ```
 
-Recommended public-read flags:
+`batches` is the dependency key for components that need the replay MBO
+stream. `cursor` and `status` are the public observability surface — the
+step driver, CLI, and future transport wake on their watches and read them
+to synchronize and report.
 
-```text
-batches: false
-cursor: true
-status: true
-```
+## ES Replay Feed Behavior
 
-`batches` is the dependency key for projections that need the replay MBO stream.
-Those projections should keep their own consumed index if they only want newly
-emitted batches.
-
-`cursor` and `status` are useful for CLI/API visibility.
-
-## ES Replay Artifact
-
-The old implementation wrote separate artifacts:
-
-```text
-events.v1.bin
-batches.v1.bin
-trades.v1.bin
-book_check.v1.json
-```
-
-The new first version should write one feed-owned artifact:
-
-```text
-kind:      ledger.es_mbo_event_store.v1
-role:      artifact
-file_name: es-mbo-event-store.v1.bin
-lineage:   [<raw object id>]
-```
-
-This artifact contains:
-
-```text
-normalized ES MBO events
-exchange batch spans
-source metadata in descriptor metadata_json
-```
-
-Do not include:
-
-```text
-trade index
-book check
-execution state
-visibility frames
-projection outputs
-```
-
-Those can return behind later feeds/projections/simulators.
-
-Artifact metadata:
-
-```json
-{
-  "artifact": "es_mbo_event_store",
-  "version": 1,
-  "raw_object_id": "sha256-...",
-  "event_count": 123,
-  "batch_count": 45,
-  "first_ts_event_ns": "1773235800000000000",
-  "last_ts_event_ns": "1773239400000000000"
-}
-```
-
-Store lookup:
-
-```text
-list role=artifact kind=ledger.es_mbo_event_store.v1
-filter descriptors where lineage contains raw object id
-filter metadata_json.version == 1
-use the descriptor if present
-otherwise build artifact
-```
-
-If multiple matching descriptors exist, pick the newest valid descriptor by
-`updated_at_ns` and log/report the ambiguity in the prepare summary. This should
-not normally happen because the artifact bytes should be deterministic for the
-same raw DBN.
-
-## Artifact Codec
-
-Use a fixed little-endian binary codec. Do not add `bincode` or a schema system.
-
-Magic:
-
-```text
-LEDGER_ES_MBO_EVENT_STORE_V1
-```
-
-Suggested layout:
-
-```text
-u32 magic_len
-[u8; magic_len] magic
-u32 version
-u64 event_count
-u64 batch_count
-
-events:
-  repeated event_count times:
-    u64 ts_event_ns
-    u64 ts_recv_ns
-    u64 sequence
-    u8  action
-    u8  side
-    i64 price_ticks_or_i64_max
-    u32 size
-    u64 order_id
-    u8  flags
-    u8  is_last
-
-batches:
-  repeated batch_count times:
-    u64 start_idx
-    u64 end_idx
-    u64 ts_event_ns
-```
-
-Decode validation:
-
-```text
-magic matches
-version matches
-all batch spans are in bounds
-start_idx <= end_idx
-batches are non-overlapping and ordered
-no trailing corrupt record data
-```
-
-Keep the codec colocated with the ES replay feed. It is not a generic store
-codec.
-
-## DBN Preparation
-
-`EsReplayFeed` startup calls an artifact preparation helper:
-
-```rust
-pub async fn prepare_es_replay_artifact<S>(
-    store: &store::Store<S>,
-    raw_object_id: &store::StoreObjectId,
-) -> Result<EsReplayArtifactDescriptor, LedgerError>
-where
-    S: store::RemoteStore + 'static;
-```
-
-Preparation behavior:
-
-```text
-1. find matching artifact descriptor
-2. if found, hydrate artifact and return it
-3. hydrate raw DBN object
-4. decode raw DBN MBO records
-5. normalize into EsMboEvent
-6. build exchange batch spans from is_last
-7. encode EsMboEventStore artifact
-8. register artifact through store with role=artifact
-9. hydrate or use local artifact path
-10. return descriptor/path/summary
-```
-
-Databento normalization should port the old useful logic:
-
-```text
-MboMsg action:
-  A -> Add
-  M -> Modify
-  C -> Cancel
-  R -> Clear
-  T -> Trade
-  F -> Fill
-  N -> None
-
-MboMsg side:
-  B -> Bid
-  A -> Ask
-  N -> None
-
-price:
-  UNDEF_PRICE -> None
-  otherwise require ES fixed price alignment to 0.25 tick
-```
-
-Constants:
-
-```rust
-pub const ES_TICK_SIZE_FIXED_PRICE: i64 = 250_000_000;
-```
-
-Batch building:
-
-```text
-start a batch at current start index
-close the batch when event.is_last is true
-if EOF leaves a partial batch, close it as a trailing batch
-batch timestamp is the closing event timestamp
-```
-
-The preparation step should be idempotent. Running it twice for the same raw
-object should reuse the existing artifact unless the artifact is missing or
-invalid.
-
-## ES Replay Feed
-
-Constructor shape:
-
-```rust
-pub struct EsReplayFeed {
-    id: FeedId,
-    raw_object_id: store::StoreObjectId,
-    cells: EsReplayCells,
-    initial_playback: PlaybackState,
-}
-```
-
-Runtime state:
+Internal state built during prepare:
 
 ```text
 artifact descriptor/path
 decoded EsMboEventStore
-current batch_idx
+epoch
+next unemitted batch index
 feed_seq
-last emitted source timestamp
-ended flag
 ```
 
-Run behavior:
+`RuntimeProcess::run` — the feed owns its pacing; there is no generic
+waiting helper in this phase (extract one when a second feed wants it):
 
 ```text
-1. prepare/open artifact
-2. decode artifact into EsMboEventStore
-3. publish initial status/cursor through one ExternalWriteBatch
-4. wait for playback to be playing
-5. emit next exchange batch when due
-6. after each emitted batch, push to batches and publish cursor/status
-7. stop when ended or shutdown is requested
+1. publish initial status/cursor through one ExternalWriteBatch
+2. loop:
+   a. read the clock cell (None -> ClockState::initial()) and compute now
+   b. if session time regressed below the last emitted batch timestamp:
+      rebuild (see Regression), then continue
+   c. emit every batch with ts_event_ns <= now not yet emitted, in order,
+      one ExternalWriteBatch each, publishing cursor/status with each
+   d. decide how to wait:
+      all batches emitted -> park on clock watch + shutdown
+      paused              -> park on clock watch + shutdown
+      running             -> select! {
+                               sleep_until(clock.wall_deadline(next_ts)),
+                               clock watch changed,
+                               shutdown changed,
+                             }
+3. exit only on shutdown
 ```
 
-One emitted exchange batch can be represented as one `ExternalWriteBatch`:
+Notes:
+
+```text
+the wall deadline targets the feed's own next event exactly — there is no
+tick grid and no periodic wakeup; a paused or finished feed is parked
+indefinitely at zero cost
+
+catch-up: if a clock write jumps time past several batches, step (c) emits
+them all as an ordered burst
+```
+
+Regression (backward seek) — feed-owned adaptation, epoch contract for
+consumers:
+
+```text
+when now < last emitted batch timestamp:
+  truncate the batches array to batches with ts_event_ns <= now
+    (cache replace_array/remove_array_range — owner-only, already exists)
+  reset the internal next-unemitted index to match
+  increment epoch
+  clear ended if set
+  publish cursor/status
+
+consumers of the batches array keep their own progress cursors; when
+cursor.epoch changes they reset progress and re-read
+```
+
+End behavior:
+
+```text
+after emitting the final batch:
+  set cursor.ended = true, next_ts_event_ns = None, publish final status
+  park on the clock watch — do NOT return
+  a later backward seek revives emission (regression path clears ended)
+  the process returns only on shutdown, so its terminal ComponentStatus is
+  Stopped, not Completed
+```
+
+One emitted exchange batch is one `ExternalWriteBatch`:
 
 ```rust
 let mut batch = ctx.batch();
@@ -889,44 +590,48 @@ batch
 ctx.submit(batch).await?;
 ```
 
-End behavior:
-
-```text
-set cursor.ended = true
-set next_ts_event_ns = None
-publish final status
-return Ok
-```
-
-The feed should not call `cache.set_value` directly.
+The feed never calls cache setters directly and never writes the clock cell
+(the cache's ownership enforcement makes the latter a hard error).
 
 ## CLI Surface
 
-Extend `crates/cli` with a `session` command group that uses `ledger`.
-
-Commands:
+Extend `crates/cli` with a `session` command group. Artifact preparation
+already exists as `es prepare` (data-management spec); the session command
+prepares implicitly through the feed's lifecycle if needed.
 
 ```text
-ledger session prepare-es-replay --raw-id <store-object-id>
-ledger session run-es-replay --raw-id <store-object-id> [--batches N] [--speed X]
+ledger session run-es-replay --raw-id <store-object-id> [--batches N] [--realtime] [--speed X]
 ```
 
-`prepare-es-replay`:
+Default: deterministic step mode.
 
 ```text
 construct R2Store
-call prepare_es_replay_artifact
+create Ledger ES replay session (clock paused at 0)
+readiness: watch the cursor cell; wait until the feed publishes its initial
+  cursor (bounded by a timeout)
+loop until N batches are emitted or cursor.ended:
+  target = cursor.next_ts_event_ns
+  seek_to(target)
+  progress: await the cursor watch until feed_seq advances past the last
+    seen value or cursor.ended becomes true (bounded by a timeout)
+shutdown
 print JSON summary
 ```
 
-`run-es-replay`:
+Step synchronization rides cell watches, never Drain and never polling. The
+chain is direct wakeups end to end: driver writes clock -> worker applies ->
+feed's clock watch wakes -> feed emits -> worker applies -> cursor
+generation bumps -> driver's cursor watch wakes. Determinism means an
+identical emitted batch sequence and identical cell states at each step
+boundary.
+
+`--realtime [--speed X]`:
 
 ```text
-construct R2Store
-create Ledger ES replay session
-set playback speed
-play
-wait until N batches are emitted or feed ends
+readiness as above, then seek_to the first batch timestamp
+set_speed(X), play
+await cursor watch until N batches are emitted or cursor.ended
 pause/shutdown
 print JSON summary
 ```
@@ -938,138 +643,114 @@ Suggested output:
   "raw_object_id": "sha256-...",
   "artifact_object_id": "sha256-...",
   "artifact_reused": true,
+  "mode": "step",
   "batches_requested": 10,
   "batches_emitted": 10,
   "first_ts_event_ns": "1773235800000000000",
   "last_ts_event_ns": "1773235801000000000",
   "ended": false,
   "runtime_batches_applied": 10,
-  "runtime_projections_run": 0
+  "runtime_components_run": 0
 }
 ```
 
-The first validation can run with zero projections. The point is to prove:
+The first validation can run with zero task components. The point is to
+prove:
 
 ```text
-store hydration works
-artifact preparation works
-feed playback emits batches
+clock-cell-driven emission works
+step runs are deterministic with no sleeps and no polling
+backward seek truncates, bumps epoch, and revives an ended feed
 runtime accepts feed writes
 cache cells reflect cursor/status/latest batch
 ```
 
-## API Surface
+## Transport Surface
 
-API work can follow after CLI validation. The crate should be shaped so API can
-later expose:
+Transport work follows CLI validation. The session surface is exposed later
+through `ledger-remux` JSON-RPC methods:
 
 ```text
-POST /sessions/es-replay
-POST /sessions/:id/play
-POST /sessions/:id/pause
-POST /sessions/:id/speed
-GET  /sessions/:id/status
-DELETE /sessions/:id
+remux/ledger/session/start
+remux/ledger/session/play
+remux/ledger/session/pause
+remux/ledger/session/speed
+remux/ledger/session/seek
+remux/ledger/session/status
+remux/ledger/session/stop
 ```
 
-Do not implement these before the headless crate and CLI are validated unless
-the next task explicitly asks for API integration.
+Handlers never run on feed tasks and never await feeds: clock methods are
+one cell write through the session handle, status is cell reads, start/stop
+build or shut down the one registered session. Cell watches later enable
+push-style status updates instead of transport polling. Module functions
+(days, prepare-as-job) are separate methods that need no session at all.
+
+Do not implement these before the headless crate and CLI are validated.
 
 ## Error Types
 
-`ledger` should have a crate error that preserves source context:
+Extend the data-phase `LedgerError`:
 
 ```rust
-#[derive(Debug, thiserror::Error)]
-pub enum LedgerError {
-    #[error(transparent)]
-    Store(#[from] anyhow::Error),
-
     #[error(transparent)]
     Cache(#[from] cache::CacheError),
 
     #[error(transparent)]
     Runtime(#[from] runtime::RuntimeError),
 
-    #[error("feed `{id}` failed: {source}")]
-    Feed {
-        id: FeedId,
-        source: FeedError,
-    },
-
-    #[error("invalid playback speed `{0}`")]
-    InvalidPlaybackSpeed(f64),
-
-    #[error("run limit exceeded while processing feed batch")]
-    RuntimeRunLimitExceeded,
-}
+    #[error("invalid clock speed `{0}`")]
+    InvalidClockSpeed(f64),
 ```
 
-`FeedError`:
-
-```rust
-#[derive(Debug, thiserror::Error)]
-pub enum FeedError {
-    #[error(transparent)]
-    Store(#[from] anyhow::Error),
-
-    #[error(transparent)]
-    Cache(#[from] cache::CacheError),
-
-    #[error("runtime external write ingress closed")]
-    RuntimeIngressClosed,
-
-    #[error("invalid DBN record: {0}")]
-    InvalidDbnRecord(String),
-
-    #[error("invalid artifact: {0}")]
-    InvalidArtifact(String),
-}
-```
-
-The exact variants can change during implementation. The important part is that
-feed errors include enough context to debug artifact and source issues.
+There is no backward-seek error — regression is legal state. There is no
+`FeedError`. Feed processes return `runtime::ComponentError` from `prepare`
+and `run`; domain failures map into `ComponentError::Message`. The runtime
+surfaces them as `ComponentStatus::Failed` and `RuntimeError::Component`.
 
 ## Tests
 
-Unit tests:
+Clock unit tests:
 
 ```text
-playback rejects zero, negative, NaN, and infinite speeds
-playback increments revision on play/pause/speed changes
-artifact codec round trips synthetic EsMboEventStore
-artifact codec rejects wrong magic
-artifact codec rejects out-of-bounds batch spans
-batch builder closes trailing partial batch
-DBN normalization maps action/side/undefined price correctly where testable
+with_speed rejects zero, negative, NaN, and infinite speeds
+play/pause/with_speed/seek_to re-anchor and increment revision
+seek_to accepts backward targets
+now_ns is anchor math: paused returns anchor; running extrapolates
+wall_deadline returns None when paused, exact instant when running
 ```
 
 Feed tests:
 
 ```text
-prepare reuses existing artifact for same raw lineage
-prepare registers artifact with role=artifact and kind=ledger.es_mbo_event_store.v1
-feed starts paused and emits no batches
-feed emits first batch after play
-feed updates cursor and status after each batch
-feed marks ended at the end of artifact
-feed submit uses feed owner
+install_process reports Preparing during artifact prepare, then Running
+feed treats a missing clock cell as paused at 0 and emits nothing
+feed emits nothing while paused before its data
+feed wakes on a clock cell write without polling
+feed emits an ordered catch-up burst when a seek jumps past several batches
+feed emits batches as session time crosses their timestamps in realtime
+feed updates cursor and status after each emission
+backward seek truncates batches, resets index, bumps epoch, clears ended
+feed parks after the final batch (ended=true) and a backward seek revives it
+feed writes are attributed to the feed component owner
+feed cannot write the clock cell (cache ownership rejects it)
 ```
 
-Runtime integration tests:
+Session and integration tests:
 
 ```text
 feed-submitted writes enter runtime through the generic external-write path
-projection depending on batches runs when the batches key changes
-Ledger session does not implement projection scheduling policy
-shutdown stops feed tasks cleanly
+task component depending on batches runs when the batches key changes
+Ledger session does not implement component scheduling policy
+RuntimeHandle::shutdown stops the feed process cleanly
+session shutdown awaits the worker join and surfaces worker errors
+step driver synchronizes on cursor watches, never on Drain, never by polling
 ```
 
 CLI validation:
 
 ```text
-cargo run -p cli -- session prepare-es-replay --raw-id <id>
-cargo run -p cli -- session run-es-replay --raw-id <id> --batches 10 --speed 100
+cargo run -p ledger-cli -- session run-es-replay --raw-id <id> --batches 10
 ```
 
 Workspace validation:
@@ -1077,56 +758,36 @@ Workspace validation:
 ```text
 cargo fmt --all
 cargo test --workspace
-cargo run -p cli -- store list --role raw --kind databento.dbn.zst
 ```
 
 ## Success Criteria
 
-This phase is complete when:
-
 ```text
-crates/ledger exists and builds
-runtime remains generic and does not mention feeds/playback/DBN/ES
-cache remains generic and does not mention feeds/playback/DBN/ES
-ES replay feed can prepare or reuse an artifact from a raw store object
+runtime is unchanged; cache and runtime stay free of feeds/clocks/DBN/ES
+feeds are runtime processes; ledger keeps no per-feed shutdown or join plumbing
+the session owns exactly one join: the RuntimeWorker task
+the clock is a session-owned cell; feeds structurally cannot write it
+feeds own their pacing; no generic waiting helper exists in this phase
+no polling anywhere: feeds and drivers park on cell watches
 ES replay feed emits one exchange batch per ExternalWriteBatch
-feed writes enter runtime through the generic external-write path
-play/pause/speed affect feed emission without changing runtime
-CLI can prepare an ES replay artifact
+backward seek truncates, bumps epoch, and revives an ended feed
+deterministic step runs emit identical batch sequences with no wall sleeps
 CLI can run a headless ES replay feed for N batches
 cargo test --workspace passes
 ```
 
 ## Future Extensions
 
-These should not be built in the first pass, but the design should leave room
-for them:
-
 ```text
-seek:
-  add target timestamp to PlaybackState or add a session-level command path
-  feed maps timestamp to batch_idx using artifact batch spans
-
-step:
-  feed emits exactly one batch while otherwise paused
-
-artifact indexing:
-  split event bytes and batch index
-  mmap event store
-  avoid loading full day into memory
-
-execution simulator:
-  separate feed/projection/simulator layer that consumes ES MBO batches
-
-live feed:
-  same runtime write path
-  different source loop and no replay artifact
-
-API session registry:
-  store session handles by id
-  route playback controls to PlaybackController
-
-Lens:
-  use session status and future projection outputs
-  do not make Data Center responsible for preparing replay
+seek UI              user-facing controls come with the Lens session surface
+shared pacing helper extract from the ES feed when a second feed wants it
+session from Days    "open validated day as a Session" action on the Lens
+                     Days screen, resolving day -> raw -> artifact
+artifact indexing    split event bytes / batch index, mmap, partial loads
+simulator and book   later layer consuming ES MBO batches (legacy designs
+                     preserved in the data-management spec)
+bars and studies     task components over the batches cell
+live feed            same feed contract; live driver pins anchors to wall time
+session registry     session handles by id behind remux methods
+transport push       cell watches let remux push status instead of polling
 ```

@@ -1,5 +1,6 @@
 mod error;
 mod hydrate;
+mod jobs;
 mod methods;
 mod rpc;
 
@@ -20,10 +21,13 @@ async fn main() {
 async fn run() -> Result<()> {
     dotenvy::dotenv().ok();
     let data_dir = env::var("LEDGER_DATA_DIR").unwrap_or_else(|_| "data".to_string());
-    let store = R2Store::from_env(data_dir).await?;
+    let fetch_staging_root = std::path::PathBuf::from(&data_dir)
+        .join("tmp")
+        .join("fetch");
+    let store = R2Store::from_env(&data_dir).await?;
 
     rpc::serve_stdio(|output_tx| {
-        let methods = Arc::new(LedgerRemux::new(store, output_tx));
+        let methods = Arc::new(LedgerRemux::new(store, output_tx, fetch_staging_root));
         Arc::new(move |request: Request| {
             let methods = methods.clone();
             Box::pin(async move { methods.handle(request).await }) as DispatchFuture

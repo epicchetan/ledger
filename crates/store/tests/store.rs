@@ -225,6 +225,55 @@ async fn register_file_uploads_descriptor_and_uses_shared_local() {
 }
 
 #[tokio::test]
+async fn update_metadata_replaces_json_preserves_locations_and_remirrors() {
+    let data = tempdir().unwrap();
+    let remote = Arc::new(TestRemote::new());
+    let store = open_test_store(&data, remote.clone(), 1024 * 1024);
+    let descriptor = register_test_object(&store, &data, "metadata.bin", b"metadata bytes").await;
+    let remote_before = descriptor.remote.clone();
+    let local_before = descriptor.local.clone();
+    let descriptor_key = format!(
+        "store/registry/objects/sha256/{}/{}.json",
+        descriptor.id.shard(),
+        descriptor.id.sha256()
+    );
+
+    let updated = store
+        .update_metadata(
+            &descriptor.id,
+            serde_json::json!({ "market_day": "2026-03-10" }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        updated.metadata_json,
+        serde_json::json!({ "market_day": "2026-03-10" })
+    );
+    assert_eq!(updated.remote, remote_before);
+    assert_eq!(updated.local, local_before);
+    assert!(updated.updated_at_ns >= descriptor.updated_at_ns);
+    let mirrored = remote.get_bytes(&descriptor_key).await.unwrap();
+    let mirrored: StoreObjectDescriptor = serde_json::from_slice(&mirrored).unwrap();
+    assert_eq!(mirrored.metadata_json, updated.metadata_json);
+}
+
+#[tokio::test]
+async fn update_metadata_errors_for_missing_object() {
+    let data = tempdir().unwrap();
+    let remote = Arc::new(TestRemote::new());
+    let store = open_test_store(&data, remote, 1024 * 1024);
+    let missing = StoreObjectId::new(format!("sha256-{}", "0".repeat(64))).unwrap();
+
+    let error = store
+        .update_metadata(&missing, serde_json::json!({ "market_day": "2026-03-10" }))
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("not found"));
+}
+
+#[tokio::test]
 async fn hydrate_restores_missing_local_from_remote() {
     let data = tempdir().unwrap();
     let remote = Arc::new(TestRemote::new());

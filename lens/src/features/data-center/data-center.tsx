@@ -1,7 +1,6 @@
 import {
   closeHostTab,
   openHostOverview,
-  reloadHostView,
   updateHostTab,
 } from "@remux/viewer-kit/host"
 import { ActionBar, ActionButton } from "@remux/viewer-kit/ui"
@@ -10,12 +9,11 @@ import {
   Loader2,
   PanelRightOpen,
   RefreshCw,
-  RotateCw,
   Search,
   Trash2,
   X,
 } from "lucide-react"
-import type { FormEvent } from "react"
+import type { FormEvent, ReactNode } from "react"
 import { useCallback, useEffect, useMemo, useState } from "react"
 import { toast } from "sonner"
 
@@ -105,7 +103,7 @@ function sortObjects(objects: StoreObject[], sort: ObjectSortKey) {
   return sorted
 }
 
-export function DataCenter() {
+export function DataCenter({ viewerMenu }: { viewerMenu?: ReactNode }) {
   const [objects, setObjects] = useState<StoreObject[]>([])
   const [filters, setFilters] = useState<StoreObjectFilters>(EMPTY_FILTERS)
   const [appliedFilters, setAppliedFilters] =
@@ -402,20 +400,7 @@ export function DataCenter() {
       <ActionBar
         left={
           <>
-            <ActionButton
-              icon={<PanelRightOpen aria-hidden="true" />}
-              label="Open tabs"
-              onClick={() => {
-                void openHostOverview({ section: "tabs" })
-              }}
-            />
-            <ActionButton
-              icon={<RotateCw aria-hidden="true" />}
-              label="Reload viewer"
-              onClick={() => {
-                void reloadHostView()
-              }}
-            />
+            {viewerMenu}
             <ActionButton
               icon={<RefreshCw aria-hidden="true" />}
               label="Refresh data"
@@ -428,13 +413,22 @@ export function DataCenter() {
           </>
         }
         right={
-          <ActionButton
-            icon={<X aria-hidden="true" />}
-            label="Close tab"
-            onClick={() => {
-              void closeHostTab()
-            }}
-          />
+          <>
+            <ActionButton
+              icon={<PanelRightOpen aria-hidden="true" />}
+              label="Open tabs"
+              onClick={() => {
+                void openHostOverview({ section: "tabs" })
+              }}
+            />
+            <ActionButton
+              icon={<X aria-hidden="true" />}
+              label="Close tab"
+              onClick={() => {
+                void closeHostTab()
+              }}
+            />
+          </>
         }
         status={barStatus}
       />
