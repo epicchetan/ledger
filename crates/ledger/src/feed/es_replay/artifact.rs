@@ -96,11 +96,17 @@ where
 
     if let Some(descriptor) = lookup.descriptor.clone() {
         if !force {
+            // The reuse path still hydrates (and fully decodes) the artifact,
+            // so surface it as such instead of sitting on "queued".
+            if let Some(progress) = &progress {
+                let _ = progress.send(PrepareProgress::Hydrating);
+            }
             match hydrate_decode_artifact(store, raw_object_id, descriptor.clone(), &mut warnings)
                 .await
             {
-                Ok(artifact) => {
+                Ok(mut artifact) => {
                     repair_raw_market_day(store, raw_object_id, &artifact.market_day).await?;
+                    offload_raw_local_copy(store, raw_object_id, &mut artifact.warnings);
                     return Ok(artifact);
                 }
                 Err(error) => {
@@ -184,6 +190,7 @@ where
     tokio::fs::remove_file(&artifact_path).await.ok();
     repair_raw_market_day(store, raw_object_id, &market_day).await?;
     let hydrated = store.hydrate(&descriptor.id).await?;
+    offload_raw_local_copy(store, raw_object_id, &mut warnings);
 
     Ok(EsReplayArtifact {
         descriptor: hydrated.descriptor,
@@ -196,6 +203,24 @@ where
         last_ts_event_ns,
         warnings,
     })
+}
+
+// Raws never rest locally: once a valid artifact exists the raw's local copy
+// is dead weight (gigabytes of DBN), while R2 keeps the paid bytes for future
+// rebuilds. Best-effort — a failed eviction is a warning, never a failed
+// prepare, because the artifact is already good.
+fn offload_raw_local_copy<S>(
+    store: &Store<S>,
+    raw_object_id: &StoreObjectId,
+    warnings: &mut Vec<String>,
+) where
+    S: RemoteStore + 'static,
+{
+    if let Err(error) = store.offload_object(raw_object_id) {
+        warnings.push(format!(
+            "failed to offload raw {raw_object_id} local copy: {error}"
+        ));
+    }
 }
 
 pub fn find_es_replay_artifact_descriptor(

@@ -6,22 +6,23 @@ import { Loader2 } from "lucide-react"
 import { useCallback, useEffect, useMemo, useState } from "react"
 import { toast } from "sonner"
 
-import { fetchStoreObjects } from "@/features/data-center/api"
-import { DeleteObjectDialog } from "@/features/data-center/object-list"
-import type {
-  StoreObject,
-  StoreObjectFilters,
-} from "@/features/data-center/types"
-import { useStoreObjectOps } from "@/features/data-center/use-store-object-ops"
+import { deleteStoreObject, formatBytes } from "@/features/data-center/api"
+import type { StoreObject } from "@/features/data-center/types"
 import {
   fetchEsDays,
   fetchJobs,
-  startPrepareJob,
+  offloadDay,
+  startInstallJob,
   subscribeLedgerJobs,
 } from "@/features/days/api"
 import { DayActionBar } from "@/features/days/day-action-bar"
 import { DayList } from "@/features/days/day-list"
-import { deriveCatalog, indexObjects } from "@/features/days/readiness"
+import {
+  deriveCatalog,
+  metadataString,
+  UNASSIGNED_KEY,
+  type DayReadiness,
+} from "@/features/days/readiness"
 import type {
   DaysLoadState,
   EsDayCatalog,
@@ -36,40 +37,34 @@ const EMPTY_CATALOG: EsDayCatalog = {
   unassigned: [],
 }
 
-// The readiness rollup needs every object's locality, so we pull the full
-// store list unfiltered and join it onto the catalog by id on the client.
-const ALL_OBJECTS: StoreObjectFilters = {
-  role: "",
-  kind: "",
-  idPrefix: "",
-}
-
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Unknown error"
 }
 
 export function Days() {
   const [catalog, setCatalog] = useState<EsDayCatalog>(EMPTY_CATALOG)
-  const [objects, setObjects] = useState<StoreObject[]>([])
   const [jobs, setJobs] = useState<JobRecord[]>([])
-  const [rowErrors, setRowErrors] = useState<Map<string, string>>(new Map())
+  // Last failure per day (keyed by market day, or the Unassigned pseudo-day).
+  // Cleared the moment a new job makes progress for that day.
+  const [dayErrors, setDayErrors] = useState<Map<string, string>>(new Map())
   const [loadState, setLoadState] = useState<DaysLoadState>({
     kind: "loading",
     message: "Loading ES days.",
   })
   const [selectedKey, setSelectedKey] = useState<string | null>(null)
+  const [offloadingDay, setOffloadingDay] = useState<string | null>(null)
 
+  // The catalog carries full descriptors (locality included), so days needs
+  // exactly two feed-level sources: the catalog and the job stream.
   const load = useCallback(async () => {
     setLoadState({ kind: "loading", message: "Loading ES days." })
     try {
-      const [nextCatalog, nextJobs, nextObjects] = await Promise.all([
+      const [nextCatalog, nextJobs] = await Promise.all([
         fetchEsDays(),
         fetchJobs(),
-        fetchStoreObjects(ALL_OBJECTS),
       ])
       setCatalog(nextCatalog)
       setJobs(nextJobs.jobs)
-      setObjects(nextObjects)
       const totalRows =
         nextCatalog.days.reduce((sum, day) => sum + day.raws.length, 0) +
         nextCatalog.unassigned.length
@@ -80,7 +75,6 @@ export function Days() {
       )
     } catch (error) {
       setCatalog(EMPTY_CATALOG)
-      setObjects([])
       setJobs([])
       setLoadState({
         kind: "error",
@@ -102,19 +96,37 @@ export function Days() {
     })
   }, [load])
 
-  const ops = useStoreObjectOps(load)
-
-  const handleProgress = useCallback((event: JobProgressEvent) => {
-    setJobs((current) => upsertRunningJob(current, event))
+  const clearDayError = useCallback((dayKey: string) => {
+    setDayErrors((current) => {
+      if (!current.has(dayKey)) return current
+      const next = new Map(current)
+      next.delete(dayKey)
+      return next
+    })
   }, [])
+
+  const setDayError = useCallback((dayKey: string, error: string) => {
+    setDayErrors((current) => {
+      const next = new Map(current)
+      next.set(dayKey, error)
+      return next
+    })
+  }, [])
+
+  const handleProgress = useCallback(
+    (event: JobProgressEvent) => {
+      setJobs((current) => upsertRunningJob(current, event))
+      // A job making progress is a fresh attempt: retire the day's old error.
+      clearDayError(event.marketDay ?? UNASSIGNED_KEY)
+    },
+    [clearDayError]
+  )
 
   const handleFinished = useCallback(
     (event: JobFinishedEvent) => {
-      let failedSubject: string | null = null
       setJobs((current) =>
         current.map((job) => {
           if (job.id !== event.jobId) return job
-          if (!event.ok) failedSubject = job.subject
           return {
             ...job,
             finishedAtNs: Date.now().toString(),
@@ -133,18 +145,14 @@ export function Days() {
         toast.error("Ledger job failed", {
           description: event.error ?? "Job failed",
         })
-        const subject = failedSubject
-        if (subject) {
-          setRowErrors((current) => {
-            const next = new Map(current)
-            next.set(subject, event.error ?? "Job failed")
-            return next
-          })
-        }
+        setDayError(
+          event.marketDay ?? UNASSIGNED_KEY,
+          event.error ?? "Job failed"
+        )
       }
       void load()
     },
-    [load]
+    [load, setDayError]
   )
 
   useEffect(() => {
@@ -154,18 +162,21 @@ export function Days() {
     })
   }, [handleFinished, handleProgress])
 
-  const jobsBySubject = useMemo(() => {
-    const map = new Map<string, JobRecord>()
+  const jobsByDay = useMemo(() => {
+    const map = new Map<string, JobRecord[]>()
     for (const job of jobs) {
-      if (job.state.status === "running") map.set(job.subject, job)
+      if (job.state.status !== "running") continue
+      const dayKey = job.marketDay ?? UNASSIGNED_KEY
+      const entries = map.get(dayKey)
+      if (entries) entries.push(job)
+      else map.set(dayKey, [job])
     }
     return map
   }, [jobs])
 
-  const objectIndex = useMemo(() => indexObjects(objects), [objects])
   const derived = useMemo(
-    () => deriveCatalog(catalog, objectIndex, jobsBySubject, rowErrors),
-    [catalog, objectIndex, jobsBySubject, rowErrors]
+    () => deriveCatalog(catalog, jobsByDay, dayErrors),
+    [catalog, jobsByDay, dayErrors]
   )
 
   const findDay = useCallback(
@@ -184,7 +195,7 @@ export function Days() {
   )
 
   const runningCount = jobs.filter((job) => job.state.status === "running").length
-  const dayCount = catalog.days.length
+  const dayCount = derived.days.length
   const barStatus =
     loadState.kind === "loading" && dayCount === 0
       ? "Loading"
@@ -198,25 +209,53 @@ export function Days() {
     )
   }, [barStatus])
 
-  async function prepare(raw: EsRawStatus, force: boolean) {
-    setRowErrors((current) => {
-      const next = new Map(current)
-      next.delete(raw.raw.id)
-      return next
-    })
+  async function install(raw: EsRawStatus) {
+    const dayKey =
+      metadataString(raw.raw.metadataJson, "market_day") ?? UNASSIGNED_KEY
+    clearDayError(dayKey)
     try {
-      const result = await startPrepareJob(raw.raw.id, force)
-      toast.success(result.alreadyRunning ? "Prepare already running" : "Prepare started", {
-        description: shortId(raw.raw.id),
+      const result = await startInstallJob(raw.raw.id)
+      toast.success(
+        result.alreadyRunning ? "Install already running" : "Install started",
+        { description: shortId(raw.raw.id) }
+      )
+      await load()
+    } catch (error) {
+      toast.error("Install failed", { description: errorMessage(error) })
+      setDayError(dayKey, errorMessage(error))
+    }
+  }
+
+  // The one destructive act on this screen rides the platform's own confirm
+  // instead of a modal of ours. Raws refuse deletion server-side regardless.
+  async function deleteObject(object: StoreObject) {
+    const confirmed = window.confirm(
+      `Delete ${object.fileName} (${object.size})?\n\nRemoves the descriptor, local copy, R2 object, and R2 descriptor mirror.`
+    )
+    if (!confirmed) return
+    try {
+      const report = await deleteStoreObject(object.id)
+      toast.success("Object deleted", {
+        description: `${object.fileName} removed ${formatBytes(report.bytesDeleted)} across store locations.`,
       })
       await load()
     } catch (error) {
-      toast.error("Prepare failed", { description: errorMessage(error) })
-      setRowErrors((current) => {
-        const next = new Map(current)
-        next.set(raw.raw.id, errorMessage(error))
-        return next
+      toast.error("Delete failed", { description: errorMessage(error) })
+    }
+  }
+
+  async function offload(day: DayReadiness) {
+    setOffloadingDay(day.marketDay)
+    try {
+      const report = await offloadDay(day.marketDay)
+      toast.success("Day offloaded", {
+        description: `Freed ${formatBytes(report.bytesRemoved)} locally; R2 keeps every byte.`,
       })
+      await load()
+    } catch (error) {
+      toast.error("Offload failed", { description: errorMessage(error) })
+    } finally {
+      setOffloadingDay(null)
     }
   }
 
@@ -244,20 +283,11 @@ export function Days() {
       <DayActionBar
         day={selectedDay}
         status={barStatus}
-        hydratingIds={ops.hydratingIds}
+        offloadingDay={offloadingDay}
         onClose={() => setSelectedKey(null)}
-        onPrepare={(raw, force) => void prepare(raw, force)}
-        onHydrate={(object) => void ops.hydrateObject(object)}
-        onDeleteObject={ops.setDeleteTarget}
-      />
-
-      <DeleteObjectDialog
-        object={ops.deleteTarget}
-        deleting={ops.deleting}
-        onOpenChange={(open) => {
-          if (!open && !ops.deleting) ops.setDeleteTarget(null)
-        }}
-        onConfirm={() => void ops.confirmDelete()}
+        onInstall={(raw) => void install(raw)}
+        onOffload={(day) => void offload(day)}
+        onDeleteObject={(object) => void deleteObject(object)}
       />
     </div>
   )
@@ -294,7 +324,13 @@ function upsertRunningJob(jobs: JobRecord[], event: JobProgressEvent) {
   if (jobs.some((job) => job.id === event.jobId)) {
     return jobs.map((job) =>
       job.id === event.jobId
-        ? { ...job, state: nextState, subject: event.subject, kind: event.kind }
+        ? {
+            ...job,
+            state: nextState,
+            subject: event.subject,
+            kind: event.kind,
+            marketDay: event.marketDay,
+          }
         : job
     )
   }
@@ -304,6 +340,7 @@ function upsertRunningJob(jobs: JobRecord[], event: JobProgressEvent) {
       id: event.jobId,
       kind: event.kind,
       subject: event.subject,
+      marketDay: event.marketDay,
       state: nextState,
       startedAtNs: Date.now().toString(),
       finishedAtNs: null,

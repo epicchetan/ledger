@@ -6,6 +6,7 @@ import {
 
 import type {
   EsDayCatalog,
+  EsOffloadReport,
   JobFinishedEvent,
   JobProgressEvent,
   JobsListResult,
@@ -20,24 +21,16 @@ export async function fetchJobs(): Promise<JobsListResult> {
   return requestIpc<JobsListResult>("remux/ledger/jobs/list", {})
 }
 
-export async function startPrepareJob(
-  rawId: string,
-  force = false
-): Promise<JobStartResult> {
-  return requestIpc<JobStartResult>("remux/ledger/es/prepare", {
-    rawId,
-    force,
-  })
+// Install: make the feed's artifact local, whatever that takes. The backend
+// hydrates an existing artifact or rebuilds a missing/invalid one from the
+// R2 raw — one verb, no prepare/hydrate split on this side.
+export async function startInstallJob(rawId: string): Promise<JobStartResult> {
+  return requestIpc<JobStartResult>("remux/ledger/es/install", { rawId })
 }
 
-export async function startFetchJob(
-  marketDay: string,
-  symbol: string
-): Promise<JobStartResult> {
-  return requestIpc<JobStartResult>("remux/ledger/es/fetch", {
-    marketDay,
-    symbol,
-  })
+// Offload: drop the day's local copies while R2 keeps every byte. Synchronous.
+export async function offloadDay(marketDay: string): Promise<EsOffloadReport> {
+  return requestIpc<EsOffloadReport>("remux/ledger/es/offload", { marketDay })
 }
 
 export function subscribeLedgerJobs(subscriber: {
@@ -73,6 +66,7 @@ function parseProgressEvent(message: JsonRpcMessage): JobProgressEvent | null {
     jobId: params.jobId,
     kind: params.kind,
     subject: params.subject,
+    marketDay: typeof params.marketDay === "string" ? params.marketDay : null,
     stage: params.stage,
     records: typeof params.records === "number" ? params.records : null,
   }
@@ -87,6 +81,9 @@ function parseFinishedEvent(message: JsonRpcMessage): JobFinishedEvent | null {
   }
   return {
     jobId: params.jobId,
+    kind: typeof params.kind === "string" ? params.kind : "",
+    subject: typeof params.subject === "string" ? params.subject : "",
+    marketDay: typeof params.marketDay === "string" ? params.marketDay : null,
     ok: params.ok,
     summary: params.summary,
     error: typeof params.error === "string" ? params.error : null,

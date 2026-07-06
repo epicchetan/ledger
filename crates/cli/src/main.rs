@@ -46,7 +46,8 @@ enum StoreSubcommand {
     Show(StoreShowArgs),
     ImportFile(StoreImportFileArgs),
     Hydrate(StoreShowArgs),
-    Delete(StoreShowArgs),
+    Offload(StoreShowArgs),
+    Delete(StoreDeleteArgs),
     LocalStatus,
     LocalPrune,
     Sync(StoreSyncArgs),
@@ -105,6 +106,15 @@ struct StoreListArgs {
 struct StoreShowArgs {
     #[arg(long)]
     id: String,
+}
+
+#[derive(Args, Clone)]
+struct StoreDeleteArgs {
+    #[arg(long)]
+    id: String,
+    /// Raw objects are paid source data and refuse deletion by default.
+    #[arg(long)]
+    force_raw: bool,
 }
 
 #[derive(Args, Clone)]
@@ -365,9 +375,14 @@ async fn run_store_command(ledger_store: R2Store, command: StoreCommand) -> Resu
             let hydrated = ledger_store.hydrate(&id).await?;
             print_json(&hydrated)?;
         }
+        StoreSubcommand::Offload(args) => {
+            let id = StoreObjectId::new(args.id)?;
+            let report = ledger_store.offload_object(&id)?;
+            print_json(&report)?;
+        }
         StoreSubcommand::Delete(args) => {
             let id = StoreObjectId::new(args.id)?;
-            let report = ledger_store.delete_object(&id).await?;
+            let report = ledger_store.delete_object(&id, args.force_raw).await?;
             print_json(&report)?;
         }
         StoreSubcommand::LocalStatus => {

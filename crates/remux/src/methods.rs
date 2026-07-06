@@ -4,16 +4,16 @@ use crate::jobs::{JobRecord, JobRegistry, JobStartDto};
 use crate::rpc::{send_notification, OutboundSender, Request};
 use chrono::{DateTime, SecondsFormat, Utc};
 use ledger::feed::es_replay::{
-    es_day_catalog, fetch_es_raw, prepare_es_replay_artifact, EsDayCatalog, EsDayEntry, EsRawState,
-    EsRawStatus, FetchProgress, PrepareProgress,
+    es_day_catalog, prepare_es_replay_artifact, EsDayCatalog, EsDayEntry, EsRawState, EsRawStatus,
+    PrepareProgress,
 };
 use ledger::market::MarketDay;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::PathBuf;
 use store::{
     DeleteObjectReport, LocalObjectEntry, LocalStoreStatus, ObjectFilter, RemoteObjectLocation,
-    RemoteStore, Store, StoreObjectDescriptor, StoreObjectId, StoreObjectRole,
+    RemoteStore, RemoveLocalObjectReport, Store, StoreObjectDescriptor, StoreObjectId,
+    StoreObjectRole,
 };
 
 const PING_METHOD: &str = "remux/ledger/ping";
@@ -21,10 +21,11 @@ const STORE_LIST_METHOD: &str = "remux/ledger/store/list";
 const STORE_GET_METHOD: &str = "remux/ledger/store/get";
 const STORE_DELETE_METHOD: &str = "remux/ledger/store/delete";
 const STORE_HYDRATE_METHOD: &str = "remux/ledger/store/hydrate";
+const STORE_OFFLOAD_METHOD: &str = "remux/ledger/store/offload";
 const STORE_LOCAL_STATUS_METHOD: &str = "remux/ledger/store/localStatus";
 const ES_DAYS_METHOD: &str = "remux/ledger/es/days";
-const ES_PREPARE_METHOD: &str = "remux/ledger/es/prepare";
-const ES_FETCH_METHOD: &str = "remux/ledger/es/fetch";
+const ES_INSTALL_METHOD: &str = "remux/ledger/es/install";
+const ES_OFFLOAD_METHOD: &str = "remux/ledger/es/offload";
 const JOBS_LIST_METHOD: &str = "remux/ledger/jobs/list";
 const JOBS_PROGRESS_NOTIFICATION: &str = "remux/ledger/jobs/progress";
 const JOBS_FINISHED_NOTIFICATION: &str = "remux/ledger/jobs/finished";
@@ -35,17 +36,15 @@ pub struct LedgerRemux<S: RemoteStore + 'static> {
     hydrate_jobs: HydrateJobs,
     jobs: JobRegistry,
     output_tx: OutboundSender,
-    fetch_staging_root: PathBuf,
 }
 
 impl<S: RemoteStore + 'static> LedgerRemux<S> {
-    pub fn new(store: Store<S>, output_tx: OutboundSender, fetch_staging_root: PathBuf) -> Self {
+    pub fn new(store: Store<S>, output_tx: OutboundSender) -> Self {
         Self {
             store,
             hydrate_jobs: HydrateJobs::default(),
             jobs: JobRegistry::default(),
             output_tx,
-            fetch_staging_root,
         }
     }
 
@@ -60,10 +59,11 @@ impl<S: RemoteStore + 'static> LedgerRemux<S> {
             STORE_GET_METHOD => self.get_store_object(request.params),
             STORE_DELETE_METHOD => self.delete_store_object(request.params).await,
             STORE_HYDRATE_METHOD => self.hydrate_store_object(request.params),
+            STORE_OFFLOAD_METHOD => self.offload_store_object(request.params),
             STORE_LOCAL_STATUS_METHOD => self.local_status(),
             ES_DAYS_METHOD => self.es_days(),
-            ES_PREPARE_METHOD => self.prepare_es(request.params),
-            ES_FETCH_METHOD => self.fetch_es(request.params),
+            ES_INSTALL_METHOD => self.install_es(request.params),
+            ES_OFFLOAD_METHOD => self.offload_es(request.params),
             JOBS_LIST_METHOD => self.jobs_list(),
             method => Err(RpcError::method_not_found(method)),
         }
@@ -94,11 +94,23 @@ impl<S: RemoteStore + 'static> LedgerRemux<S> {
     async fn delete_store_object(&self, params: Value) -> Result<Value, RpcError> {
         let params = parse_params::<IdParams>(params)?;
         let id = parse_object_id(&params.id)?;
-        let report = self.store.delete_object(&id).await?;
+        // No raw override over RPC: deleting paid source data is a deliberate
+        // CLI act, never something the viewer can do.
+        let report = self.store.delete_object(&id, false).await?;
         if !report.descriptor_removed {
             return Err(RpcError::object_not_found(&params.id));
         }
         to_value(DeleteReportDto::from(report))
+    }
+
+    fn offload_store_object(&self, params: Value) -> Result<Value, RpcError> {
+        let params = parse_params::<IdParams>(params)?;
+        let id = parse_object_id(&params.id)?;
+        if self.store.get_object(&id)?.is_none() {
+            return Err(RpcError::object_not_found(&params.id));
+        }
+        let report = self.store.offload_object(&id)?;
+        to_value(OffloadReportDto::from(report))
     }
 
     fn hydrate_store_object(&self, params: Value) -> Result<Value, RpcError> {
@@ -123,33 +135,66 @@ impl<S: RemoteStore + 'static> LedgerRemux<S> {
         to_value(EsDayCatalogDto::from(catalog))
     }
 
-    fn prepare_es(&self, params: Value) -> Result<Value, RpcError> {
-        let params = parse_params::<EsPrepareParams>(params)?;
+    // Install: make the feed's artifact local, whatever that takes — an
+    // existing artifact is hydrated and validated, a missing or invalid one is
+    // rebuilt from the R2 raw. One verb for the UI; forced rebuilds stay a CLI
+    // maintenance op (`ledger es prepare`).
+    fn install_es(&self, params: Value) -> Result<Value, RpcError> {
+        let params = parse_params::<EsInstallParams>(params)?;
         let raw_id = parse_object_id(&params.raw_id)?;
+        let raw = self
+            .store
+            .get_object(&raw_id)?
+            .ok_or_else(|| RpcError::object_not_found(&params.raw_id))?;
+        let market_day = raw
+            .metadata_json
+            .get("market_day")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let subject = raw_id.to_string();
-        let start = self.jobs.start("es.prepare", &subject)?;
+        let start = self.jobs.start("es.install", &subject, market_day.clone())?;
         if !start.already_running {
-            self.spawn_prepare_job(start.id.clone(), raw_id, params.force.unwrap_or(false));
+            self.spawn_install_job(start.id.clone(), raw_id, market_day);
         }
         to_value(JobStartDto::from(start))
     }
 
-    fn fetch_es(&self, params: Value) -> Result<Value, RpcError> {
-        let params = parse_params::<EsFetchParams>(params)?;
+    // Offload a day: drop local copies of everything the day owns while R2
+    // keeps every byte. Synchronous — file deletes don't need a job.
+    fn offload_es(&self, params: Value) -> Result<Value, RpcError> {
+        let params = parse_params::<EsOffloadParams>(params)?;
         let market_day = MarketDay::parse(&params.market_day)
             .map_err(|err| RpcError::invalid_params(err.to_string()))?;
-        let symbol = params.symbol.trim().to_string();
-        if symbol.is_empty() {
-            return Err(RpcError::invalid_params("symbol is required"));
+        let catalog =
+            es_day_catalog(&self.store).map_err(|err| RpcError::domain(err.to_string()))?;
+        let entry = catalog
+            .days
+            .into_iter()
+            .find(|entry| entry.market_day == market_day)
+            .ok_or_else(|| RpcError::domain(format!("unknown ES market day {market_day}")))?;
+
+        let mut offloaded = Vec::new();
+        let mut bytes_removed = 0u64;
+        for status in entry.raws {
+            let mut descriptors = vec![status.raw];
+            descriptors.extend(status.artifact);
+            for descriptor in descriptors {
+                if descriptor.local.is_none() {
+                    continue;
+                }
+                let report = self.store.offload_object(&descriptor.id)?;
+                bytes_removed += report.bytes_removed;
+                offloaded.push(OffloadedObjectDto {
+                    id: descriptor.id.to_string(),
+                    bytes_removed: report.bytes_removed,
+                });
+            }
         }
-        let dataset = params.dataset.unwrap_or_else(|| "GLBX.MDP3".to_string());
-        let force = params.force.unwrap_or(false);
-        let subject = format!("{market_day} {symbol}");
-        let start = self.jobs.start("es.fetch", &subject)?;
-        if !start.already_running {
-            self.spawn_fetch_job(start.id.clone(), market_day, symbol, dataset, force);
-        }
-        to_value(JobStartDto::from(start))
+        to_value(EsOffloadReportDto {
+            market_day: market_day.to_string(),
+            offloaded,
+            bytes_removed,
+        })
     }
 
     fn jobs_list(&self) -> Result<Value, RpcError> {
@@ -158,7 +203,12 @@ impl<S: RemoteStore + 'static> LedgerRemux<S> {
         })
     }
 
-    fn spawn_prepare_job(&self, job_id: String, raw_id: StoreObjectId, force: bool) {
+    fn spawn_install_job(
+        &self,
+        job_id: String,
+        raw_id: StoreObjectId,
+        market_day: Option<String>,
+    ) {
         let store = self.store.clone();
         let jobs = self.jobs.clone();
         let output_tx = self.output_tx.clone();
@@ -168,14 +218,16 @@ impl<S: RemoteStore + 'static> LedgerRemux<S> {
         let progress_output = output_tx.clone();
         let progress_job_id = job_id.clone();
         let progress_subject = subject.clone();
+        let progress_market_day = market_day.clone();
         tokio::spawn(async move {
             while let Some(progress) = progress_rx.recv().await {
                 let (stage, records) = prepare_progress_stage(progress);
                 progress_jobs.progress(&progress_job_id, stage.clone(), records);
                 let params = json!({
                     "jobId": progress_job_id,
-                    "kind": "es.prepare",
+                    "kind": "es.install",
                     "subject": progress_subject,
+                    "marketDay": progress_market_day,
                     "stage": stage,
                     "records": records,
                 });
@@ -188,91 +240,28 @@ impl<S: RemoteStore + 'static> LedgerRemux<S> {
         });
         tokio::spawn(async move {
             let result =
-                prepare_es_replay_artifact(&store, &raw_id, force, Some(progress_tx)).await;
+                prepare_es_replay_artifact(&store, &raw_id, false, Some(progress_tx)).await;
+            let finished = JobFinishedContext {
+                job_id: &job_id,
+                kind: "es.install",
+                subject: &subject,
+                market_day: market_day.as_deref(),
+            };
             match result {
                 Ok(artifact) => {
-                    let summary = match serde_json::to_value(artifact.summary(&raw_id)) {
-                        Ok(summary) => summary,
-                        Err(error) => json!({ "error": error.to_string() }),
-                    };
+                    let summary = summary_value(&artifact.summary(&raw_id));
                     jobs.complete(&job_id, summary.clone());
-                    send_job_finished(&output_tx, &job_id, true, Some(summary), None).await;
+                    send_job_finished(&output_tx, finished, true, Some(summary), None).await;
                 }
                 Err(error) => {
                     let error = error.to_string();
                     jobs.fail(&job_id, error.clone());
-                    send_job_finished(&output_tx, &job_id, false, None, Some(error)).await;
+                    send_job_finished(&output_tx, finished, false, None, Some(error)).await;
                 }
             }
         });
     }
 
-    fn spawn_fetch_job(
-        &self,
-        job_id: String,
-        market_day: MarketDay,
-        symbol: String,
-        dataset: String,
-        force: bool,
-    ) {
-        let store = self.store.clone();
-        let jobs = self.jobs.clone();
-        let output_tx = self.output_tx.clone();
-        let subject = format!("{market_day} {symbol}");
-        let staging_dir = self
-            .fetch_staging_root
-            .join(&symbol)
-            .join(market_day.to_string());
-        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
-        let progress_jobs = jobs.clone();
-        let progress_output = output_tx.clone();
-        let progress_job_id = job_id.clone();
-        let progress_subject = subject.clone();
-        tokio::spawn(async move {
-            while let Some(progress) = progress_rx.recv().await {
-                let stage = fetch_progress_stage(progress);
-                progress_jobs.progress(&progress_job_id, stage.clone(), None);
-                let params = json!({
-                    "jobId": progress_job_id,
-                    "kind": "es.fetch",
-                    "subject": progress_subject,
-                    "stage": stage,
-                });
-                if let Err(error) =
-                    send_notification(&progress_output, JOBS_PROGRESS_NOTIFICATION, params).await
-                {
-                    eprintln!("[ledger-remux] failed to broadcast job progress: {error}");
-                }
-            }
-        });
-        tokio::spawn(async move {
-            let result = fetch_es_raw(
-                &store,
-                market_day,
-                &symbol,
-                &dataset,
-                &staging_dir,
-                force,
-                Some(progress_tx),
-            )
-            .await;
-            match result {
-                Ok(summary) => {
-                    let summary = match serde_json::to_value(summary) {
-                        Ok(summary) => summary,
-                        Err(error) => json!({ "error": error.to_string() }),
-                    };
-                    jobs.complete(&job_id, summary.clone());
-                    send_job_finished(&output_tx, &job_id, true, Some(summary), None).await;
-                }
-                Err(error) => {
-                    let error = error.to_string();
-                    jobs.fail(&job_id, error.clone());
-                    send_job_finished(&output_tx, &job_id, false, None, Some(error)).await;
-                }
-            }
-        });
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -299,18 +288,29 @@ struct IdParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct EsPrepareParams {
+struct EsInstallParams {
     raw_id: String,
-    force: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct EsFetchParams {
+struct EsOffloadParams {
     market_day: String,
-    symbol: String,
-    dataset: Option<String>,
-    force: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EsOffloadReportDto {
+    market_day: String,
+    offloaded: Vec<OffloadedObjectDto>,
+    bytes_removed: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OffloadedObjectDto {
+    id: String,
+    bytes_removed: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -443,6 +443,26 @@ struct DeleteReportDto {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct OffloadReportDto {
+    id: Option<String>,
+    removed: bool,
+    path: Option<String>,
+    bytes_removed: u64,
+}
+
+impl From<RemoveLocalObjectReport> for OffloadReportDto {
+    fn from(report: RemoveLocalObjectReport) -> Self {
+        Self {
+            id: report.id.map(|id| id.to_string()),
+            removed: report.removed,
+            path: report.path.map(|path| path.display().to_string()),
+            bytes_removed: report.bytes_removed,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct LocalStatusDto {
     root: String,
     local_objects: usize,
@@ -560,6 +580,12 @@ fn to_value<T: Serialize>(value: T) -> Result<Value, RpcError> {
     serde_json::to_value(value).map_err(|err| RpcError::domain(err.to_string()))
 }
 
+// Job summaries ride a notification, so a serialization failure degrades to an
+// inline error value instead of losing the completion event.
+fn summary_value<T: Serialize>(value: &T) -> Value {
+    serde_json::to_value(value).unwrap_or_else(|error| json!({ "error": error.to_string() }))
+}
+
 fn prepare_progress_stage(progress: PrepareProgress) -> (String, Option<u64>) {
     match progress {
         PrepareProgress::Hydrating => ("hydrating".to_string(), None),
@@ -569,23 +595,28 @@ fn prepare_progress_stage(progress: PrepareProgress) -> (String, Option<u64>) {
     }
 }
 
-fn fetch_progress_stage(progress: FetchProgress) -> String {
-    match progress {
-        FetchProgress::Requesting => "requesting".to_string(),
-        FetchProgress::Downloading => "downloading".to_string(),
-        FetchProgress::Registering => "registering".to_string(),
-    }
+// Identity fields repeated on the finished notification so the client can key
+// the outcome by day without joining against its local job table.
+#[derive(Clone, Copy)]
+struct JobFinishedContext<'a> {
+    job_id: &'a str,
+    kind: &'a str,
+    subject: &'a str,
+    market_day: Option<&'a str>,
 }
 
 async fn send_job_finished(
     output_tx: &OutboundSender,
-    job_id: &str,
+    context: JobFinishedContext<'_>,
     ok: bool,
     summary: Option<Value>,
     error: Option<String>,
 ) {
     let params = json!({
-        "jobId": job_id,
+        "jobId": context.job_id,
+        "kind": context.kind,
+        "subject": context.subject,
+        "marketDay": context.market_day,
         "ok": ok,
         "summary": summary,
         "error": error,
@@ -612,7 +643,7 @@ fn ns_to_datetime(ns: u64) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::{INVALID_PARAMS, METHOD_NOT_FOUND};
+    use crate::error::{DOMAIN_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
     use async_trait::async_trait;
     use serde_json::json;
     use std::collections::HashMap;
@@ -757,7 +788,7 @@ mod tests {
         )
         .unwrap();
         let (output_tx, _output_rx) = mpsc::channel(8);
-        LedgerRemux::new(store, output_tx, data.path().join("tmp").join("fetch"))
+        LedgerRemux::new(store, output_tx)
     }
 
     async fn register_object(
@@ -970,6 +1001,196 @@ mod tests {
 
         assert_eq!(result["descriptorRemoved"], true);
         assert_eq!(result["remoteObjectDeleted"], true);
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_raw_objects() {
+        let data = tempdir().unwrap();
+        let methods = open_methods(&data);
+        let descriptor = register_object(
+            &methods,
+            &data,
+            StoreObjectRole::Raw,
+            "paid.dbn.zst",
+            b"paid raw bytes",
+        )
+        .await;
+
+        let err = methods
+            .handle(Request {
+                method: STORE_DELETE_METHOD.to_string(),
+                params: json!({ "id": descriptor.id.to_string() }),
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, DOMAIN_ERROR);
+        assert!(err.message.contains("refusing to delete raw object"));
+        assert!(methods.store.get_object(&descriptor.id).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn offload_drops_local_and_keeps_descriptor() {
+        let data = tempdir().unwrap();
+        let methods = open_methods(&data);
+        let descriptor = register_object(
+            &methods,
+            &data,
+            StoreObjectRole::Artifact,
+            "offload.bin",
+            b"offload bytes",
+        )
+        .await;
+
+        let result = methods
+            .handle(Request {
+                method: STORE_OFFLOAD_METHOD.to_string(),
+                params: json!({ "id": descriptor.id.to_string() }),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result["removed"], true);
+        assert_eq!(result["bytesRemoved"], b"offload bytes".len() as u64);
+        let after = methods
+            .store
+            .get_object(&descriptor.id)
+            .unwrap()
+            .unwrap();
+        assert!(after.local.is_none());
+        assert!(after.remote.is_some());
+    }
+
+    async fn register_es_raw(
+        methods: &LedgerRemux<TestRemote>,
+        data: &TempDir,
+        file_name: &str,
+        market_day: &str,
+    ) -> StoreObjectDescriptor {
+        let source = data.path().join(file_name);
+        tokio::fs::write(&source, b"es raw bytes").await.unwrap();
+        methods
+            .store
+            .register_file(RegisterFileRequest {
+                path: &source,
+                role: StoreObjectRole::Raw,
+                kind: "databento.dbn.zst".to_string(),
+                file_name: None,
+                format: None,
+                media_type: None,
+                lineage: Vec::new(),
+                metadata_json: json!({
+                    "market_day": market_day,
+                    "source_symbol": "ESH6",
+                }),
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn install_starts_day_tagged_job() {
+        let data = tempdir().unwrap();
+        let methods = open_methods(&data);
+        let descriptor = register_es_raw(&methods, &data, "install.dbn.zst", "2026-03-10").await;
+
+        let result = methods
+            .handle(Request {
+                method: ES_INSTALL_METHOD.to_string(),
+                params: json!({ "rawId": descriptor.id.to_string() }),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result["jobId"], "job-1");
+
+        let jobs = methods
+            .handle(Request {
+                method: JOBS_LIST_METHOD.to_string(),
+                params: Value::Null,
+            })
+            .await
+            .unwrap();
+        assert_eq!(jobs["jobs"][0]["kind"], "es.install");
+        assert_eq!(jobs["jobs"][0]["subject"], descriptor.id.to_string());
+        assert_eq!(jobs["jobs"][0]["marketDay"], "2026-03-10");
+    }
+
+    #[tokio::test]
+    async fn install_returns_object_not_found_for_unknown_raw() {
+        let data = tempdir().unwrap();
+        let methods = open_methods(&data);
+        let id = format!("sha256-{}", "0".repeat(64));
+
+        let err = methods
+            .handle(Request {
+                method: ES_INSTALL_METHOD.to_string(),
+                params: json!({ "rawId": id }),
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.message, "objectNotFound");
+    }
+
+    #[tokio::test]
+    async fn offload_day_drops_local_copies() {
+        let data = tempdir().unwrap();
+        let methods = open_methods(&data);
+        let descriptor = register_es_raw(&methods, &data, "offload.dbn.zst", "2026-03-10").await;
+
+        let result = methods
+            .handle(Request {
+                method: ES_OFFLOAD_METHOD.to_string(),
+                params: json!({ "marketDay": "2026-03-10" }),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result["marketDay"], "2026-03-10");
+        assert_eq!(result["bytesRemoved"], b"es raw bytes".len() as u64);
+        assert_eq!(result["offloaded"].as_array().unwrap().len(), 1);
+        let after = methods
+            .store
+            .get_object(&descriptor.id)
+            .unwrap()
+            .unwrap();
+        assert!(after.local.is_none());
+        assert!(after.remote.is_some());
+    }
+
+    #[tokio::test]
+    async fn offload_unknown_day_errors() {
+        let data = tempdir().unwrap();
+        let methods = open_methods(&data);
+
+        let err = methods
+            .handle(Request {
+                method: ES_OFFLOAD_METHOD.to_string(),
+                params: json!({ "marketDay": "2026-03-10" }),
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, DOMAIN_ERROR);
+        assert!(err.message.contains("unknown ES market day"));
+    }
+
+    #[tokio::test]
+    async fn offload_returns_object_not_found_for_unknown_id() {
+        let data = tempdir().unwrap();
+        let methods = open_methods(&data);
+        let id = format!("sha256-{}", "0".repeat(64));
+
+        let err = methods
+            .handle(Request {
+                method: STORE_OFFLOAD_METHOD.to_string(),
+                params: json!({ "id": id }),
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.message, "objectNotFound");
     }
 
     #[tokio::test]

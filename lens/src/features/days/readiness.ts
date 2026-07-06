@@ -1,42 +1,30 @@
+import { formatStoreObject } from "@/features/data-center/api"
 import type { StoreObject } from "@/features/data-center/types"
 import type {
   EsDayCatalog,
   EsRawStatus,
   JobRecord,
-  StoreDescriptor,
 } from "@/features/days/types"
 
-// Where an object currently lives. Replay reads the local artifact, so
-// "ready-local" is the only state that can hit play immediately; "ready-remote"
-// needs a hydrate first.
-export type Locality = "local" | "remote" | "absent" | "unknown"
-
-// The single most useful next step for a raw, derived by folding prep state
-// (from the day catalog) together with locality (from the store object list)
-// and any in-flight job or last error.
-export type ReadinessState =
-  | "preparing"
-  | "failed"
-  | "ready-local"
-  | "ready-remote"
-  | "unprepared"
+// The day lifecycle, folded from the catalog (which carries full descriptors,
+// locality included) plus the day-keyed job stream. Everything is always in
+// R2; "ready" means the artifact is also local — the only state replay can
+// hit play from. "offloaded" covers both artifact-remote and not-built-yet:
+// either way it isn't here, and Install fixes it.
+export type ReadinessState = "installing" | "ready" | "offloaded" | "failed"
 
 export interface RawReadiness {
   raw: EsRawStatus
   state: ReadinessState
   symbol: string
-  rawLocality: Locality
-  artifactLocality: Locality
+  // Live job stage ("downloading", "decoding", ...) while installing.
+  stage: string | null
   eventCount: number | null
   batchCount: number | null
   job?: JobRecord
   error?: string
-  // Resolved store objects (null when the catalog descriptor has no matching
-  // store entry). artifactObject is the hydrate target for a ready-remote day.
-  rawObject: StoreObject | null
-  artifactObject: StoreObject | null
-  // Store objects backing this raw (the raw itself, plus its artifact when
-  // prepared). Feeds the per-day storage drawer without a second fetch.
+  // Shaped store objects backing this raw (the raw itself, plus its artifact
+  // when built). Feeds the per-day storage drawer without a second fetch.
   storageObjects: StoreObject[]
 }
 
@@ -46,26 +34,17 @@ export interface DayReadiness {
   // The raw the day card's headline reflects and whose primary action runs.
   primary: RawReadiness
   state: ReadinessState
+  stage: string | null
+  error?: string
   extraRawCount: number
   storageObjects: StoreObject[]
 }
 
-export type ObjectIndex = Map<string, StoreObject>
+// Raws with no market day yet file under this pseudo-day key everywhere:
+// job tagging, error tagging, and the home-list card.
+export const UNASSIGNED_KEY = "Unassigned"
 
-export function indexObjects(objects: StoreObject[]): ObjectIndex {
-  const map: ObjectIndex = new Map()
-  for (const object of objects) map.set(object.id, object)
-  return map
-}
-
-function locality(object: StoreObject | undefined): Locality {
-  if (!object) return "unknown"
-  if (object.local) return "local"
-  if (object.remote) return "remote"
-  return "absent"
-}
-
-function metadataString(metadata: unknown, key: string): string | null {
+export function metadataString(metadata: unknown, key: string): string | null {
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
     return null
   }
@@ -81,67 +60,52 @@ function metadataNumber(metadata: unknown, key: string): number | null {
   return typeof value === "number" ? value : null
 }
 
-function collectStorage(
-  descriptors: (StoreDescriptor | null | undefined)[],
-  objects: ObjectIndex
-): StoreObject[] {
-  const out: StoreObject[] = []
-  for (const descriptor of descriptors) {
-    if (!descriptor) continue
-    const object = objects.get(descriptor.id)
-    if (object) out.push(object)
-  }
-  return out
-}
-
 export function deriveRawReadiness(
   raw: EsRawStatus,
-  objects: ObjectIndex,
-  job: JobRecord | undefined,
+  dayJobs: JobRecord[],
   error: string | undefined
 ): RawReadiness {
-  const rawObject = objects.get(raw.raw.id)
-  const artifactObject = raw.artifact
-    ? objects.get(raw.artifact.id)
-    : undefined
-  const artifactLocality = raw.artifact ? locality(artifactObject) : "absent"
+  // Jobs are keyed to the day; an install's subject names its raw directly.
+  const job = dayJobs.find((entry) => entry.subject === raw.raw.id)
 
   let state: ReadinessState
+  let stage: string | null = null
   if (job?.state.status === "running") {
-    state = "preparing"
+    state = "installing"
+    stage = job.state.stage
+  } else if (raw.artifact?.local) {
+    state = "ready"
   } else if (error) {
     state = "failed"
-  } else if (raw.artifact) {
-    state = artifactLocality === "local" ? "ready-local" : "ready-remote"
   } else {
-    state = "unprepared"
+    state = "offloaded"
   }
+
+  const storageObjects = [raw.raw, raw.artifact]
+    .filter((descriptor) => descriptor !== null)
+    .map(formatStoreObject)
 
   return {
     raw,
     state,
     symbol: metadataString(raw.raw.metadataJson, "source_symbol") ?? "-",
-    rawLocality: locality(rawObject),
-    artifactLocality,
+    stage,
     eventCount: metadataNumber(raw.artifact?.metadataJson, "event_count"),
     batchCount: metadataNumber(raw.artifact?.metadataJson, "batch_count"),
     job,
     error,
-    rawObject: rawObject ?? null,
-    artifactObject: artifactObject ?? null,
-    storageObjects: collectStorage([raw.raw, raw.artifact], objects),
+    storageObjects,
   }
 }
 
-// Higher rank = further along the pipeline, so the day card headlines the most
-// advanced raw. Failures outrank plain unprepared raws so a broken prepare is
+// Higher rank = closer to replayable, so the day card headlines the most
+// advanced raw. Failures outrank plain offloaded raws so a broken install is
 // never hidden behind an untouched sibling.
 const STATE_RANK: Record<ReadinessState, number> = {
-  "ready-local": 5,
-  "ready-remote": 4,
-  preparing: 3,
+  ready: 4,
+  installing: 3,
   failed: 2,
-  unprepared: 1,
+  offloaded: 1,
 }
 
 function pickPrimary(raws: RawReadiness[]): RawReadiness {
@@ -153,17 +117,11 @@ function pickPrimary(raws: RawReadiness[]): RawReadiness {
 function deriveDay(
   marketDay: string,
   rawStatuses: EsRawStatus[],
-  objects: ObjectIndex,
-  jobsBySubject: Map<string, JobRecord>,
-  rowErrors: Map<string, string>
+  dayJobs: JobRecord[],
+  error: string | undefined
 ): DayReadiness {
   const raws = rawStatuses.map((raw) =>
-    deriveRawReadiness(
-      raw,
-      objects,
-      jobsBySubject.get(raw.raw.id),
-      rowErrors.get(raw.raw.id)
-    )
+    deriveRawReadiness(raw, dayJobs, error)
   )
   const primary = pickPrimary(raws)
   return {
@@ -171,6 +129,8 @@ function deriveDay(
     raws,
     primary,
     state: primary.state,
+    stage: primary.stage,
+    error,
     extraRawCount: raws.length - 1,
     storageObjects: raws.flatMap((entry) => entry.storageObjects),
   }
@@ -181,25 +141,30 @@ export interface ReadyCatalog {
   unassigned: DayReadiness | null
 }
 
-// The whole catalog resolved into day cards. `unassigned` collapses raws with
-// no market day into a single pseudo-day so the home stays a flat list.
+// The whole catalog resolved into day cards. Inputs are exactly the two
+// feed-level sources: the catalog and the day-keyed job/error maps — no
+// store-list join. `unassigned` collapses raws with no market day into a
+// single pseudo-day so the home stays a flat list.
 export function deriveCatalog(
   catalog: EsDayCatalog,
-  objects: ObjectIndex,
-  jobsBySubject: Map<string, JobRecord>,
-  rowErrors: Map<string, string>
+  jobsByDay: Map<string, JobRecord[]>,
+  dayErrors: Map<string, string>
 ): ReadyCatalog {
   const days = catalog.days.map((day) =>
-    deriveDay(day.marketDay, day.raws, objects, jobsBySubject, rowErrors)
+    deriveDay(
+      day.marketDay,
+      day.raws,
+      jobsByDay.get(day.marketDay) ?? [],
+      dayErrors.get(day.marketDay)
+    )
   )
   const unassigned =
     catalog.unassigned.length > 0
       ? deriveDay(
-          "Unassigned",
+          UNASSIGNED_KEY,
           catalog.unassigned,
-          objects,
-          jobsBySubject,
-          rowErrors
+          jobsByDay.get(UNASSIGNED_KEY) ?? [],
+          dayErrors.get(UNASSIGNED_KEY)
         )
       : null
   return { days, unassigned }

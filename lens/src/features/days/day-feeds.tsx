@@ -12,6 +12,7 @@ import { useState } from "react"
 import { Button } from "@/components/ui/button"
 import { DetailRow, RoleBadge } from "@/features/data-center/object-list"
 import type { StoreObject } from "@/features/data-center/types"
+import { stateLabel } from "@/features/days/day-status"
 import type { DayReadiness, RawReadiness } from "@/features/days/readiness"
 import type { EsRawStatus } from "@/features/days/types"
 import { cn } from "@/lib/utils"
@@ -19,25 +20,16 @@ import { cn } from "@/lib/utils"
 interface DayFeedsProps {
   day: DayReadiness
   openObject: StoreObject | null
-  hydratingIds: Set<string>
   onOpenObject: (object: StoreObject) => void
-  onPrepare: (raw: EsRawStatus, force: boolean) => void
-  onHydrate: (object: StoreObject) => void
+  onInstall: (raw: EsRawStatus) => void
 }
 
 // The body of the expanded action bar: a header (day + feed count) over a
 // content region that swaps between the feed view (its objects, with a single
 // Install action) and a single object's data. Which object is open is owned by
-// the action bar, which also carries the object's back/delete/hydrate controls,
-// so this view stays pure display — entering an object never stacks a modal.
-export function DayFeeds({
-  day,
-  openObject,
-  hydratingIds,
-  onOpenObject,
-  onPrepare,
-  onHydrate,
-}: DayFeedsProps) {
+// the action bar, which also carries the object's back/delete controls, so
+// this view stays pure display — entering an object never stacks a modal.
+export function DayFeeds({ day, openObject, onOpenObject, onInstall }: DayFeedsProps) {
   const [activeFeedId, setActiveFeedId] = useState<string | null>(null)
 
   // Fall back to the primary feed so a stale id from a previous day resolves
@@ -68,11 +60,9 @@ export function DayFeeds({
         <FeedView
           day={day}
           feed={activeFeed}
-          hydratingIds={hydratingIds}
           onSelectFeed={setActiveFeedId}
           onOpenObject={onOpenObject}
-          onPrepare={onPrepare}
-          onHydrate={onHydrate}
+          onInstall={onInstall}
         />
       )}
     </div>
@@ -89,19 +79,15 @@ function feedName(feed: RawReadiness): string {
 function FeedView({
   day,
   feed,
-  hydratingIds,
   onSelectFeed,
   onOpenObject,
-  onPrepare,
-  onHydrate,
+  onInstall,
 }: {
   day: DayReadiness
   feed: RawReadiness
-  hydratingIds: Set<string>
   onSelectFeed: (id: string) => void
   onOpenObject: (object: StoreObject) => void
-  onPrepare: (raw: EsRawStatus, force: boolean) => void
-  onHydrate: (object: StoreObject) => void
+  onInstall: (raw: EsRawStatus) => void
 }) {
   return (
     <div className="flex flex-col gap-3">
@@ -145,15 +131,10 @@ function FeedView({
             </span>
           ) : null}
         </div>
-        <InstallButton
-          feed={feed}
-          hydratingIds={hydratingIds}
-          onPrepare={onPrepare}
-          onHydrate={onHydrate}
-        />
+        <InstallButton feed={feed} onInstall={onInstall} />
       </div>
 
-      {feed.error ? (
+      {feed.error && feed.state === "failed" ? (
         <div className="px-0.5 text-[0.72rem] break-words text-destructive">
           {feed.error}
         </div>
@@ -177,22 +158,18 @@ function FeedView({
   )
 }
 
-// Install consolidates the raw → prepared → local pipeline behind one control:
-// it triggers the next step needed (prepare, then hydrate), shows a spinner
-// while either is in flight, and settles into a disabled "Installed" once the
-// artifact is local and ready.
+// One verb for the whole lifecycle: the backend hydrates an existing artifact
+// or rebuilds a missing/invalid one — this button never has to know which.
+// While the job runs it shows the live pipeline stage; a ready feed settles
+// into a disabled "Installed".
 function InstallButton({
   feed,
-  hydratingIds,
-  onPrepare,
-  onHydrate,
+  onInstall,
 }: {
   feed: RawReadiness
-  hydratingIds: Set<string>
-  onPrepare: (raw: EsRawStatus, force: boolean) => void
-  onHydrate: (object: StoreObject) => void
+  onInstall: (raw: EsRawStatus) => void
 }) {
-  if (feed.state === "ready-local") {
+  if (feed.state === "ready") {
     return (
       <Button
         type="button"
@@ -207,14 +184,11 @@ function InstallButton({
     )
   }
 
-  const hydrating = feed.artifactObject
-    ? hydratingIds.has(feed.artifactObject.id)
-    : false
-  if (feed.state === "preparing" || hydrating) {
+  if (feed.state === "installing") {
     return (
       <Button type="button" size="sm" className="h-8 shrink-0" disabled>
         <Loader2 className="size-3.5 animate-spin" />
-        Installing
+        {stateLabel(feed.state, feed.stage)}
       </Button>
     )
   }
@@ -224,16 +198,10 @@ function InstallButton({
       type="button"
       size="sm"
       className="h-8 shrink-0"
-      onClick={() => {
-        if (feed.state === "ready-remote" && feed.artifactObject) {
-          onHydrate(feed.artifactObject)
-        } else {
-          onPrepare(feed.raw, feed.raw.state === "prepared")
-        }
-      }}
+      onClick={() => onInstall(feed.raw)}
     >
       <Download className="size-3.5" />
-      Install
+      {feed.state === "failed" ? "Retry" : "Install"}
     </Button>
   )
 }
@@ -265,7 +233,7 @@ function ObjectRow({
           <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
             {object.kind}
           </span>
-          <LocalityIcons object={object} />
+          <LocalityIcon object={object} />
         </div>
       </div>
       <ChevronRight
@@ -276,8 +244,8 @@ function ObjectRow({
   )
 }
 
-// Object detail: header + metadata only. Back / delete / hydrate ride on the
-// action bar for as long as this view is open.
+// Object detail: header + metadata only. Back / delete ride on the action bar
+// for as long as this view is open.
 function ObjectView({ object }: { object: StoreObject }) {
   return (
     <div className="flex flex-col gap-2.5">
@@ -286,7 +254,7 @@ function ObjectView({ object }: { object: StoreObject }) {
         <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">
           {object.fileName}
         </span>
-        <LocalityIcons object={object} />
+        <LocalityIcon object={object} />
       </div>
 
       <div className="rounded-lg border border-border bg-card/30 p-2.5 text-xs">
@@ -319,24 +287,17 @@ function ObjectView({ object }: { object: StoreObject }) {
   )
 }
 
-function LocalityIcons({ object }: { object: StoreObject }) {
-  return (
-    <div className="flex shrink-0 items-center gap-1.5">
-      <Cloud
-        aria-hidden="true"
-        className={cn(
-          "size-3",
-          object.remote ? "text-muted-foreground" : "text-muted-foreground/40"
-        )}
-      />
-      <HardDrive
-        aria-hidden="true"
-        className={cn(
-          "size-3",
-          object.local ? "text-success" : "text-muted-foreground/40"
-        )}
-      />
-    </div>
+// One icon, one question: is it installed here? Everything is always in R2
+// (registration uploads before it registers), so the only signal worth a
+// glyph is the local copy — disk when present, cloud when it lives remote.
+function LocalityIcon({ object }: { object: StoreObject }) {
+  return object.local ? (
+    <HardDrive aria-hidden="true" className="size-3 shrink-0 text-success" />
+  ) : (
+    <Cloud
+      aria-hidden="true"
+      className="size-3 shrink-0 text-muted-foreground"
+    />
   )
 }
 

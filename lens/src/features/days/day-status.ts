@@ -6,9 +6,21 @@ export const STATE_META: Record<
   ReadinessState,
   { label: string; dot: string; pulse?: boolean }
 > = {
-  "ready-local": { label: "Ready to replay", dot: "bg-success" },
-  "ready-remote": { label: "Needs hydrate", dot: "bg-amber-500" },
-  preparing: { label: "Preparing", dot: "bg-link", pulse: true },
-  failed: { label: "Prepare failed", dot: "bg-destructive" },
-  unprepared: { label: "Not prepared", dot: "bg-muted-foreground" },
+  installing: { label: "Installing", dot: "bg-link", pulse: true },
+  ready: { label: "Ready to replay", dot: "bg-success" },
+  offloaded: { label: "Offloaded", dot: "bg-amber-500" },
+  failed: { label: "Failed", dot: "bg-destructive" },
+}
+
+// While a job runs, the label is its live stage ("downloading", "decoding",
+// ...) so the pipeline is visible right on the card; otherwise the state's
+// static label.
+export function stateLabel(
+  state: ReadinessState,
+  stage: string | null
+): string {
+  if (state === "installing" && stage) {
+    return stage.charAt(0).toUpperCase() + stage.slice(1)
+  }
+  return STATE_META[state].label
 }

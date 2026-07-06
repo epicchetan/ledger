@@ -260,13 +260,40 @@ impl<S: RemoteStore + 'static> Store<S> {
         remove_local_copy(&self.local, &self.registry, id)
     }
 
-    pub async fn delete_object(&self, id: &StoreObjectId) -> Result<DeleteObjectReport> {
+    /// Offload: drop the local copy while the object stays in R2 (descriptor
+    /// and remote bytes untouched). Refuses when no remote copy exists, since
+    /// removing the local file would then destroy the only copy.
+    pub fn offload_object(&self, id: &StoreObjectId) -> Result<RemoveLocalObjectReport> {
+        let descriptor = self
+            .registry
+            .get(id)?
+            .ok_or_else(|| anyhow!("store object {id} not found"))?;
+        if descriptor.remote.is_none() {
+            bail!("refusing to offload {id}: object has no remote copy");
+        }
+        self.remove_local_copy(id)
+    }
+
+    /// Delete everywhere: remote object + descriptor mirror, local copy, and
+    /// registry entry. Raw objects are paid source data and are refused unless
+    /// `force_raw` is set — re-fetching them costs real money, so deletion is
+    /// a deliberate maintenance act, never part of the day lifecycle.
+    pub async fn delete_object(
+        &self,
+        id: &StoreObjectId,
+        force_raw: bool,
+    ) -> Result<DeleteObjectReport> {
         let Some(descriptor) = self.registry.get(id)? else {
             return Ok(DeleteObjectReport {
                 id: Some(id.clone()),
                 ..Default::default()
             });
         };
+        if descriptor.role == StoreObjectRole::Raw && !force_raw {
+            bail!(
+                "refusing to delete raw object {id}: raw source data is retained by policy (force_raw overrides)"
+            );
+        }
 
         let mut report = DeleteObjectReport {
             id: Some(id.clone()),

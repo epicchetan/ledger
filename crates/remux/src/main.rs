@@ -21,13 +21,10 @@ async fn main() {
 async fn run() -> Result<()> {
     dotenvy::dotenv().ok();
     let data_dir = env::var("LEDGER_DATA_DIR").unwrap_or_else(|_| "data".to_string());
-    let fetch_staging_root = std::path::PathBuf::from(&data_dir)
-        .join("tmp")
-        .join("fetch");
     let store = R2Store::from_env(&data_dir).await?;
 
     rpc::serve_stdio(|output_tx| {
-        let methods = Arc::new(LedgerRemux::new(store, output_tx, fetch_staging_root));
+        let methods = Arc::new(LedgerRemux::new(store, output_tx));
         Arc::new(move |request: Request| {
             let methods = methods.clone();
             Box::pin(async move { methods.handle(request).await }) as DispatchFuture

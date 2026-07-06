@@ -22,6 +22,10 @@ pub struct JobRecord {
     pub id: String,
     pub kind: String,
     pub subject: String,
+    /// The market day this job settles, when known. Subject stays the dedup
+    /// key; this is the display key — the UI files every job under its day.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub market_day: Option<String>,
     pub state: JobState,
     #[serde(serialize_with = "serialize_ns")]
     pub started_at_ns: u64,
@@ -66,7 +70,12 @@ struct JobKey {
 }
 
 impl JobRegistry {
-    pub fn start(&self, kind: &str, subject: &str) -> Result<JobStart, RpcError> {
+    pub fn start(
+        &self,
+        kind: &str,
+        subject: &str,
+        market_day: Option<String>,
+    ) -> Result<JobStart, RpcError> {
         let key = JobKey {
             kind: kind.to_string(),
             subject: subject.to_string(),
@@ -84,6 +93,7 @@ impl JobRegistry {
             id: id.clone(),
             kind: kind.to_string(),
             subject: subject.to_string(),
+            market_day,
             state: JobState::Running {
                 stage: "queued".to_string(),
                 records: None,

@@ -440,7 +440,7 @@ async fn delete_object_removes_descriptor_remote_object_mirror_and_local() {
         .join("store")
         .join(descriptor.local.as_ref().unwrap().relative_path.as_path());
 
-    let report = store.delete_object(&descriptor.id).await.unwrap();
+    let report = store.delete_object(&descriptor.id, false).await.unwrap();
 
     assert!(report.descriptor_removed);
     assert!(report.remote_object_deleted);
@@ -450,6 +450,105 @@ async fn delete_object_removes_descriptor_remote_object_mirror_and_local() {
     assert!(!remote.contains_key(&descriptor_key));
     assert!(!local_path.exists());
     assert!(store.get_object(&descriptor.id).unwrap().is_none());
+}
+
+async fn register_test_raw(
+    store: &Store<TestRemote>,
+    data: &TempDir,
+    file_name: &str,
+    bytes: &[u8],
+) -> StoreObjectDescriptor {
+    let source = data.path().join(file_name);
+    tokio::fs::write(&source, bytes).await.unwrap();
+    store
+        .register_file(RegisterFileRequest {
+            path: &source,
+            role: StoreObjectRole::Raw,
+            kind: "databento.dbn.zst".to_string(),
+            file_name: None,
+            format: None,
+            media_type: None,
+            lineage: Vec::new(),
+            metadata_json: serde_json::json!({}),
+        })
+        .await
+        .unwrap()
+}
+
+// Raw objects are paid downloads: plain delete must refuse and leave every
+// copy in place.
+#[tokio::test]
+async fn delete_object_refuses_raw_without_force() {
+    let data = tempdir().unwrap();
+    let remote = Arc::new(TestRemote::new());
+    let store = open_test_store(&data, remote.clone(), 1024);
+    let descriptor = register_test_raw(&store, &data, "keep.dbn.zst", b"paid raw bytes").await;
+    let remote_key = descriptor.remote.as_ref().unwrap().key.clone();
+
+    let error = store
+        .delete_object(&descriptor.id, false)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("refusing to delete raw object"));
+    assert!(remote.contains_key(&remote_key));
+    assert!(store.get_object(&descriptor.id).unwrap().is_some());
+    assert!(local_path(&data, &descriptor).exists());
+}
+
+#[tokio::test]
+async fn delete_object_removes_raw_with_force() {
+    let data = tempdir().unwrap();
+    let remote = Arc::new(TestRemote::new());
+    let store = open_test_store(&data, remote.clone(), 1024);
+    let descriptor = register_test_raw(&store, &data, "force.dbn.zst", b"forced raw bytes").await;
+    let remote_key = descriptor.remote.as_ref().unwrap().key.clone();
+
+    let report = store.delete_object(&descriptor.id, true).await.unwrap();
+
+    assert!(report.descriptor_removed);
+    assert!(!remote.contains_key(&remote_key));
+    assert!(store.get_object(&descriptor.id).unwrap().is_none());
+}
+
+// Offload drops only the local copy; descriptor and remote bytes survive, so
+// a later hydrate restores the object without re-fetching.
+#[tokio::test]
+async fn offload_object_drops_local_and_keeps_remote() {
+    let data = tempdir().unwrap();
+    let remote = Arc::new(TestRemote::new());
+    let store = open_test_store(&data, remote.clone(), 1024);
+    let descriptor = register_test_object(&store, &data, "offload.bin", b"offload bytes").await;
+    let remote_key = descriptor.remote.as_ref().unwrap().key.clone();
+    let path = local_path(&data, &descriptor);
+
+    let report = store.offload_object(&descriptor.id).unwrap();
+
+    assert!(report.removed);
+    assert_eq!(report.bytes_removed, b"offload bytes".len() as u64);
+    assert!(!path.exists());
+    assert!(remote.contains_key(&remote_key));
+    let after = store.get_object(&descriptor.id).unwrap().unwrap();
+    assert!(after.local.is_none());
+    assert!(after.remote.is_some());
+
+    let hydrated = store.hydrate(&descriptor.id).await.unwrap();
+    assert_eq!(
+        tokio::fs::read(&hydrated.path).await.unwrap(),
+        b"offload bytes"
+    );
+}
+
+#[tokio::test]
+async fn offload_object_errors_on_unknown_object_id() {
+    let data = tempdir().unwrap();
+    let remote = Arc::new(TestRemote::new());
+    let store = open_test_store(&data, remote, 1024);
+    let id = StoreObjectId::new(format!("sha256-{}", "0".repeat(64))).unwrap();
+
+    let error = store.offload_object(&id).unwrap_err();
+
+    assert!(error.to_string().contains("not found"));
 }
 
 #[tokio::test]

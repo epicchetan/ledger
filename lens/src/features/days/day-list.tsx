@@ -1,7 +1,7 @@
 import { CalendarDays } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
-import { STATE_META } from "@/features/days/day-status"
+import { STATE_META, stateLabel } from "@/features/days/day-status"
 import type { DayReadiness } from "@/features/days/readiness"
 import { cn } from "@/lib/utils"
 
@@ -109,7 +109,7 @@ function DayCard({
   selected: boolean
   onSelect: (day: DayReadiness) => void
 }) {
-  const meta = STATE_META[day.primary.state]
+  const meta = STATE_META[day.state]
 
   return (
     <Button
@@ -149,7 +149,7 @@ function DayCard({
           aria-hidden="true"
         />
         <span className="truncate text-xs font-normal text-muted-foreground">
-          {meta.label}
+          {stateLabel(day.state, day.stage)}
         </span>
       </span>
     </Button>

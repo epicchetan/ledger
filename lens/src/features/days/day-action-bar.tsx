@@ -6,7 +6,7 @@ import { ActionBar, ActionButton } from "@remux/viewer-kit/ui"
 import {
   ArrowLeft,
   ChevronDown,
-  Download,
+  CloudUpload,
   Loader2,
   PanelRightOpen,
   RefreshCw,
@@ -23,26 +23,27 @@ import { cn } from "@/lib/utils"
 interface DayActionBarProps {
   day: DayReadiness | null
   status: string
-  hydratingIds: Set<string>
+  offloadingDay: string | null
   onClose: () => void
-  onPrepare: (raw: EsRawStatus, force: boolean) => void
-  onHydrate: (object: StoreObject) => void
+  onInstall: (raw: EsRawStatus) => void
+  onOffload: (day: DayReadiness) => void
   onDeleteObject: (object: StoreObject) => void
 }
 
-// One action bar that morphs with selection. The core buttons (tab out, reload)
-// are pinned in every state. Picking a day expands a panel upward on the same
-// bar surface — the feed pipeline, its next-step action, and store objects — so
-// the day-scoped control the bar itself carries is minimize. Drilling into an
-// object doesn't take the bar over: it just adds that object's controls (back,
-// delete, hydrate) alongside the pinned ones for as long as it is open.
+// One action bar that morphs with selection. The core buttons (tab out,
+// reload) are pinned in every state. Picking a day expands a panel upward on
+// the same bar surface — the feed pipeline, its Install action, and store
+// objects — so the day-scoped controls the bar itself carries are offload and
+// minimize. Drilling into an object doesn't take the bar over: it just adds
+// that object's controls (back, delete) alongside the pinned ones for as long
+// as it is open.
 export function DayActionBar({
   day,
   status,
-  hydratingIds,
+  offloadingDay,
   onClose,
-  onPrepare,
-  onHydrate,
+  onInstall,
+  onOffload,
   onDeleteObject,
 }: DayActionBarProps) {
   const open = day !== null
@@ -68,7 +69,7 @@ export function DayActionBar({
     objectId && shown
       ? (shown.storageObjects.find((object) => object.id === objectId) ?? null)
       : null
-  const hydrating = openObject ? hydratingIds.has(openObject.id) : false
+  const offloading = shown !== null && offloadingDay === shown.marketDay
 
   return (
     <ActionBar
@@ -88,10 +89,8 @@ export function DayActionBar({
                   <DayFeeds
                     day={shown}
                     openObject={openObject}
-                    hydratingIds={hydratingIds}
                     onOpenObject={(object) => setObjectId(object.id)}
-                    onPrepare={onPrepare}
-                    onHydrate={onHydrate}
+                    onInstall={onInstall}
                   />
                 </div>
               ) : null}
@@ -119,27 +118,6 @@ export function DayActionBar({
                 {openObject ? (
                   <>
                     <ActionButton
-                      icon={
-                        hydrating ? (
-                          <Loader2
-                            className="animate-spin"
-                            aria-hidden="true"
-                          />
-                        ) : (
-                          <Download aria-hidden="true" />
-                        )
-                      }
-                      label={
-                        openObject.local
-                          ? "Touch local copy"
-                          : "Hydrate object"
-                      }
-                      tone="primary"
-                      busy={hydrating}
-                      disabled={hydrating}
-                      onClick={() => onHydrate(openObject)}
-                    />
-                    <ActionButton
                       icon={<Trash2 aria-hidden="true" />}
                       label="Delete object"
                       onClick={() => onDeleteObject(openObject)}
@@ -155,6 +133,23 @@ export function DayActionBar({
                     />
                   </>
                 ) : null}
+                <ActionButton
+                  icon={
+                    offloading ? (
+                      <Loader2 className="animate-spin" aria-hidden="true" />
+                    ) : (
+                      <CloudUpload aria-hidden="true" />
+                    )
+                  }
+                  label="Offload day"
+                  busy={offloading}
+                  disabled={
+                    offloading || !shown || shown.state !== "ready"
+                  }
+                  onClick={() => {
+                    if (shown) onOffload(shown)
+                  }}
+                />
                 <ActionButton
                   icon={<ChevronDown aria-hidden="true" />}
                   label="Minimize"

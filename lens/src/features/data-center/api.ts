@@ -31,7 +31,10 @@ interface StoreDeleteResult {
   bytesDeleted: number
 }
 
-interface RemuxStoreObject {
+// Exported: the ES day catalog embeds these same wire descriptors, and the
+// days feature shapes them through formatStoreObject instead of re-fetching
+// the whole store list.
+export interface RemuxStoreObject {
   id: string
   role: string
   kind: string
@@ -137,7 +140,7 @@ function parseHydratedEvent(
   }
 }
 
-function formatStoreObject(record: RemuxStoreObject): StoreObject {
+export function formatStoreObject(record: RemuxStoreObject): StoreObject {
   return {
     id: record.id,
     role: record.role,
