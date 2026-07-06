@@ -1,4 +1,12 @@
-import { Check, ChevronRight, Cloud, Download, HardDrive, Loader2 } from "lucide-react"
+import {
+  CalendarDays,
+  Check,
+  ChevronRight,
+  Cloud,
+  Download,
+  HardDrive,
+  Loader2,
+} from "lucide-react"
 import { useState } from "react"
 
 import { Button } from "@/components/ui/button"
@@ -40,9 +48,15 @@ export function DayFeeds({
   return (
     <div className="flex flex-col gap-2.5">
       <div className="flex items-center justify-between gap-2 px-0.5">
-        <span className="font-mono text-sm font-semibold text-foreground">
-          {day.marketDay}
-        </span>
+        <div className="flex min-w-0 items-center gap-1.5">
+          <CalendarDays
+            aria-hidden="true"
+            className="size-4 shrink-0 text-muted-foreground"
+          />
+          <span className="font-mono text-sm font-semibold text-foreground">
+            {day.marketDay}
+          </span>
+        </div>
         <span className="text-[0.7rem] text-muted-foreground">
           {day.raws.length} feed{day.raws.length === 1 ? "" : "s"}
         </span>
