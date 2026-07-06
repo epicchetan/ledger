@@ -242,6 +242,67 @@ export function ObjectDetailDialog({
   )
 }
 
+export function DeleteObjectDialog({
+  object,
+  deleting,
+  onOpenChange,
+  onConfirm,
+}: {
+  object: StoreObject | null
+  deleting: boolean
+  onOpenChange: (open: boolean) => void
+  onConfirm: () => void
+}) {
+  return (
+    <Dialog open={object !== null} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Delete store object</DialogTitle>
+          <DialogDescription>
+            This removes the exact object descriptor, local object, R2 object,
+            and R2 descriptor mirror when present.
+          </DialogDescription>
+        </DialogHeader>
+        {object ? (
+          <div className="space-y-1 text-xs">
+            <DetailRow label="File" value={object.fileName} />
+            <DetailRow label="Role" value={object.role} />
+            <DetailRow label="Kind" value={object.kind} wrap />
+            <DetailRow label="ID" value={object.id} mono wrap />
+            <DetailRow
+              label="Remote"
+              value={object.remote?.key ?? "-"}
+              mono
+              wrap
+            />
+          </div>
+        ) : null}
+        <DialogFooter>
+          <Button
+            type="button"
+            variant="outline"
+            disabled={deleting}
+            onClick={() => onOpenChange(false)}
+          >
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            variant="destructive"
+            disabled={deleting}
+            onClick={onConfirm}
+          >
+            <Trash2
+              className={deleting ? "size-3.5 animate-pulse" : "size-3.5"}
+            />
+            Delete
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 export function DetailRow({
   label,
   value,

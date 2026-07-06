@@ -1,39 +1,27 @@
 import {
-  closeHostTab,
-  openHostOverview,
   subscribeHostResume,
   updateHostTab,
 } from "@remux/viewer-kit/host"
-import { ActionBar, ActionButton } from "@remux/viewer-kit/ui"
-import {
-  CloudDownload,
-  Loader2,
-  PanelRightOpen,
-  RefreshCw,
-  X,
-} from "lucide-react"
-import type { FormEvent, ReactNode } from "react"
+import { Loader2 } from "lucide-react"
 import { useCallback, useEffect, useMemo, useState } from "react"
 import { toast } from "sonner"
 
-import { Button } from "@/components/ui/button"
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog"
-import { Input } from "@/components/ui/input"
+import { fetchStoreObjects } from "@/features/data-center/api"
+import { DeleteObjectDialog } from "@/features/data-center/object-list"
+import type {
+  StoreObject,
+  StoreObjectFilters,
+} from "@/features/data-center/types"
+import { useStoreObjectOps } from "@/features/data-center/use-store-object-ops"
 import {
   fetchEsDays,
   fetchJobs,
-  startFetchJob,
   startPrepareJob,
   subscribeLedgerJobs,
 } from "@/features/days/api"
+import { DayActionBar } from "@/features/days/day-action-bar"
 import { DayList } from "@/features/days/day-list"
+import { deriveCatalog, indexObjects } from "@/features/days/readiness"
 import type {
   DaysLoadState,
   EsDayCatalog,
@@ -48,30 +36,40 @@ const EMPTY_CATALOG: EsDayCatalog = {
   unassigned: [],
 }
 
+// The readiness rollup needs every object's locality, so we pull the full
+// store list unfiltered and join it onto the catalog by id on the client.
+const ALL_OBJECTS: StoreObjectFilters = {
+  role: "",
+  kind: "",
+  idPrefix: "",
+}
+
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Unknown error"
 }
 
-export function Days({ viewerMenu }: { viewerMenu?: ReactNode }) {
+export function Days() {
   const [catalog, setCatalog] = useState<EsDayCatalog>(EMPTY_CATALOG)
+  const [objects, setObjects] = useState<StoreObject[]>([])
   const [jobs, setJobs] = useState<JobRecord[]>([])
   const [rowErrors, setRowErrors] = useState<Map<string, string>>(new Map())
   const [loadState, setLoadState] = useState<DaysLoadState>({
     kind: "loading",
     message: "Loading ES days.",
   })
-  const [fetchOpen, setFetchOpen] = useState(false)
-  const [fetching, setFetching] = useState(false)
+  const [selectedKey, setSelectedKey] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     setLoadState({ kind: "loading", message: "Loading ES days." })
     try {
-      const [nextCatalog, nextJobs] = await Promise.all([
+      const [nextCatalog, nextJobs, nextObjects] = await Promise.all([
         fetchEsDays(),
         fetchJobs(),
+        fetchStoreObjects(ALL_OBJECTS),
       ])
       setCatalog(nextCatalog)
       setJobs(nextJobs.jobs)
+      setObjects(nextObjects)
       const totalRows =
         nextCatalog.days.reduce((sum, day) => sum + day.raws.length, 0) +
         nextCatalog.unassigned.length
@@ -82,6 +80,7 @@ export function Days({ viewerMenu }: { viewerMenu?: ReactNode }) {
       )
     } catch (error) {
       setCatalog(EMPTY_CATALOG)
+      setObjects([])
       setJobs([])
       setLoadState({
         kind: "error",
@@ -102,6 +101,8 @@ export function Days({ viewerMenu }: { viewerMenu?: ReactNode }) {
       void load()
     })
   }, [load])
+
+  const ops = useStoreObjectOps(load)
 
   const handleProgress = useCallback((event: JobProgressEvent) => {
     setJobs((current) => upsertRunningJob(current, event))
@@ -161,6 +162,27 @@ export function Days({ viewerMenu }: { viewerMenu?: ReactNode }) {
     return map
   }, [jobs])
 
+  const objectIndex = useMemo(() => indexObjects(objects), [objects])
+  const derived = useMemo(
+    () => deriveCatalog(catalog, objectIndex, jobsBySubject, rowErrors),
+    [catalog, objectIndex, jobsBySubject, rowErrors]
+  )
+
+  const findDay = useCallback(
+    (key: string | null) => {
+      if (!key) return null
+      const match = derived.days.find((day) => day.marketDay === key)
+      if (match) return match
+      return derived.unassigned?.marketDay === key ? derived.unassigned : null
+    },
+    [derived]
+  )
+
+  const selectedDay = useMemo(
+    () => findDay(selectedKey),
+    [findDay, selectedKey]
+  )
+
   const runningCount = jobs.filter((job) => job.state.status === "running").length
   const dayCount = catalog.days.length
   const barStatus =
@@ -198,22 +220,6 @@ export function Days({ viewerMenu }: { viewerMenu?: ReactNode }) {
     }
   }
 
-  async function fetchDay(marketDay: string, symbol: string) {
-    setFetching(true)
-    try {
-      const result = await startFetchJob(marketDay, symbol)
-      toast.success(result.alreadyRunning ? "Fetch already running" : "Fetch started", {
-        description: `${marketDay} ${symbol}`,
-      })
-      setFetchOpen(false)
-      await load()
-    } catch (error) {
-      toast.error("Fetch failed", { description: errorMessage(error) })
-    } finally {
-      setFetching(false)
-    }
-  }
-
   return (
     <div className="flex h-full flex-col bg-background text-foreground">
       <main className="lens-safe-top lens-scroll min-h-0 flex-1 overflow-y-auto px-3 py-2">
@@ -227,131 +233,33 @@ export function Days({ viewerMenu }: { viewerMenu?: ReactNode }) {
           <DaysStatePanel loading message={loadState.message} title="Loading" />
         ) : (
           <DayList
-            days={catalog.days}
-            jobsBySubject={jobsBySubject}
-            onPrepare={(raw, force) => void prepare(raw, force)}
-            rowErrors={rowErrors}
-            unassigned={catalog.unassigned}
+            days={derived.days}
+            unassigned={derived.unassigned}
+            selectedKey={selectedKey}
+            onSelect={(day) => setSelectedKey(day.marketDay)}
           />
         )}
       </main>
 
-      <ActionBar
-        left={
-          <>
-            {viewerMenu}
-            <ActionButton
-              busy={loadState.kind === "loading"}
-              disabled={loadState.kind === "loading"}
-              icon={<RefreshCw aria-hidden="true" />}
-              label="Refresh"
-              onClick={() => {
-                void load()
-              }}
-            />
-            <ActionButton
-              icon={<CloudDownload aria-hidden="true" />}
-              label="Fetch day"
-              onClick={() => setFetchOpen(true)}
-            />
-          </>
-        }
-        right={
-          <>
-            <ActionButton
-              icon={<PanelRightOpen aria-hidden="true" />}
-              label="Open tabs"
-              onClick={() => {
-                void openHostOverview({ section: "tabs" })
-              }}
-            />
-            <ActionButton
-              icon={<X aria-hidden="true" />}
-              label="Close tab"
-              onClick={() => {
-                void closeHostTab()
-              }}
-            />
-          </>
-        }
+      <DayActionBar
+        day={selectedDay}
         status={barStatus}
+        hydratingIds={ops.hydratingIds}
+        onClose={() => setSelectedKey(null)}
+        onPrepare={(raw, force) => void prepare(raw, force)}
+        onHydrate={(object) => void ops.hydrateObject(object)}
+        onDeleteObject={ops.setDeleteTarget}
       />
 
-      <FetchDayDialog
-        fetching={fetching}
-        onConfirm={(marketDay, symbol) => void fetchDay(marketDay, symbol)}
-        onOpenChange={setFetchOpen}
-        open={fetchOpen}
+      <DeleteObjectDialog
+        object={ops.deleteTarget}
+        deleting={ops.deleting}
+        onOpenChange={(open) => {
+          if (!open && !ops.deleting) ops.setDeleteTarget(null)
+        }}
+        onConfirm={() => void ops.confirmDelete()}
       />
     </div>
-  )
-}
-
-function FetchDayDialog({
-  fetching,
-  onConfirm,
-  onOpenChange,
-  open,
-}: {
-  fetching: boolean
-  onConfirm: (marketDay: string, symbol: string) => void
-  onOpenChange: (open: boolean) => void
-  open: boolean
-}) {
-  const [marketDay, setMarketDay] = useState("")
-  const [symbol, setSymbol] = useState("")
-
-  function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    const day = marketDay.trim()
-    const nextSymbol = symbol.trim().toUpperCase()
-    if (!day || !nextSymbol) return
-    onConfirm(day, nextSymbol)
-  }
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
-        <form onSubmit={submit}>
-          <DialogHeader>
-            <DialogTitle>Fetch day</DialogTitle>
-            <DialogDescription>
-              Databento ES MBO raw download.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="my-4 grid gap-2">
-            <Input
-              className="text-xs"
-              disabled={fetching}
-              onChange={(event) => setMarketDay(event.target.value)}
-              placeholder="YYYY-MM-DD"
-              value={marketDay}
-            />
-            <Input
-              className="text-xs uppercase"
-              disabled={fetching}
-              onChange={(event) => setSymbol(event.target.value)}
-              placeholder="ESH6"
-              value={symbol}
-            />
-          </div>
-          <DialogFooter>
-            <Button
-              disabled={fetching}
-              onClick={() => onOpenChange(false)}
-              type="button"
-              variant="outline"
-            >
-              Cancel
-            </Button>
-            <Button disabled={fetching} type="submit">
-              {fetching ? <Loader2 className="size-3.5 animate-spin" /> : null}
-              Fetch
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
   )
 }
 

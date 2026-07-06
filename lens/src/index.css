@@ -61,3 +61,24 @@
   scrollbar-color: color-mix(in oklab, var(--foreground) 35%, transparent)
     transparent;
 }
+
+/*
+ * Morphing action bar. Everything lives in the ActionBar's left slot as a
+ * vertical stack (info row + button row), so extra rows expand upward on the
+ * same bar surface instead of a separate panel. The left group must span the
+ * full width for the stack's rows to right-align their trailing controls, and
+ * the unused right group collapses. Mirrors the terminal viewer's approach.
+ */
+.lens-action-bar {
+  justify-content: flex-start;
+}
+
+.lens-action-bar .remux-extension-action-group {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: visible;
+}
+
+.lens-action-bar .remux-extension-action-group-right:empty {
+  display: none;
+}
