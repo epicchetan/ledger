@@ -1,5 +1,4 @@
 mod error;
-mod hydrate;
 mod jobs;
 mod methods;
 mod rpc;

@@ -1,193 +1,178 @@
 # CLI Reference
 
-The CLI is a thin adapter over the Ledger crates. It loads `.env`, constructs the required services, and prints JSON.
+The CLI is a thin adapter over the `store` and `ledger` crates. It loads `.env`, constructs the store, prints progress to stderr, and keeps structured results on stdout as JSON.
+
+```bash
+cargo run -p ledger-cli -- <command>
+```
 
 Global options:
 
 ```bash
---data-dir <path>      # default: data, env: LEDGER_DATA_DIR
---r2-prefix <prefix>   # default: ledger/v1, env: LEDGER_R2_PREFIX
---quiet                # suppress progress logs on stderr
+--data-dir <path>   # default: data, env: LEDGER_DATA_DIR
 ```
 
-Commands print progress to stderr and keep structured results on stdout as JSON.
-
-## `resolve`
-
-Resolve an ES contract and market date into Ledger's market-day window.
-
-```bash
-cargo run -p ledger-cli -- resolve --symbol ESH6 --date 2026-03-12
-```
-
-This does not touch R2, SQLite, or local replay dataset files. It only prints the resolved market-day metadata.
-
-## `ingest`
-
-Prepare a market day end to end.
-
-```bash
-cargo run -p ledger-cli -- ingest --symbol ESH6 --date 2026-03-12
-```
-
-This command:
+Configuration comes from `.env`:
 
 ```text
-downloads or reuses raw DBN
-preprocesses DBN into replay artifacts
-runs book-check
-uploads raw/artifacts to R2
-writes SQLite catalog rows
-catalogs Layer 1 raw data and Layer 2 ReplayDataset artifacts
+LEDGER_R2_ACCOUNT_ID              R2 account
+LEDGER_R2_ACCESS_KEY_ID           R2 credentials
+LEDGER_R2_SECRET_ACCESS_KEY       R2 credentials
+LEDGER_R2_BUCKET                  R2 bucket
+LEDGER_R2_ENDPOINT_URL            optional endpoint override
+LEDGER_R2_REGION                  optional, default auto
+LEDGER_R2_MULTIPART_THRESHOLD_BYTES   optional multipart tuning
+LEDGER_R2_MULTIPART_PART_SIZE_BYTES   optional multipart tuning
+LEDGER_STORE_LOCAL_MAX_BYTES      local copy budget for prune
+DATABENTO_API_KEY                 required by `es fetch`
 ```
 
-Rerunning `ingest` for a ready `MarketDay` should reuse the cataloged durable objects and avoid a Databento redownload.
+## ES days
 
-`download` is a hidden alias for `ingest`.
+An ES market day is a raw Databento DBN download plus a prepared replay artifact, both durable in R2. The lifecycle verbs:
 
-## `status`
+- **fetch** — download a day from Databento and make it replay-ready (CLI only).
+- **install** — make a day's artifact local again (lens, via remux).
+- **offload** — drop local copies; R2 keeps every byte (lens or `store offload`).
 
-Inspect one MarketDay's durable layer state.
+### `es days`
+
+Print the day catalog: every raw grouped by market day, with its artifact and state.
 
 ```bash
-cargo run -p ledger-cli -- status --symbol ESH6 --date 2026-03-12
+cargo run -p ledger-cli -- es days
 ```
 
-Important fields:
+### `es fetch`
 
-```text
-catalog_found              SQLite knows about this market day
-raw                        Layer 1 raw data record, if present
-replay_dataset             Layer 2 replay dataset record, if present
-objects                    replay artifact R2 object statuses
-replay_objects_valid       object metadata verification result when requested
-last_validation            latest persisted validation report
-```
-
-`status` does not hydrate files.
-
-## `list`
-
-Query cataloged market days.
+Download raw ES MBO data from Databento, register it, and chain straight into prepare so the day lands replay-ready. The raw's local copy is offloaded once the artifact exists; the paid download stays durable in R2.
 
 ```bash
-cargo run -p ledger-cli -- list --root ES
+cargo run -p ledger-cli -- es fetch --day 2026-03-12 --symbol ESH6
 ```
 
-Useful variants:
+Options:
 
 ```bash
-cargo run -p ledger-cli -- list --symbol ESH6
-cargo run -p ledger-cli -- list --root ES
+--dataset <name>   # default: GLBX.MDP3
+--force            # re-download even when a matching raw already exists
 ```
 
-This reads SQLite only. It does not scan R2.
+Without `--force`, a raw already registered for the same day/symbol/dataset is reused and no Databento request is made. Prepare always runs unforced: raw ids are content-addressed, so an existing valid artifact is reused and anything missing or invalid is rebuilt.
 
-## `session validate`
+### `es prepare`
 
-Validate a locally loaded `ReplayDataset`.
+Build or validate replay artifacts from registered raws. Fetch already chains into this; run it directly for maintenance — for example rebuilding artifacts after an `ES_MBO_EVENT_STORE_VERSION` bump.
 
 ```bash
-cargo run -p ledger-cli -- session validate --symbol ESH6 --date 2026-03-12
+cargo run -p ledger-cli -- es prepare --raw-id sha256-...
+cargo run -p ledger-cli -- es prepare --day 2026-03-12
+cargo run -p ledger-cli -- es prepare --all
 ```
 
-This command:
+Exactly one of `--raw-id`, `--day`, or `--all` is required. `--force` rebuilds even when a valid artifact exists. The raw's local copy is offloaded after prepare; batch runs (`--day`, `--all`) report per-raw successes and failures and exit nonzero if any raw failed.
 
-```text
-loads or hydrates replay dataset artifacts
-decodes events, batches, and trades into an EventStore
-validates rebuilt batch/trade indexes against decoded indexes
-compares the deterministic book-check report with book_check.v1.json
-steps the replay simulator through a small probe
-```
+## Store
 
-By default, the replay probe steps one batch. Useful variants:
+The store is a content-addressed object registry: SQLite descriptors, an R2 copy of every object, an R2 descriptor mirror, and optional local copies under `data/store`.
+
+### `store list`
 
 ```bash
-cargo run -p ledger-cli -- session validate --symbol ESH6 --date 2026-03-12 --replay-batches 1000
-cargo run -p ledger-cli -- session validate --symbol ESH6 --date 2026-03-12 --replay-all
-cargo run -p ledger-cli -- session validate --symbol ESH6 --date 2026-03-12 --skip-book-check
+cargo run -p ledger-cli -- store list
+cargo run -p ledger-cli -- store list --role raw --kind databento.dbn.zst
+cargo run -p ledger-cli -- store list --id-prefix sha256-ab
 ```
 
-`session validate` is a CLI adapter over the same validation composition that
-the API uses. It proves replay artifacts decode, index validation holds,
-book-check still matches, and replay simulation can consume the hydrated
-`EventStore`.
-
-## `session run`
-
-Run the active `Session` controller headlessly with a replay feed and print a
-deterministic JSON report.
+### `store show`
 
 ```bash
-cargo run -p ledger-cli -- session run --symbol ESH6 --date 2026-03-12
+cargo run -p ledger-cli -- store show --id sha256-...
 ```
 
-Useful variants:
+### `store import-file`
+
+Register a local file: upload to R2, mirror the descriptor, record it in SQLite.
 
 ```bash
-cargo run -p ledger-cli -- session run --symbol ESH6 --date 2026-03-12 --batches 100
-cargo run -p ledger-cli -- session run --symbol ESH6 --date 2026-03-12 --start-ts-ns 1773235800000000000
-cargo run -p ledger-cli -- session run --symbol ESH6 --date 2026-03-12 --truth-visibility
+cargo run -p ledger-cli -- store import-file \
+  --path path/to/file.dbn.zst \
+  --role raw \
+  --kind databento.dbn.zst \
+  --metadata-json '{"market_day":"2026-03-12","source_symbol":"ESH6"}'
 ```
 
-This is the headless adapter for agentic/developer validation of replay
-feature work. It loads the `ReplayDataset` through the local replay cache,
-opens a `Session` with a replay feed, advances the requested number of feed
-batches, and reports feed cursor, batch index, checksum, BBO, frame count, and
-fill count. It does not persist a training session.
+`--file-name`, `--format`, and `--media-type` are optional overrides.
 
-## `session clock-run`
+### `store hydrate`
 
-Run the active `Session` controller with a deterministic fake clock. This proves
-the same feed/projection path can be advanced by session time instead of a fixed
-batch count.
+Download an object's bytes from R2 into the local store. A valid local copy is a no-op.
 
 ```bash
-cargo run -p ledger-cli -- session clock-run \
-  --symbol ESH6 \
-  --date 2026-03-12 \
-  --projection bars:v1 \
-  --params '{"seconds":60}' \
-  --speed 60 \
-  --tick-ms 16 \
-  --ticks 1000 \
-  --budget-batches 500 \
-  --digest \
-  --truth-visibility
+cargo run -p ledger-cli -- store hydrate --id sha256-...
 ```
 
-The command does not sleep. It opens a replay-backed `Session`, subscribes the
-projection, advances fake monotonic time by `tick-ms`, pumps all feed batches
-due by the target feed time up to `budget-batches`, and prints a deterministic
-JSON report plus optional frame digest.
+### `store offload`
 
-## `replay cache-status`
-
-Inspect whether the current durable `ReplayDataset` is cached locally.
+Drop the local copy; the descriptor and R2 object remain. Refuses objects with no remote copy.
 
 ```bash
-cargo run -p ledger-cli -- replay cache-status --symbol ESH6 --date 2026-03-12
+cargo run -p ledger-cli -- store offload --id sha256-...
 ```
 
-## `replay cache-remove`
+### `store delete`
 
-Remove the local replay cache for a market day. This only deletes
-`data/cache/replay/...`; it does not delete R2 replay artifacts or SQLite
-catalog records for the durable `ReplayDataset`.
+Delete an object everywhere: descriptor, local copy, R2 object, and R2 descriptor mirror. Raw objects are paid source data and refuse deletion unless `--force-raw` is passed. This is the only raw-delete path — remux never exposes one.
 
 ```bash
-cargo run -p ledger-cli -- replay cache-remove --symbol ESH6 --date 2026-03-12
+cargo run -p ledger-cli -- store delete --id sha256-...
+cargo run -p ledger-cli -- store delete --id sha256-... --force-raw
 ```
 
-## `storage cleanup-tmp`
+### `store local-status`
 
-Delete disposable job staging files under `data/tmp`.
+Report the local store root, object count, bytes used, and the configured budget.
 
 ```bash
-cargo run -p ledger-cli -- storage cleanup-tmp
-cargo run -p ledger-cli -- storage cleanup-tmp --older-than-hours 24
+cargo run -p ledger-cli -- store local-status
 ```
 
-Successful API/CLI jobs should clean their own staging directories. This command
-is for failed jobs, interrupted runs, and manual disk recovery.
+### `store local-prune`
+
+Evict least-recently-accessed local copies until usage fits `LEDGER_STORE_LOCAL_MAX_BYTES`.
+
+```bash
+cargo run -p ledger-cli -- store local-prune
+```
+
+### `store sync`
+
+Rebuild the SQLite registry from the R2 descriptor mirror — for a fresh machine or a lost database. Local-copy state from the mirror is kept only when the bytes validate on this machine.
+
+```bash
+cargo run -p ledger-cli -- store sync --dry-run
+cargo run -p ledger-cli -- store sync
+cargo run -p ledger-cli -- store sync --overwrite   # replace existing descriptors too
+```
+
+### `store validate`
+
+Verify descriptors against reality: local bytes are re-hashed; `--verify-remote` also checks the R2 object's size and checksum.
+
+```bash
+cargo run -p ledger-cli -- store validate --id sha256-...
+cargo run -p ledger-cli -- store validate --role artifact --verify-remote
+```
+
+Without `--id`, validates everything matching the optional `--role`/`--kind` filter.
+
+### `store abort-incomplete-uploads`
+
+List (and with `--execute`, abort) dangling R2 multipart uploads left by interrupted imports.
+
+```bash
+cargo run -p ledger-cli -- store abort-incomplete-uploads
+cargo run -p ledger-cli -- store abort-incomplete-uploads --execute
+```
+
+`--prefix` narrows the scan (default `store/objects`).

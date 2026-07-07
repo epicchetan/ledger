@@ -208,7 +208,7 @@ async fn run_es_command(
                 .join("fetch")
                 .join(&args.symbol)
                 .join(day.to_string());
-            let summary = fetch_es_raw(
+            let fetch = fetch_es_raw(
                 &ledger_store,
                 day,
                 &args.symbol,
@@ -218,7 +218,12 @@ async fn run_es_command(
                 Some(progress),
             )
             .await?;
-            print_json(&summary)?;
+            // Fetch chains straight into prepare so the day lands replay-ready.
+            // Raw ids are content-addressed, so force never propagates: an
+            // existing valid artifact is reused, anything else is rebuilt.
+            let raw_id = StoreObjectId::new(fetch.raw_object_id.clone())?;
+            let prepare = prepare_one(&ledger_store, raw_id, false).await?;
+            print_json(&json!({ "fetch": fetch, "prepare": prepare }))?;
         }
     }
     Ok(())

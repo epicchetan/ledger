@@ -1,5 +1,4 @@
 use crate::error::RpcError;
-use crate::hydrate::HydrateJobs;
 use crate::jobs::{JobRecord, JobRegistry, JobStartDto};
 use crate::rpc::{send_notification, OutboundSender, Request};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -33,7 +32,6 @@ const JOBS_FINISHED_NOTIFICATION: &str = "remux/ledger/jobs/finished";
 #[derive(Clone)]
 pub struct LedgerRemux<S: RemoteStore + 'static> {
     store: Store<S>,
-    hydrate_jobs: HydrateJobs,
     jobs: JobRegistry,
     output_tx: OutboundSender,
 }
@@ -42,7 +40,6 @@ impl<S: RemoteStore + 'static> LedgerRemux<S> {
     pub fn new(store: Store<S>, output_tx: OutboundSender) -> Self {
         Self {
             store,
-            hydrate_jobs: HydrateJobs::default(),
             jobs: JobRegistry::default(),
             output_tx,
         }
@@ -113,16 +110,27 @@ impl<S: RemoteStore + 'static> LedgerRemux<S> {
         to_value(OffloadReportDto::from(report))
     }
 
+    // Hydrate rides the same job registry as install: one job model, one pair
+    // of notifications, dedup by (kind, subject). An already-local object just
+    // completes the job immediately — the store's hydrate fast-path is free.
     fn hydrate_store_object(&self, params: Value) -> Result<Value, RpcError> {
         let params = parse_params::<IdParams>(params)?;
         let id = parse_object_id(&params.id)?;
-        if self.store.get_object(&id)?.is_none() {
-            return Err(RpcError::object_not_found(&params.id));
+        let descriptor = self
+            .store
+            .get_object(&id)?
+            .ok_or_else(|| RpcError::object_not_found(&params.id))?;
+        let market_day = descriptor
+            .metadata_json
+            .get("market_day")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let subject = id.to_string();
+        let start = self.jobs.start("store.hydrate", &subject, market_day.clone())?;
+        if !start.already_running {
+            self.spawn_hydrate_job(start.id.clone(), id, market_day);
         }
-        let response = self
-            .hydrate_jobs
-            .start(self.store.clone(), id, self.output_tx.clone())?;
-        to_value(response)
+        to_value(JobStartDto::from(start))
     }
 
     fn local_status(&self) -> Result<Value, RpcError> {
@@ -262,6 +270,50 @@ impl<S: RemoteStore + 'static> LedgerRemux<S> {
         });
     }
 
+    fn spawn_hydrate_job(&self, job_id: String, id: StoreObjectId, market_day: Option<String>) {
+        let store = self.store.clone();
+        let jobs = self.jobs.clone();
+        let output_tx = self.output_tx.clone();
+        let subject = id.to_string();
+        tokio::spawn(async move {
+            jobs.progress(&job_id, "hydrating", None);
+            let params = json!({
+                "jobId": job_id,
+                "kind": "store.hydrate",
+                "subject": subject,
+                "marketDay": market_day,
+                "stage": "hydrating",
+                "records": Value::Null,
+            });
+            if let Err(error) =
+                send_notification(&output_tx, JOBS_PROGRESS_NOTIFICATION, params).await
+            {
+                eprintln!("[ledger-remux] failed to broadcast job progress: {error}");
+            }
+            let finished = JobFinishedContext {
+                job_id: &job_id,
+                kind: "store.hydrate",
+                subject: &subject,
+                market_day: market_day.as_deref(),
+            };
+            match store.hydrate(&id).await {
+                Ok(hydrated) => {
+                    let summary = json!({
+                        "id": subject,
+                        "path": hydrated.path.display().to_string(),
+                        "sizeBytes": hydrated.descriptor.size_bytes,
+                    });
+                    jobs.complete(&job_id, summary.clone());
+                    send_job_finished(&output_tx, finished, true, Some(summary), None).await;
+                }
+                Err(error) => {
+                    let error = error.to_string();
+                    jobs.fail(&job_id, error.clone());
+                    send_job_finished(&output_tx, finished, false, None, Some(error)).await;
+                }
+            }
+        });
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1194,17 +1246,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hydrate_returns_already_local_for_valid_local_object() {
+    async fn hydrate_starts_day_tagged_registry_job() {
         let data = tempdir().unwrap();
         let methods = open_methods(&data);
-        let descriptor = register_object(
-            &methods,
-            &data,
-            StoreObjectRole::Artifact,
-            "hydrate.bin",
-            b"hydrate bytes",
-        )
-        .await;
+        let descriptor = register_es_raw(&methods, &data, "hydrate.dbn.zst", "2026-03-10").await;
 
         let result = methods
             .handle(Request {
@@ -1214,6 +1259,34 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result, json!({ "alreadyLocal": true, "started": false }));
+        assert_eq!(result["jobId"], "job-1");
+
+        let jobs = methods
+            .handle(Request {
+                method: JOBS_LIST_METHOD.to_string(),
+                params: Value::Null,
+            })
+            .await
+            .unwrap();
+        assert_eq!(jobs["jobs"][0]["kind"], "store.hydrate");
+        assert_eq!(jobs["jobs"][0]["subject"], descriptor.id.to_string());
+        assert_eq!(jobs["jobs"][0]["marketDay"], "2026-03-10");
+    }
+
+    #[tokio::test]
+    async fn hydrate_returns_object_not_found_for_unknown_id() {
+        let data = tempdir().unwrap();
+        let methods = open_methods(&data);
+        let id = format!("sha256-{}", "0".repeat(64));
+
+        let err = methods
+            .handle(Request {
+                method: STORE_HYDRATE_METHOD.to_string(),
+                params: json!({ "id": id }),
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.message, "objectNotFound");
     }
 }

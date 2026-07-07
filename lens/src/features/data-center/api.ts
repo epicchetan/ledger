@@ -1,39 +1,14 @@
-import {
-  requestIpc,
-  subscribeIpcEvents,
-  type JsonRpcMessage,
-} from "@remux/viewer-kit/ipc"
+import { requestIpc } from "@remux/viewer-kit/ipc"
 
 import type {
   DeleteStoreObjectReport,
-  HydratedStoreObjectEvent,
-  HydrateStoreObjectResult,
   LocalStoreObject,
-  LocalStoreStatus,
   StoreObject,
-  StoreObjectFilters,
   StoreRemoteObject,
 } from "@/features/data-center/types"
 
-interface StoreListResult {
-  objects: RemuxStoreObject[]
-}
-
-interface StoreDeleteResult {
-  id: string | null
-  descriptorRemoved: boolean
-  remoteObjectDeleted: boolean
-  remoteDescriptorDeleted: boolean
-  localDeleted: boolean
-  remoteKey: string | null
-  remoteDescriptorKey: string | null
-  localPath: string | null
-  bytesDeleted: number
-}
-
-// Exported: the ES day catalog embeds these same wire descriptors, and the
-// days feature shapes them through formatStoreObject instead of re-fetching
-// the whole store list.
+// The ES day catalog embeds these wire descriptors; the days feature shapes
+// them through formatStoreObject instead of fetching a separate store list.
 export interface RemuxStoreObject {
   id: string
   role: string
@@ -70,74 +45,12 @@ interface RemuxLocalStoreObject {
   lastAccessedAtIso: string
 }
 
-export async function fetchStoreObjects(
-  filters: StoreObjectFilters
-): Promise<StoreObject[]> {
-  const result = await requestIpc<StoreListResult>(
-    "remux/ledger/store/list",
-    storeListParams(filters)
-  )
-  return result.objects.map(formatStoreObject)
-}
-
-export async function fetchLocalStatus(): Promise<LocalStoreStatus> {
-  const status = await requestIpc<LocalStoreStatus>(
-    "remux/ledger/store/localStatus"
-  )
-  return {
-    ...status,
-    size: formatBytes(status.sizeBytes),
-    max: formatBytes(status.maxBytes),
-  }
-}
-
 export async function deleteStoreObject(
   id: string
 ): Promise<DeleteStoreObjectReport> {
-  return requestIpc<StoreDeleteResult>("remux/ledger/store/delete", { id })
-}
-
-export async function hydrateStoreObject(
-  id: string
-): Promise<HydrateStoreObjectResult> {
-  return requestIpc<HydrateStoreObjectResult>("remux/ledger/store/hydrate", {
+  return requestIpc<DeleteStoreObjectReport>("remux/ledger/store/delete", {
     id,
   })
-}
-
-export function subscribeHydratedStoreObjects(
-  subscriber: (event: HydratedStoreObjectEvent) => void
-) {
-  return subscribeIpcEvents((events) => {
-    for (const message of events) {
-      const event = parseHydratedEvent(message)
-      if (event) subscriber(event)
-    }
-  })
-}
-
-function storeListParams(filters: StoreObjectFilters) {
-  return {
-    ...(filters.role ? { role: filters.role } : {}),
-    ...(filters.kind ? { kind: filters.kind } : {}),
-    ...(filters.idPrefix ? { idPrefix: filters.idPrefix } : {}),
-  }
-}
-
-function parseHydratedEvent(
-  message: JsonRpcMessage
-): HydratedStoreObjectEvent | null {
-  if (message.method !== "remux/ledger/store/hydrated") return null
-  if (!message.params || typeof message.params !== "object") return null
-  const params = message.params as Partial<HydratedStoreObjectEvent>
-  if (typeof params.id !== "string" || typeof params.ok !== "boolean") {
-    return null
-  }
-  return {
-    id: params.id,
-    ok: params.ok,
-    error: typeof params.error === "string" ? params.error : undefined,
-  }
 }
 
 export function formatStoreObject(record: RemuxStoreObject): StoreObject {

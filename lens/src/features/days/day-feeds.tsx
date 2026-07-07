@@ -10,7 +10,6 @@ import {
 import { useState } from "react"
 
 import { Button } from "@/components/ui/button"
-import { DetailRow, RoleBadge } from "@/features/data-center/object-list"
 import type { StoreObject } from "@/features/data-center/types"
 import { stateLabel } from "@/features/days/day-status"
 import type { DayReadiness, RawReadiness } from "@/features/days/readiness"
@@ -305,4 +304,46 @@ function formatCount(value: number) {
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`
   if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`
   return value.toLocaleString()
+}
+
+function RoleBadge({ role }: { role: string }) {
+  const tone =
+    role === "raw"
+      ? "border-link/25 bg-link/10 text-link"
+      : "border-success/25 bg-success/10 text-success"
+
+  return (
+    <span
+      className={`inline-flex shrink-0 rounded-md border px-1.5 py-0.5 text-[0.68rem] font-medium ${tone}`}
+    >
+      {role}
+    </span>
+  )
+}
+
+function DetailRow({
+  label,
+  value,
+  mono = false,
+  wrap = false,
+}: {
+  label: string
+  value: string
+  mono?: boolean
+  wrap?: boolean
+}) {
+  return (
+    <div className="grid grid-cols-[5.5rem_minmax(0,1fr)] gap-2 py-0.5">
+      <div className="text-muted-foreground">{label}</div>
+      <div
+        className={cn(
+          wrap ? "break-all" : "truncate",
+          mono && "font-mono",
+          "text-foreground"
+        )}
+      >
+        {value}
+      </div>
+    </div>
+  )
 }
