@@ -8,14 +8,43 @@
   },
   "server": {
     "transport": "stdio",
-    "command": "cargo",
-    "args": ["run", "--quiet", "-p", "ledger-remux", "--"],
+    "build": {
+      "command": "cargo",
+      "args": [
+        "build",
+        "--release",
+        "-p",
+        "ledger-remux",
+        "--target-dir",
+        "/tmp/remux-ledger-server-target",
+        "--quiet"
+      ],
+      "cwd": "."
+    },
+    "command": "/tmp/remux-ledger-server-target/release/ledger-remux",
+    "args": [],
     "cwd": "."
   },
   "views": {
     "main": {
       "route": "/viewers/ledger",
-      "entry": "lens/dist/index.html"
+      "entry": "lens/dist/index.html",
+      "build": {
+        "command": "npm",
+        "args": [
+          "run",
+          "build"
+        ],
+        "cwd": "lens"
+      },
+      "watch": {
+        "command": "npm",
+        "args": [
+          "run",
+          "watch"
+        ],
+        "cwd": "lens"
+      }
     }
   },
   "launchers": [
