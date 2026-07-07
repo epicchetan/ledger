@@ -126,7 +126,9 @@ impl<S: RemoteStore + 'static> LedgerRemux<S> {
             .and_then(Value::as_str)
             .map(str::to_string);
         let subject = id.to_string();
-        let start = self.jobs.start("store.hydrate", &subject, market_day.clone())?;
+        let start = self
+            .jobs
+            .start("store.hydrate", &subject, market_day.clone())?;
         if !start.already_running {
             self.spawn_hydrate_job(start.id.clone(), id, market_day);
         }
@@ -160,7 +162,9 @@ impl<S: RemoteStore + 'static> LedgerRemux<S> {
             .and_then(Value::as_str)
             .map(str::to_string);
         let subject = raw_id.to_string();
-        let start = self.jobs.start("es.install", &subject, market_day.clone())?;
+        let start = self
+            .jobs
+            .start("es.install", &subject, market_day.clone())?;
         if !start.already_running {
             self.spawn_install_job(start.id.clone(), raw_id, market_day);
         }
@@ -211,12 +215,7 @@ impl<S: RemoteStore + 'static> LedgerRemux<S> {
         })
     }
 
-    fn spawn_install_job(
-        &self,
-        job_id: String,
-        raw_id: StoreObjectId,
-        market_day: Option<String>,
-    ) {
+    fn spawn_install_job(&self, job_id: String, raw_id: StoreObjectId, market_day: Option<String>) {
         let store = self.store.clone();
         let jobs = self.jobs.clone();
         let output_tx = self.output_tx.clone();
@@ -1104,11 +1103,7 @@ mod tests {
 
         assert_eq!(result["removed"], true);
         assert_eq!(result["bytesRemoved"], b"offload bytes".len() as u64);
-        let after = methods
-            .store
-            .get_object(&descriptor.id)
-            .unwrap()
-            .unwrap();
+        let after = methods.store.get_object(&descriptor.id).unwrap().unwrap();
         assert!(after.local.is_none());
         assert!(after.remote.is_some());
     }
@@ -1202,11 +1197,7 @@ mod tests {
         assert_eq!(result["marketDay"], "2026-03-10");
         assert_eq!(result["bytesRemoved"], b"es raw bytes".len() as u64);
         assert_eq!(result["offloaded"].as_array().unwrap().len(), 1);
-        let after = methods
-            .store
-            .get_object(&descriptor.id)
-            .unwrap()
-            .unwrap();
+        let after = methods.store.get_object(&descriptor.id).unwrap().unwrap();
         assert!(after.local.is_none());
         assert!(after.remote.is_some());
     }

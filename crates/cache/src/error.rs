@@ -33,6 +33,9 @@ pub enum CacheError {
     #[error("array range is out of bounds for cell `{key}`")]
     ArrayRangeOutOfBounds { key: Key },
 
+    #[error("watch on cell `{key}` closed: cache dropped")]
+    WatchClosed { key: Key },
+
     #[error("cache registry lock poisoned")]
     RegistryLockPoisoned,
 

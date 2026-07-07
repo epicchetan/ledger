@@ -5,3 +5,8 @@ edition.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+# sync only: the base crate needs watch channels, not a runtime
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
+[dev-dependencies]
+tokio.workspace = true

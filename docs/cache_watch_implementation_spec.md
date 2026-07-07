@@ -37,7 +37,7 @@ impl CellWatch {
     /// Cancel-safe inside tokio::select!.
     pub async fn changed(&mut self) -> Result<(), CacheError>;
 
-    /// The generation this watch last observed.
+    /// The latest generation visible to this watch.
     pub fn generation(&self) -> u64;
 }
 ```
@@ -62,6 +62,10 @@ bump-on-write   every mutating operation bumps the generation after the
 wake-on-write   writers never know who is listening; the cache wakes parked
                 watchers as part of applying the write
 
+no bump on      a rejected mutation (ownership mismatch, kind mismatch,
+failure         out-of-bounds range or index) is not a change and does not
+                bump the generation
+
 never-miss      if the generation advanced while a watcher was busy, its
                 next changed() returns immediately instead of parking
 
@@ -85,10 +89,14 @@ more code and wake exactly the right tasks.
 
 - The generation lives inside the `watch::Sender<u64>` itself — the channel
   is the counter. Bumping is `send_modify(|g| *g += 1)` after the mutation.
-- Every mutating path in `cache.rs` already funnels through the cell
-  record; add the bump there so no operation can forget it. This includes
+- Every mutating path in `cache.rs` already funnels through the two storage
+  helpers; add the bump there so no operation can forget it. This includes
   writes applied by the runtime worker and prepare-context writes — they
-  all use the same mutators.
+  all use the same mutators. The fallible array ops validate inside those
+  helpers, so the helper closures return `Result` and the bump runs only on
+  success — a rejected mutation must not wake anyone.
+- The bump happens before the storage write lock releases, so a watcher
+  woken by it can never read pre-write state.
 - `changed()` maps the underlying channel-closed error (cache dropped) into
   a `CacheError` variant.
 - Ownership is unchanged: watching requires no ownership; writing still
@@ -100,6 +108,8 @@ more code and wake exactly the right tasks.
 watch_key on an unregistered key errors
 changed() parks until a set_value on the watched cell
 every mutating op bumps the generation (value ops and each array op)
+a failed mutation (out-of-bounds insert) does not bump
+changed() after the cache is dropped errors instead of hanging
 a write that lands while the watcher is busy makes the next changed()
   return immediately (never-miss)
 multiple rapid writes coalesce into one wakeup with the latest state

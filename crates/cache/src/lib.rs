@@ -2,15 +2,17 @@
 //!
 //! This crate intentionally does not know about feeds, projections, scheduling,
 //! persistence, or Ledger domain payloads. It provides named, owned `Value<T>`
-//! and `Array<T>` cells with typed handles, owner-checked mutations, and
-//! changed-key effects.
+//! and `Array<T>` cells with typed handles, owner-checked mutations,
+//! changed-key effects, and per-cell change watches.
 
 mod cache;
 mod cell;
 mod error;
 mod key;
+mod watch;
 
 pub use cache::Cache;
 pub use cell::{ArrayKey, CellDescriptor, CellKind, CellOwner, ValueKey, WriteEffects};
 pub use error::CacheError;
 pub use key::Key;
+pub use watch::CellWatch;

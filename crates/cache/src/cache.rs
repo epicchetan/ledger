@@ -5,9 +5,12 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use tokio::sync::watch;
+
 use crate::{
     cell::{ArrayStorage, ValueStorage},
-    ArrayKey, CacheError, CellDescriptor, CellKind, CellOwner, Key, ValueKey, WriteEffects,
+    ArrayKey, CacheError, CellDescriptor, CellKind, CellOwner, CellWatch, Key, ValueKey,
+    WriteEffects,
 };
 
 #[derive(Clone)]
@@ -21,6 +24,8 @@ struct CacheInner {
 
 struct Cell {
     descriptor: CellDescriptor,
+    /// The channel is the generation counter; subscribing yields a watch.
+    generation: watch::Sender<u64>,
     storage: RwLock<Box<dyn Any + Send + Sync>>,
 }
 
@@ -45,6 +50,7 @@ impl Cache {
         let key = descriptor.key.clone();
         let cell = Arc::new(Cell {
             descriptor,
+            generation: watch::Sender::new(0),
             storage: RwLock::new(Box::new(ValueStorage { value: initial })),
         });
 
@@ -64,6 +70,7 @@ impl Cache {
         let key = descriptor.key.clone();
         let cell = Arc::new(Cell {
             descriptor,
+            generation: watch::Sender::new(0),
             storage: RwLock::new(Box::new(ArrayStorage { items: initial })),
         });
 
@@ -73,6 +80,13 @@ impl Cache {
 
     pub fn describe(&self, key: &Key) -> Result<CellDescriptor, CacheError> {
         Ok(self.lookup_cell(key)?.descriptor.clone())
+    }
+
+    /// Watch a registered cell for changes. Errors on an unregistered key.
+    /// Follows the same visibility rules as reads.
+    pub fn watch_key(&self, key: &Key) -> Result<CellWatch, CacheError> {
+        let cell = self.lookup_cell(key)?;
+        Ok(CellWatch::new(key.clone(), cell.generation.subscribe()))
     }
 
     pub fn read_value<T>(&self, key: &ValueKey<T>) -> Result<Option<T>, CacheError>
@@ -148,6 +162,7 @@ impl Cache {
     {
         self.with_value_storage(writer, key, |storage| {
             storage.value = Some(value);
+            Ok(())
         })?;
         Ok(WriteEffects::changed(key.key()))
     }
@@ -162,6 +177,7 @@ impl Cache {
     {
         self.with_value_storage(writer, key, |storage| {
             storage.value = None;
+            Ok(())
         })?;
         Ok(WriteEffects::changed(key.key()))
     }
@@ -175,7 +191,8 @@ impl Cache {
     where
         T: Clone + Send + Sync + 'static,
     {
-        let result = self.with_value_storage(writer, key, |storage| update(&mut storage.value))?;
+        let result =
+            self.with_value_storage(writer, key, |storage| Ok(update(&mut storage.value)))?;
         Ok((result, WriteEffects::changed(key.key())))
     }
 
@@ -190,6 +207,7 @@ impl Cache {
     {
         self.with_array_storage(writer, key, |storage| {
             storage.items = items;
+            Ok(())
         })?;
         Ok(WriteEffects::changed(key.key()))
     }
@@ -205,6 +223,7 @@ impl Cache {
     {
         self.with_array_storage(writer, key, |storage| {
             storage.items.extend(items);
+            Ok(())
         })?;
         Ok(WriteEffects::changed(key.key()))
     }
@@ -223,7 +242,7 @@ impl Cache {
             validate_insert_index(key.key(), index, storage.items.len())?;
             storage.items.splice(index..index, items);
             Ok(())
-        })??;
+        })?;
         Ok(WriteEffects::changed(key.key()))
     }
 
@@ -241,7 +260,7 @@ impl Cache {
             validate_range(key.key(), &range, storage.items.len())?;
             storage.items.splice(range, items);
             Ok(())
-        })??;
+        })?;
         Ok(WriteEffects::changed(key.key()))
     }
 
@@ -258,7 +277,7 @@ impl Cache {
             validate_range(key.key(), &range, storage.items.len())?;
             storage.items.drain(range);
             Ok(())
-        })??;
+        })?;
         Ok(WriteEffects::changed(key.key()))
     }
 
@@ -272,6 +291,7 @@ impl Cache {
     {
         self.with_array_storage(writer, key, |storage| {
             storage.items.clear();
+            Ok(())
         })?;
         Ok(WriteEffects::changed(key.key()))
     }
@@ -285,7 +305,8 @@ impl Cache {
     where
         T: Clone + Send + Sync + 'static,
     {
-        let result = self.with_array_storage(writer, key, |storage| update(&mut storage.items))?;
+        let result =
+            self.with_array_storage(writer, key, |storage| Ok(update(&mut storage.items)))?;
         Ok((result, WriteEffects::changed(key.key())))
     }
 
@@ -363,7 +384,7 @@ impl Cache {
         &self,
         writer: &CellOwner,
         key: &ValueKey<T>,
-        update: impl FnOnce(&mut ValueStorage<T>) -> R,
+        update: impl FnOnce(&mut ValueStorage<T>) -> Result<R, CacheError>,
     ) -> Result<R, CacheError>
     where
         T: Clone + Send + Sync + 'static,
@@ -381,14 +402,18 @@ impl Cache {
             .as_mut()
             .downcast_mut::<ValueStorage<T>>()
             .ok_or_else(|| CacheError::TypeMismatch(key.key().clone()))?;
-        Ok(update(storage))
+        let result = update(storage)?;
+        // Bumped only on success, before the storage lock releases, so a
+        // woken watcher can never read pre-write state.
+        cell.generation.send_modify(|generation| *generation += 1);
+        Ok(result)
     }
 
     fn with_array_storage<T, R>(
         &self,
         writer: &CellOwner,
         key: &ArrayKey<T>,
-        update: impl FnOnce(&mut ArrayStorage<T>) -> R,
+        update: impl FnOnce(&mut ArrayStorage<T>) -> Result<R, CacheError>,
     ) -> Result<R, CacheError>
     where
         T: Clone + Send + Sync + 'static,
@@ -406,7 +431,11 @@ impl Cache {
             .as_mut()
             .downcast_mut::<ArrayStorage<T>>()
             .ok_or_else(|| CacheError::TypeMismatch(key.key().clone()))?;
-        Ok(update(storage))
+        let result = update(storage)?;
+        // Bumped only on success, before the storage lock releases, so a
+        // woken watcher can never read pre-write state.
+        cell.generation.send_modify(|generation| *generation += 1);
+        Ok(result)
     }
 }
 
