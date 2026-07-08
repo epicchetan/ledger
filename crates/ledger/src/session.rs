@@ -120,6 +120,10 @@ impl LedgerSessionHandle {
         &self.runtime
     }
 
+    pub fn clock_key(&self) -> &ValueKey<ClockState> {
+        &self.clock_key
+    }
+
     pub fn clock_snapshot(&self) -> Result<ClockSnapshot, LedgerError> {
         Ok(self.current_clock()?.snapshot())
     }

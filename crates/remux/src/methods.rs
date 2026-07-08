@@ -1,6 +1,11 @@
 use crate::error::RpcError;
 use crate::jobs::{JobRecord, JobRegistry, JobStartDto};
 use crate::rpc::{send_notification, OutboundSender, Request};
+use crate::session::{
+    SessionRegistry, SESSION_BARS_METHOD, SESSION_CLOSE_METHOD, SESSION_OPEN_METHOD,
+    SESSION_PAUSE_METHOD, SESSION_PLAY_METHOD, SESSION_SEEK_METHOD, SESSION_SPEED_METHOD,
+    SESSION_STATUS_METHOD,
+};
 use chrono::{DateTime, SecondsFormat, Utc};
 use ledger::feed::es_replay::{
     es_day_catalog, prepare_es_replay_artifact, EsDayCatalog, EsDayEntry, EsRawState, EsRawStatus,
@@ -33,6 +38,7 @@ const JOBS_FINISHED_NOTIFICATION: &str = "remux/ledger/jobs/finished";
 pub struct LedgerRemux<S: RemoteStore + 'static> {
     store: Store<S>,
     jobs: JobRegistry,
+    pub(crate) sessions: SessionRegistry,
     output_tx: OutboundSender,
 }
 
@@ -41,6 +47,7 @@ impl<S: RemoteStore + 'static> LedgerRemux<S> {
         Self {
             store,
             jobs: JobRegistry::default(),
+            sessions: SessionRegistry::default(),
             output_tx,
         }
     }
@@ -62,6 +69,18 @@ impl<S: RemoteStore + 'static> LedgerRemux<S> {
             ES_INSTALL_METHOD => self.install_es(request.params),
             ES_OFFLOAD_METHOD => self.offload_es(request.params),
             JOBS_LIST_METHOD => self.jobs_list(),
+            SESSION_OPEN_METHOD => {
+                self.sessions
+                    .open(&self.store, &self.output_tx, request.params)
+                    .await
+            }
+            SESSION_CLOSE_METHOD => self.sessions.close(&self.output_tx, request.params).await,
+            SESSION_STATUS_METHOD => self.sessions.status(request.params).await,
+            SESSION_PLAY_METHOD => self.sessions.play(request.params).await,
+            SESSION_PAUSE_METHOD => self.sessions.pause(request.params).await,
+            SESSION_SPEED_METHOD => self.sessions.speed(request.params).await,
+            SESSION_SEEK_METHOD => self.sessions.seek(request.params).await,
+            SESSION_BARS_METHOD => self.sessions.bars(request.params).await,
             method => Err(RpcError::method_not_found(method)),
         }
     }

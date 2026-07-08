@@ -2,6 +2,7 @@ mod error;
 mod jobs;
 mod methods;
 mod rpc;
+mod session;
 
 use anyhow::Result;
 use methods::LedgerRemux;
