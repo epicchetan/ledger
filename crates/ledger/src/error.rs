@@ -17,4 +17,13 @@ pub enum LedgerError {
 
     #[error("databento fetch failed: {0}")]
     Fetch(String),
+
+    #[error(transparent)]
+    Cache(#[from] cache::CacheError),
+
+    #[error(transparent)]
+    Runtime(#[from] runtime::RuntimeError),
+
+    #[error("invalid clock speed `{0}`")]
+    InvalidClockSpeed(f64),
 }

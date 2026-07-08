@@ -1,157 +1,24 @@
-use anyhow::Result;
-use async_trait::async_trait;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use store::{
-    JsonObjectRegistry, LocalStore, ObjectFilter, ObjectMetadata, RegisterFileRequest,
-    RemoteObject, RemoteStore, Store, StoreConfig, StoreObjectDescriptor, StoreObjectId,
+    test_util::MemoryRemote, JsonObjectRegistry, LocalStore, ObjectFilter, ObjectMetadata,
+    RegisterFileRequest, RemoteStore, Store, StoreConfig, StoreObjectDescriptor, StoreObjectId,
     StoreObjectRole,
 };
 use tempfile::{tempdir, TempDir};
-use tokio::io::AsyncWriteExt;
-
-#[derive(Clone, Default)]
-struct TestRemote {
-    bucket: String,
-    objects: Arc<Mutex<HashMap<String, (Vec<u8>, ObjectMetadata)>>>,
-}
-
-impl TestRemote {
-    fn new() -> Self {
-        Self {
-            bucket: "test-bucket".to_string(),
-            objects: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    fn contains_key(&self, key: &str) -> bool {
-        self.objects.lock().unwrap().contains_key(key)
-    }
-}
-
-#[async_trait]
-impl RemoteStore for TestRemote {
-    async fn put_path(
-        &self,
-        key: &str,
-        path: &Path,
-        metadata: &ObjectMetadata,
-    ) -> Result<RemoteObject> {
-        let bytes = tokio::fs::read(path).await?;
-        self.put_bytes(key, &bytes, metadata).await
-    }
-
-    async fn get_to_path(&self, key: &str, dest: &Path) -> Result<RemoteObject> {
-        let (bytes, metadata) = self
-            .objects
-            .lock()
-            .unwrap()
-            .get(key)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("missing object {key}"))?;
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let mut file = tokio::fs::File::create(dest).await?;
-        file.write_all(&bytes).await?;
-        file.sync_all().await?;
-        Ok(remote_object(
-            &self.bucket,
-            key,
-            bytes.len() as u64,
-            &metadata,
-        ))
-    }
-
-    async fn head(&self, key: &str) -> Result<Option<RemoteObject>> {
-        Ok(self
-            .objects
-            .lock()
-            .unwrap()
-            .get(key)
-            .map(|(bytes, metadata)| {
-                remote_object(&self.bucket, key, bytes.len() as u64, metadata)
-            }))
-    }
-
-    async fn delete(&self, key: &str) -> Result<()> {
-        self.objects.lock().unwrap().remove(key);
-        Ok(())
-    }
-
-    async fn put_bytes(
-        &self,
-        key: &str,
-        bytes: &[u8],
-        metadata: &ObjectMetadata,
-    ) -> Result<RemoteObject> {
-        self.objects
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), (bytes.to_vec(), metadata.clone()));
-        Ok(remote_object(
-            &self.bucket,
-            key,
-            bytes.len() as u64,
-            metadata,
-        ))
-    }
-
-    async fn get_bytes(&self, key: &str) -> Result<Vec<u8>> {
-        self.objects
-            .lock()
-            .unwrap()
-            .get(key)
-            .map(|(bytes, _)| bytes.clone())
-            .ok_or_else(|| anyhow::anyhow!("missing object {key}"))
-    }
-
-    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>> {
-        let mut keys: Vec<String> = self
-            .objects
-            .lock()
-            .unwrap()
-            .keys()
-            .filter(|key| key.starts_with(prefix))
-            .cloned()
-            .collect();
-        keys.sort();
-        Ok(keys)
-    }
-
-    fn bucket(&self) -> &str {
-        &self.bucket
-    }
-}
-
-fn remote_object(
-    bucket: &str,
-    key: &str,
-    size_bytes: u64,
-    metadata: &ObjectMetadata,
-) -> RemoteObject {
-    RemoteObject {
-        bucket: bucket.to_string(),
-        key: key.to_string(),
-        size_bytes,
-        sha256: Some(metadata.sha256.clone()),
-        etag: None,
-        metadata: metadata.user_metadata.clone(),
-    }
-}
 
 fn open_test_store(
     data: &TempDir,
-    remote: Arc<TestRemote>,
+    remote: Arc<MemoryRemote>,
     local_max_bytes: u64,
-) -> Store<TestRemote> {
+) -> Store<MemoryRemote> {
     Store::open(data.path(), StoreConfig { local_max_bytes }, remote).unwrap()
 }
 
 async fn register_test_object(
-    store: &Store<TestRemote>,
+    store: &Store<MemoryRemote>,
     data: &TempDir,
     file_name: &str,
     bytes: &[u8],
@@ -182,7 +49,7 @@ fn local_path(data: &TempDir, descriptor: &StoreObjectDescriptor) -> PathBuf {
 #[tokio::test]
 async fn register_file_uploads_descriptor_and_uses_shared_local() {
     let data = tempdir().unwrap();
-    let remote = Arc::new(TestRemote::new());
+    let remote = Arc::new(MemoryRemote::new());
     let store = Store::open(
         data.path(),
         StoreConfig {
@@ -227,7 +94,7 @@ async fn register_file_uploads_descriptor_and_uses_shared_local() {
 #[tokio::test]
 async fn update_metadata_replaces_json_preserves_locations_and_remirrors() {
     let data = tempdir().unwrap();
-    let remote = Arc::new(TestRemote::new());
+    let remote = Arc::new(MemoryRemote::new());
     let store = open_test_store(&data, remote.clone(), 1024 * 1024);
     let descriptor = register_test_object(&store, &data, "metadata.bin", b"metadata bytes").await;
     let remote_before = descriptor.remote.clone();
@@ -261,7 +128,7 @@ async fn update_metadata_replaces_json_preserves_locations_and_remirrors() {
 #[tokio::test]
 async fn update_metadata_errors_for_missing_object() {
     let data = tempdir().unwrap();
-    let remote = Arc::new(TestRemote::new());
+    let remote = Arc::new(MemoryRemote::new());
     let store = open_test_store(&data, remote, 1024 * 1024);
     let missing = StoreObjectId::new(format!("sha256-{}", "0".repeat(64))).unwrap();
 
@@ -276,7 +143,7 @@ async fn update_metadata_errors_for_missing_object() {
 #[tokio::test]
 async fn hydrate_restores_missing_local_from_remote() {
     let data = tempdir().unwrap();
-    let remote = Arc::new(TestRemote::new());
+    let remote = Arc::new(MemoryRemote::new());
     let store = Store::open(
         data.path(),
         StoreConfig {
@@ -314,7 +181,7 @@ async fn hydrate_restores_missing_local_from_remote() {
 #[tokio::test]
 async fn touch_valid_local_copy_returns_true_for_valid_local_copy() {
     let data = tempdir().unwrap();
-    let remote = Arc::new(TestRemote::new());
+    let remote = Arc::new(MemoryRemote::new());
     let store = open_test_store(&data, remote, 1024);
     let descriptor = register_test_object(&store, &data, "local.bin", b"local bytes").await;
 
@@ -324,7 +191,7 @@ async fn touch_valid_local_copy_returns_true_for_valid_local_copy() {
 #[tokio::test]
 async fn touch_valid_local_copy_refreshes_last_accessed_for_valid_local_copy() {
     let data = tempdir().unwrap();
-    let remote = Arc::new(TestRemote::new());
+    let remote = Arc::new(MemoryRemote::new());
     let store = open_test_store(&data, remote, 1024);
     let descriptor = register_test_object(&store, &data, "refresh.bin", b"refresh bytes").await;
     let before = store
@@ -349,7 +216,7 @@ async fn touch_valid_local_copy_refreshes_last_accessed_for_valid_local_copy() {
 #[tokio::test]
 async fn touch_valid_local_copy_returns_false_when_local_file_is_missing() {
     let data = tempdir().unwrap();
-    let remote = Arc::new(TestRemote::new());
+    let remote = Arc::new(MemoryRemote::new());
     let store = open_test_store(&data, remote, 1024);
     let descriptor = register_test_object(&store, &data, "missing.bin", b"missing bytes").await;
     std::fs::remove_file(local_path(&data, &descriptor)).unwrap();
@@ -360,7 +227,7 @@ async fn touch_valid_local_copy_returns_false_when_local_file_is_missing() {
 #[tokio::test]
 async fn touch_valid_local_copy_returns_false_on_size_mismatch() {
     let data = tempdir().unwrap();
-    let remote = Arc::new(TestRemote::new());
+    let remote = Arc::new(MemoryRemote::new());
     let store = open_test_store(&data, remote, 1024);
     let descriptor = register_test_object(&store, &data, "size.bin", b"size bytes").await;
     std::fs::write(local_path(&data, &descriptor), b"short").unwrap();
@@ -371,7 +238,7 @@ async fn touch_valid_local_copy_returns_false_on_size_mismatch() {
 #[tokio::test]
 async fn touch_valid_local_copy_returns_false_on_sha256_mismatch() {
     let data = tempdir().unwrap();
-    let remote = Arc::new(TestRemote::new());
+    let remote = Arc::new(MemoryRemote::new());
     let store = open_test_store(&data, remote, 1024);
     let descriptor = register_test_object(&store, &data, "sha.bin", b"same size").await;
     std::fs::write(local_path(&data, &descriptor), b"Same size").unwrap();
@@ -382,7 +249,7 @@ async fn touch_valid_local_copy_returns_false_on_sha256_mismatch() {
 #[tokio::test]
 async fn touch_valid_local_copy_returns_false_without_local_entry() {
     let data = tempdir().unwrap();
-    let remote = Arc::new(TestRemote::new());
+    let remote = Arc::new(MemoryRemote::new());
     let store = open_test_store(&data, remote, 1024);
     let descriptor = register_test_object(&store, &data, "remote.bin", b"remote only").await;
     store.remove_local_copy(&descriptor.id).unwrap();
@@ -393,7 +260,7 @@ async fn touch_valid_local_copy_returns_false_without_local_entry() {
 #[tokio::test]
 async fn touch_valid_local_copy_errors_on_unknown_object_id() {
     let data = tempdir().unwrap();
-    let remote = Arc::new(TestRemote::new());
+    let remote = Arc::new(MemoryRemote::new());
     let store = open_test_store(&data, remote, 1024);
     let id = StoreObjectId::new(format!("sha256-{}", "0".repeat(64))).unwrap();
 
@@ -405,7 +272,7 @@ async fn touch_valid_local_copy_errors_on_unknown_object_id() {
 #[tokio::test]
 async fn delete_object_removes_descriptor_remote_object_mirror_and_local() {
     let data = tempdir().unwrap();
-    let remote = Arc::new(TestRemote::new());
+    let remote = Arc::new(MemoryRemote::new());
     let store = Store::open(
         data.path(),
         StoreConfig {
@@ -453,7 +320,7 @@ async fn delete_object_removes_descriptor_remote_object_mirror_and_local() {
 }
 
 async fn register_test_raw(
-    store: &Store<TestRemote>,
+    store: &Store<MemoryRemote>,
     data: &TempDir,
     file_name: &str,
     bytes: &[u8],
@@ -480,7 +347,7 @@ async fn register_test_raw(
 #[tokio::test]
 async fn delete_object_refuses_raw_without_force() {
     let data = tempdir().unwrap();
-    let remote = Arc::new(TestRemote::new());
+    let remote = Arc::new(MemoryRemote::new());
     let store = open_test_store(&data, remote.clone(), 1024);
     let descriptor = register_test_raw(&store, &data, "keep.dbn.zst", b"paid raw bytes").await;
     let remote_key = descriptor.remote.as_ref().unwrap().key.clone();
@@ -499,7 +366,7 @@ async fn delete_object_refuses_raw_without_force() {
 #[tokio::test]
 async fn delete_object_removes_raw_with_force() {
     let data = tempdir().unwrap();
-    let remote = Arc::new(TestRemote::new());
+    let remote = Arc::new(MemoryRemote::new());
     let store = open_test_store(&data, remote.clone(), 1024);
     let descriptor = register_test_raw(&store, &data, "force.dbn.zst", b"forced raw bytes").await;
     let remote_key = descriptor.remote.as_ref().unwrap().key.clone();
@@ -516,7 +383,7 @@ async fn delete_object_removes_raw_with_force() {
 #[tokio::test]
 async fn offload_object_drops_local_and_keeps_remote() {
     let data = tempdir().unwrap();
-    let remote = Arc::new(TestRemote::new());
+    let remote = Arc::new(MemoryRemote::new());
     let store = open_test_store(&data, remote.clone(), 1024);
     let descriptor = register_test_object(&store, &data, "offload.bin", b"offload bytes").await;
     let remote_key = descriptor.remote.as_ref().unwrap().key.clone();
@@ -542,7 +409,7 @@ async fn offload_object_drops_local_and_keeps_remote() {
 #[tokio::test]
 async fn offload_object_errors_on_unknown_object_id() {
     let data = tempdir().unwrap();
-    let remote = Arc::new(TestRemote::new());
+    let remote = Arc::new(MemoryRemote::new());
     let store = open_test_store(&data, remote, 1024);
     let id = StoreObjectId::new(format!("sha256-{}", "0".repeat(64))).unwrap();
 
@@ -554,7 +421,7 @@ async fn offload_object_errors_on_unknown_object_id() {
 #[tokio::test]
 async fn local_prune_evicts_lru_without_touching_remote() {
     let data = tempdir().unwrap();
-    let remote = Arc::new(TestRemote::new());
+    let remote = Arc::new(MemoryRemote::new());
     let store = Store::open(
         data.path(),
         StoreConfig {
@@ -604,7 +471,7 @@ async fn local_prune_evicts_lru_without_touching_remote() {
 
 #[tokio::test]
 async fn sync_registry_adds_missing_descriptors_without_local_claim() {
-    let remote = Arc::new(TestRemote::new());
+    let remote = Arc::new(MemoryRemote::new());
     let source_data = tempdir().unwrap();
     let source_store = open_test_store(&source_data, remote.clone(), 1024);
     let registered =
@@ -629,7 +496,7 @@ async fn sync_registry_adds_missing_descriptors_without_local_claim() {
 
 #[tokio::test]
 async fn sync_registry_skips_existing_without_overwrite() {
-    let remote = Arc::new(TestRemote::new());
+    let remote = Arc::new(MemoryRemote::new());
     let source_data = tempdir().unwrap();
     let source_store = open_test_store(&source_data, remote.clone(), 1024);
     let registered =
@@ -655,7 +522,7 @@ async fn sync_registry_skips_existing_without_overwrite() {
 
 #[tokio::test]
 async fn sync_registry_overwrite_restores_mirror_and_keeps_valid_local() {
-    let remote = Arc::new(TestRemote::new());
+    let remote = Arc::new(MemoryRemote::new());
     let data = tempdir().unwrap();
     let store = open_test_store(&data, remote.clone(), 1024);
     let registered = register_test_object(&store, &data, "sync-owr.bin", b"overwrite me").await;
@@ -680,7 +547,7 @@ async fn sync_registry_overwrite_restores_mirror_and_keeps_valid_local() {
 
 #[tokio::test]
 async fn sync_registry_dry_run_reports_without_writing() {
-    let remote = Arc::new(TestRemote::new());
+    let remote = Arc::new(MemoryRemote::new());
     let source_data = tempdir().unwrap();
     let source_store = open_test_store(&source_data, remote.clone(), 1024);
     let registered =
@@ -701,7 +568,7 @@ async fn sync_registry_dry_run_reports_without_writing() {
 
 #[tokio::test]
 async fn sync_registry_reports_mismatched_mirror_key_as_failure() {
-    let remote = Arc::new(TestRemote::new());
+    let remote = Arc::new(MemoryRemote::new());
     let source_data = tempdir().unwrap();
     let source_store = open_test_store(&source_data, remote.clone(), 1024);
     let registered =

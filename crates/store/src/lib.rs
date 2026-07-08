@@ -14,6 +14,8 @@ pub mod local_store;
 pub mod registry;
 pub mod remote_store;
 pub mod store;
+#[cfg(feature = "test-util")]
+pub mod test_util;
 
 pub use descriptor::*;
 pub use error::*;

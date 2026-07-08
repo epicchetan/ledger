@@ -1921,10 +1921,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "cache",
  "chrono",
  "chrono-tz",
  "databento",
  "dbn",
+ "runtime",
  "serde",
  "serde_json",
  "store",
@@ -1939,6 +1941,7 @@ name = "ledger-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cache",
  "clap",
  "dotenvy",
  "ledger",
@@ -2874,6 +2877,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "store",
  "tempfile",
  "thiserror",
  "tokio",

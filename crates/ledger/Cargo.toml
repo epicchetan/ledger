@@ -5,10 +5,13 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
+cache = { path = "../cache" }
 chrono.workspace = true
 chrono-tz.workspace = true
 databento.workspace = true
 dbn.workspace = true
+runtime = { path = "../runtime" }
 serde.workspace = true
 serde_json.workspace = true
 store = { path = "../store" }
@@ -17,5 +20,5 @@ time.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-async-trait.workspace = true
+store = { path = "../store", features = ["test-util"] }
 tempfile.workspace = true

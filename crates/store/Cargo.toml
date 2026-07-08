@@ -18,5 +18,10 @@ aws-credential-types.workspace = true
 aws-smithy-http-client.workspace = true
 hyper-rustls.workspace = true
 
+[features]
+# In-memory RemoteStore double for downstream crates' tests.
+test-util = []
+
 [dev-dependencies]
+store = { path = ".", features = ["test-util"] }
 tempfile.workspace = true

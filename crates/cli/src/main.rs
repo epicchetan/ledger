@@ -6,16 +6,24 @@
 
 use anyhow::{anyhow, Result};
 use clap::{Args, Parser, Subcommand};
+use ledger::feed::es_replay;
 use ledger::feed::es_replay::{
-    es_day_catalog, fetch_es_raw, prepare_es_replay_artifact, EsPrepareSummary, FetchProgress,
-    PrepareProgress, RAW_DATABENTO_DBN_ZST_KIND,
+    es_day_catalog, fetch_es_raw, find_es_replay_artifact_descriptor, prepare_es_replay_artifact,
+    EsPrepareSummary, EsReplayCells, EsReplayCursor, FetchProgress, PrepareProgress,
+    ES_MBO_EVENT_STORE_KIND, RAW_DATABENTO_DBN_ZST_KIND,
 };
 use ledger::market::MarketDay;
+use ledger::session::LedgerSessionBuilder;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 use store::{ObjectFilter, R2Store, RegisterFileRequest, StoreObjectId, StoreObjectRole};
 use tokio::sync::mpsc;
+
+const SESSION_READY_TIMEOUT: Duration = Duration::from_secs(60);
+const SESSION_STEP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Parser)]
 #[command(name = "ledger")]
@@ -32,6 +40,7 @@ struct Cli {
 enum Command {
     Store(StoreCommand),
     Es(EsCommand),
+    Session(SessionCommand),
 }
 
 #[derive(Args)]
@@ -66,6 +75,29 @@ enum EsSubcommand {
     Days,
     Prepare(EsPrepareArgs),
     Fetch(EsFetchArgs),
+}
+
+#[derive(Args)]
+struct SessionCommand {
+    #[command(subcommand)]
+    command: SessionSubcommand,
+}
+
+#[derive(Subcommand)]
+enum SessionSubcommand {
+    RunEsReplay(SessionRunEsReplayArgs),
+}
+
+#[derive(Args, Clone)]
+struct SessionRunEsReplayArgs {
+    #[arg(long)]
+    raw_id: String,
+    #[arg(long)]
+    batches: Option<usize>,
+    #[arg(long)]
+    realtime: bool,
+    #[arg(long, default_value_t = 1.0)]
+    speed: f64,
 }
 
 #[derive(Args, Clone)]
@@ -182,8 +214,120 @@ async fn main() -> Result<()> {
             )
             .await?
         }
+        Command::Session(command) => {
+            run_session_command(R2Store::from_env(&cli.data_dir).await?, command).await?
+        }
     }
 
+    Ok(())
+}
+
+async fn run_session_command(ledger_store: R2Store, command: SessionCommand) -> Result<()> {
+    match command.command {
+        SessionSubcommand::RunEsReplay(args) => {
+            run_session_es_replay_command(ledger_store, args).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn run_session_es_replay_command(
+    ledger_store: R2Store,
+    args: SessionRunEsReplayArgs,
+) -> Result<()> {
+    let raw_id = StoreObjectId::new(args.raw_id.clone())?;
+    let preexisting_artifact_id = existing_es_replay_artifact_id(&ledger_store, &raw_id)?;
+    let store = Arc::new(ledger_store);
+    let mut builder = LedgerSessionBuilder::new(store)?;
+    let cells = builder.es_replay(raw_id.clone())?;
+    let session = builder.start().await?;
+    let mut cursor_watch = session.cache().watch_key(cells.cursor.key())?;
+
+    let mut cursor = match tokio::time::timeout(
+        SESSION_READY_TIMEOUT,
+        wait_for_cursor_value(session.cache(), &mut cursor_watch, &cells.cursor),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            let feed_status = session
+                .runtime()
+                .component_status(&es_replay::es_replay_component_id())
+                .await
+                .map(|status| format!("{status:?}"))
+                .unwrap_or_else(|err| format!("status unavailable: {err}"));
+            let _ = session.shutdown().await;
+            return Err(anyhow!(
+                "timed out waiting for ES replay cursor readiness; component_status={feed_status}"
+            ));
+        }
+    };
+
+    let mode = if args.realtime { "realtime" } else { "step" };
+    let start_feed_seq = cursor.feed_seq;
+
+    if args.realtime {
+        if !requested_reached(&cursor, start_feed_seq, args.batches) && !cursor.ended {
+            let Some(first_ts) = cursor.next_ts_event_ns else {
+                let summary = session_summary(
+                    &cells,
+                    session.cache(),
+                    &raw_id,
+                    mode,
+                    args.batches,
+                    start_feed_seq,
+                    preexisting_artifact_id.as_deref(),
+                )?;
+                session.shutdown().await?;
+                print_json(&summary)?;
+                return Ok(());
+            };
+            session.seek_to(first_ts).await?;
+            session.set_speed(args.speed).await?;
+            session.play().await?;
+            let _ = wait_until_requested_or_ended(
+                session.cache(),
+                &mut cursor_watch,
+                &cells.cursor,
+                start_feed_seq,
+                args.batches,
+            )
+            .await?;
+            session.pause().await?;
+        }
+    } else {
+        while !requested_reached(&cursor, start_feed_seq, args.batches) && !cursor.ended {
+            let Some(target) = cursor.next_ts_event_ns else {
+                break;
+            };
+            let last_seen = cursor.feed_seq;
+            session.seek_to(target).await?;
+            cursor = tokio::time::timeout(
+                SESSION_STEP_TIMEOUT,
+                wait_for_cursor_progress(
+                    session.cache(),
+                    &mut cursor_watch,
+                    &cells.cursor,
+                    last_seen,
+                ),
+            )
+            .await
+            .map_err(|_| anyhow!("timed out waiting for ES replay cursor progress"))??;
+        }
+    }
+
+    let summary = session_summary(
+        &cells,
+        session.cache(),
+        &raw_id,
+        mode,
+        args.batches,
+        start_feed_seq,
+        preexisting_artifact_id.as_deref(),
+    )?;
+    session.shutdown().await?;
+    print_json(&summary)?;
     Ok(())
 }
 
@@ -296,6 +440,127 @@ async fn prepare_one(
     let progress = prepare_progress_channel();
     let artifact = prepare_es_replay_artifact(ledger_store, &raw_id, force, Some(progress)).await?;
     Ok(artifact.summary(&raw_id))
+}
+
+fn existing_es_replay_artifact_id(
+    ledger_store: &R2Store,
+    raw_id: &StoreObjectId,
+) -> Result<Option<String>> {
+    let artifacts = ledger_store.list_objects(ObjectFilter {
+        role: Some(StoreObjectRole::Artifact),
+        kind: Some(ES_MBO_EVENT_STORE_KIND.to_string()),
+        id_prefix: None,
+    })?;
+    Ok(find_es_replay_artifact_descriptor(&artifacts, raw_id)
+        .descriptor
+        .map(|descriptor| descriptor.id.to_string()))
+}
+
+async fn wait_for_cursor_value(
+    cache: &cache::Cache,
+    watch: &mut cache::CellWatch,
+    key: &cache::ValueKey<EsReplayCursor>,
+) -> Result<EsReplayCursor> {
+    loop {
+        if let Some(cursor) = cache.read_value(key)? {
+            return Ok(cursor);
+        }
+        watch.changed().await?;
+    }
+}
+
+async fn wait_for_cursor_progress(
+    cache: &cache::Cache,
+    watch: &mut cache::CellWatch,
+    key: &cache::ValueKey<EsReplayCursor>,
+    last_seen: u64,
+) -> Result<EsReplayCursor> {
+    loop {
+        if let Some(cursor) = cache.read_value(key)? {
+            if cursor.feed_seq > last_seen || cursor.ended {
+                return Ok(cursor);
+            }
+        }
+        watch.changed().await?;
+    }
+}
+
+async fn wait_until_requested_or_ended(
+    cache: &cache::Cache,
+    watch: &mut cache::CellWatch,
+    key: &cache::ValueKey<EsReplayCursor>,
+    start_feed_seq: u64,
+    requested: Option<usize>,
+) -> Result<EsReplayCursor> {
+    loop {
+        let cursor = wait_for_cursor_value(cache, watch, key).await?;
+        if requested_reached(&cursor, start_feed_seq, requested) || cursor.ended {
+            return Ok(cursor);
+        }
+        watch.changed().await?;
+    }
+}
+
+fn requested_reached(
+    cursor: &EsReplayCursor,
+    start_feed_seq: u64,
+    requested: Option<usize>,
+) -> bool {
+    requested
+        .map(|requested| cursor.feed_seq.saturating_sub(start_feed_seq) >= requested as u64)
+        .unwrap_or(false)
+}
+
+fn session_summary(
+    cells: &EsReplayCells,
+    cache: &cache::Cache,
+    raw_id: &StoreObjectId,
+    mode: &str,
+    batches_requested: Option<usize>,
+    start_feed_seq: u64,
+    preexisting_artifact_id: Option<&str>,
+) -> Result<SessionRunEsReplaySummary> {
+    let cursor = cache
+        .read_value(&cells.cursor)?
+        .ok_or_else(|| anyhow!("ES replay cursor was not published"))?;
+    let status = cache
+        .read_value(&cells.status)?
+        .ok_or_else(|| anyhow!("ES replay status was not published"))?;
+    let batches = cache.read_array(&cells.batches)?;
+    let artifact_reused = status
+        .artifact_object_id
+        .as_deref()
+        .zip(preexisting_artifact_id)
+        .map(|(actual, preexisting)| actual == preexisting)
+        .unwrap_or(false);
+    Ok(SessionRunEsReplaySummary {
+        raw_object_id: raw_id.to_string(),
+        artifact_object_id: status.artifact_object_id,
+        artifact_reused,
+        mode: mode.to_string(),
+        batches_requested,
+        batches_emitted: cursor.feed_seq.saturating_sub(start_feed_seq),
+        first_ts_event_ns: batches.first().map(|batch| batch.ts_event_ns.to_string()),
+        last_ts_event_ns: batches.last().map(|batch| batch.ts_event_ns.to_string()),
+        ended: cursor.ended,
+        epoch: cursor.epoch,
+        feed_seq: cursor.feed_seq,
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct SessionRunEsReplaySummary {
+    raw_object_id: String,
+    artifact_object_id: Option<String>,
+    artifact_reused: bool,
+    mode: String,
+    batches_requested: Option<usize>,
+    batches_emitted: u64,
+    first_ts_event_ns: Option<String>,
+    last_ts_event_ns: Option<String>,
+    ended: bool,
+    epoch: u64,
+    feed_seq: u64,
 }
 
 #[derive(Debug, Default, Serialize)]
