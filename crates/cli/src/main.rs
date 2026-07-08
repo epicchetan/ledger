@@ -13,9 +13,11 @@ use ledger::feed::es_replay::{
     ES_MBO_EVENT_STORE_KIND, RAW_DATABENTO_DBN_ZST_KIND,
 };
 use ledger::market::MarketDay;
+use ledger::projection::{BarsCells, BarsStatus, ProjectionSpec};
 use ledger::session::LedgerSessionBuilder;
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -98,6 +100,9 @@ struct SessionRunEsReplayArgs {
     realtime: bool,
     #[arg(long, default_value_t = 1.0)]
     speed: f64,
+    /// Projections to compute over the feed, e.g. `bars:1m`. Repeatable.
+    #[arg(long = "projection")]
+    projections: Vec<String>,
 }
 
 #[derive(Args, Clone)]
@@ -215,17 +220,27 @@ async fn main() -> Result<()> {
             .await?
         }
         Command::Session(command) => {
-            run_session_command(R2Store::from_env(&cli.data_dir).await?, command).await?
+            let projection_specs = parse_session_projection_specs(&command)?;
+            run_session_command(
+                R2Store::from_env(&cli.data_dir).await?,
+                command,
+                projection_specs,
+            )
+            .await?
         }
     }
 
     Ok(())
 }
 
-async fn run_session_command(ledger_store: R2Store, command: SessionCommand) -> Result<()> {
+async fn run_session_command(
+    ledger_store: R2Store,
+    command: SessionCommand,
+    projection_specs: Vec<(String, ProjectionSpec)>,
+) -> Result<()> {
     match command.command {
         SessionSubcommand::RunEsReplay(args) => {
-            run_session_es_replay_command(ledger_store, args).await?;
+            run_session_es_replay_command(ledger_store, args, projection_specs).await?;
         }
     }
     Ok(())
@@ -234,12 +249,22 @@ async fn run_session_command(ledger_store: R2Store, command: SessionCommand) -> 
 async fn run_session_es_replay_command(
     ledger_store: R2Store,
     args: SessionRunEsReplayArgs,
+    projection_specs: Vec<(String, ProjectionSpec)>,
 ) -> Result<()> {
     let raw_id = StoreObjectId::new(args.raw_id.clone())?;
     let preexisting_artifact_id = existing_es_replay_artifact_id(&ledger_store, &raw_id)?;
     let store = Arc::new(ledger_store);
     let mut builder = LedgerSessionBuilder::new(store)?;
     let cells = builder.es_replay(raw_id.clone())?;
+    let mut projection_cells = Vec::new();
+    for (canonical, spec) in &projection_specs {
+        match spec {
+            ProjectionSpec::Bars(params) => {
+                let bars = builder.bars(&cells, *params)?;
+                projection_cells.push((canonical.clone(), bars));
+            }
+        }
+    }
     let session = builder.start().await?;
     let mut cursor_watch = session.cache().watch_key(cells.cursor.key())?;
 
@@ -269,32 +294,20 @@ async fn run_session_es_replay_command(
 
     if args.realtime {
         if !requested_reached(&cursor, start_feed_seq, args.batches) && !cursor.ended {
-            let Some(first_ts) = cursor.next_ts_event_ns else {
-                let summary = session_summary(
-                    &cells,
+            if let Some(first_ts) = cursor.next_ts_event_ns {
+                session.seek_to(first_ts).await?;
+                session.set_speed(args.speed).await?;
+                session.play().await?;
+                let _ = wait_until_requested_or_ended(
                     session.cache(),
-                    &raw_id,
-                    mode,
-                    args.batches,
+                    &mut cursor_watch,
+                    &cells.cursor,
                     start_feed_seq,
-                    preexisting_artifact_id.as_deref(),
-                )?;
-                session.shutdown().await?;
-                print_json(&summary)?;
-                return Ok(());
-            };
-            session.seek_to(first_ts).await?;
-            session.set_speed(args.speed).await?;
-            session.play().await?;
-            let _ = wait_until_requested_or_ended(
-                session.cache(),
-                &mut cursor_watch,
-                &cells.cursor,
-                start_feed_seq,
-                args.batches,
-            )
-            .await?;
-            session.pause().await?;
+                    args.batches,
+                )
+                .await?;
+                session.pause().await?;
+            }
         }
     } else {
         while !requested_reached(&cursor, start_feed_seq, args.batches) && !cursor.ended {
@@ -317,6 +330,13 @@ async fn run_session_es_replay_command(
         }
     }
 
+    if let Err(error) =
+        wait_for_projection_catch_up_all(session.cache(), &projection_cells, &cells.cursor).await
+    {
+        let _ = session.shutdown().await;
+        return Err(error);
+    }
+
     let summary = session_summary(
         &cells,
         session.cache(),
@@ -325,6 +345,7 @@ async fn run_session_es_replay_command(
         args.batches,
         start_feed_seq,
         preexisting_artifact_id.as_deref(),
+        &projection_cells,
     )?;
     session.shutdown().await?;
     print_json(&summary)?;
@@ -456,6 +477,28 @@ fn existing_es_replay_artifact_id(
         .map(|descriptor| descriptor.id.to_string()))
 }
 
+fn parse_session_projection_specs(
+    command: &SessionCommand,
+) -> Result<Vec<(String, ProjectionSpec)>> {
+    match &command.command {
+        SessionSubcommand::RunEsReplay(args) => parse_projection_specs(&args.projections),
+    }
+}
+
+fn parse_projection_specs(raw_specs: &[String]) -> Result<Vec<(String, ProjectionSpec)>> {
+    let mut seen = HashSet::new();
+    let mut parsed = Vec::new();
+    for raw in raw_specs {
+        let spec = ProjectionSpec::parse(raw)?;
+        let canonical = spec.canonical();
+        if !seen.insert(canonical.clone()) {
+            return Err(anyhow!("duplicate projection spec `{canonical}`"));
+        }
+        parsed.push((canonical, spec));
+    }
+    Ok(parsed)
+}
+
 async fn wait_for_cursor_value(
     cache: &cache::Cache,
     watch: &mut cache::CellWatch,
@@ -501,6 +544,61 @@ async fn wait_until_requested_or_ended(
     }
 }
 
+async fn wait_for_projection_catch_up_all(
+    cache: &cache::Cache,
+    projections: &[(String, BarsCells)],
+    cursor_key: &cache::ValueKey<EsReplayCursor>,
+) -> Result<()> {
+    for (spec, cells) in projections {
+        let mut watch = cache.watch_key(cells.status.key())?;
+        match tokio::time::timeout(
+            SESSION_STEP_TIMEOUT,
+            wait_for_projection_catch_up(cache, &mut watch, &cells.status, cursor_key),
+        )
+        .await
+        {
+            Ok(result) => {
+                result?;
+            }
+            Err(_) => {
+                let processed = cache
+                    .read_value(&cells.status)?
+                    .map(|status| status.processed_batches.to_string())
+                    .unwrap_or_else(|| "unpublished".to_string());
+                let batch_idx = cache
+                    .read_value(cursor_key)?
+                    .map(|cursor| cursor.batch_idx.to_string())
+                    .unwrap_or_else(|| "unpublished".to_string());
+                return Err(anyhow!(
+                    "timed out waiting for projection `{spec}` catch-up: status.processed_batches={processed} cursor.batch_idx={batch_idx}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn wait_for_projection_catch_up(
+    cache: &cache::Cache,
+    watch: &mut cache::CellWatch,
+    key: &cache::ValueKey<BarsStatus>,
+    cursor_key: &cache::ValueKey<EsReplayCursor>,
+) -> Result<BarsStatus> {
+    loop {
+        // Re-read the cursor each pass: in realtime mode the feed can emit
+        // in-flight batches after pause() resolves, so a cursor pinned before
+        // the wait can sit permanently behind the projection's progress.
+        if let (Some(cursor), Some(status)) =
+            (cache.read_value(cursor_key)?, cache.read_value(key)?)
+        {
+            if status.epoch == cursor.epoch && status.processed_batches == cursor.batch_idx {
+                return Ok(status);
+            }
+        }
+        watch.changed().await?;
+    }
+}
+
 fn requested_reached(
     cursor: &EsReplayCursor,
     start_feed_seq: u64,
@@ -519,6 +617,7 @@ fn session_summary(
     batches_requested: Option<usize>,
     start_feed_seq: u64,
     preexisting_artifact_id: Option<&str>,
+    projections: &[(String, BarsCells)],
 ) -> Result<SessionRunEsReplaySummary> {
     let cursor = cache
         .read_value(&cells.cursor)?
@@ -545,7 +644,45 @@ fn session_summary(
         ended: cursor.ended,
         epoch: cursor.epoch,
         feed_seq: cursor.feed_seq,
+        projections: projection_summaries(cache, projections)?,
     })
+}
+
+fn projection_summaries(
+    cache: &cache::Cache,
+    projections: &[(String, BarsCells)],
+) -> Result<Vec<SessionProjectionSummary>> {
+    let mut summaries = Vec::new();
+    for (spec, cells) in projections {
+        let bars = cache.read_array(&cells.bars)?;
+        let live = cache.read_value(&cells.live)?;
+        let completed_volume = bars.iter().map(|bar| bar.volume).sum::<u64>();
+        let completed_trade_count = bars.iter().map(|bar| bar.trade_count).sum::<u64>();
+        let volume = completed_volume + live.as_ref().map(|bar| bar.volume).unwrap_or(0);
+        let trade_count =
+            completed_trade_count + live.as_ref().map(|bar| bar.trade_count).unwrap_or(0);
+        let first_bar_start_ns = bars
+            .first()
+            .map(|bar| bar.interval_start_ns)
+            .or_else(|| live.as_ref().map(|bar| bar.interval_start_ns))
+            .map(|value| value.to_string());
+        let last_bar_start_ns = live
+            .as_ref()
+            .map(|bar| bar.interval_start_ns)
+            .or_else(|| bars.last().map(|bar| bar.interval_start_ns))
+            .map(|value| value.to_string());
+
+        summaries.push(SessionProjectionSummary {
+            spec: spec.clone(),
+            completed_bars: bars.len(),
+            live_bar: live.is_some(),
+            volume,
+            trade_count,
+            first_bar_start_ns,
+            last_bar_start_ns,
+        });
+    }
+    Ok(summaries)
 }
 
 #[derive(Debug, Serialize)]
@@ -561,6 +698,24 @@ struct SessionRunEsReplaySummary {
     ended: bool,
     epoch: u64,
     feed_seq: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    projections: Vec<SessionProjectionSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionProjectionSummary {
+    spec: String,
+    completed_bars: usize,
+    live_bar: bool,
+    /// Totals across completed bars plus the live bar.
+    volume: u64,
+    trade_count: u64,
+    /// interval_start_ns of the first completed bar (or live bar if none
+    /// completed), u64-as-string like the other ns fields.
+    first_bar_start_ns: Option<String>,
+    /// interval_start_ns of the live bar if present, else the last
+    /// completed bar.
+    last_bar_start_ns: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize)]

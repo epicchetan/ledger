@@ -9,6 +9,7 @@ pub mod clock;
 pub mod error;
 pub mod feed;
 pub mod market;
+pub mod projection;
 pub mod session;
 
 pub use error::LedgerError;

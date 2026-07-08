@@ -2,13 +2,15 @@ use std::sync::Arc;
 
 use cache::{Cache, CellDescriptor, CellKind, CellOwner, Key, ValueKey};
 use runtime::{
-    ExternalWriteBatch, ExternalWriteSink, RuntimeHandle, RuntimeProcess, RuntimeWorker,
+    ExternalWriteBatch, ExternalWriteSink, RuntimeHandle, RuntimeProcess, RuntimeTask,
+    RuntimeWorker,
 };
 use store::{RemoteStore, Store, StoreObjectId};
 use tokio::task::JoinHandle;
 
 use crate::clock::{ClockSnapshot, ClockState};
 use crate::feed::es_replay::{EsReplayCells, EsReplayFeed};
+use crate::projection::{BarsCells, BarsParams, BarsTask};
 use crate::LedgerError;
 
 pub struct LedgerSessionBuilder<S>
@@ -18,6 +20,7 @@ where
     store: Arc<Store<S>>,
     cache: Cache,
     clock_key: ValueKey<ClockState>,
+    tasks: Vec<Box<dyn RuntimeTask>>,
     feeds: Vec<Box<dyn RuntimeProcess>>,
 }
 
@@ -41,6 +44,7 @@ where
             store,
             cache,
             clock_key,
+            tasks: Vec::new(),
             feeds: Vec::new(),
         })
     }
@@ -60,6 +64,18 @@ where
         Ok(cells)
     }
 
+    /// Register a time-bars projection over an es_replay feed's cells.
+    pub fn bars(
+        &mut self,
+        feed: &EsReplayCells,
+        params: BarsParams,
+    ) -> Result<BarsCells, LedgerError> {
+        let cells = BarsCells::register(&self.cache, params)?;
+        let task = BarsTask::new(feed.clone(), params, cells.clone())?;
+        self.tasks.push(Box::new(task));
+        Ok(cells)
+    }
+
     pub async fn start(self) -> Result<LedgerSessionHandle, LedgerError> {
         let (worker, runtime) = RuntimeWorker::new(self.cache);
         let worker = tokio::spawn(worker.run());
@@ -68,6 +84,10 @@ where
         let mut batch = ExternalWriteBatch::new(session_owner.clone());
         batch.set_value(&self.clock_key, ClockState::initial());
         writes.submit(batch).await?;
+
+        for task in self.tasks {
+            runtime.install_boxed_task(task).await?;
+        }
 
         for feed in self.feeds {
             runtime.install_boxed_process(feed).await?;

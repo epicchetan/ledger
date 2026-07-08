@@ -41,6 +41,32 @@ pub struct EsMboEvent {
     pub is_last: bool,
 }
 
+/// A canonical trade print per the ledger trade-print policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TradePrint {
+    pub ts_event_ns: UnixNanos,
+    pub price_ticks: PriceTicks,
+    pub size: u32,
+    /// Aggressor side as reported by the venue; `None` when unattributed.
+    pub aggressor: Option<BookSide>,
+}
+
+/// Canonical trade-print policy: `Trade` actions with a price and nonzero
+/// size count as chart volume; `Fill` mirrors the resting side of the same
+/// match and is excluded to avoid double-counting.
+pub fn canonical_trade_print(event: &EsMboEvent) -> Option<TradePrint> {
+    if event.action != BookAction::Trade || event.size == 0 {
+        return None;
+    }
+    let price_ticks = event.price_ticks?;
+    Some(TradePrint {
+        ts_event_ns: event.ts_event_ns,
+        price_ticks,
+        size: event.size,
+        aggressor: event.side,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EsMboBatchSpan {
     pub start_idx: usize,

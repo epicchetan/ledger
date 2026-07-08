@@ -18,6 +18,9 @@ pub enum LedgerError {
     #[error("databento fetch failed: {0}")]
     Fetch(String),
 
+    #[error("invalid projection spec `{spec}`: {reason}")]
+    InvalidProjectionSpec { spec: String, reason: String },
+
     #[error(transparent)]
     Cache(#[from] cache::CacheError),
 

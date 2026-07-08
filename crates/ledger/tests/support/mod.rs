@@ -122,3 +122,24 @@ pub fn event(ts_event_ns: u64, sequence: u64) -> EsMboEvent {
         is_last: true,
     }
 }
+
+pub fn trade(
+    ts_event_ns: u64,
+    sequence: u64,
+    price_ticks: i64,
+    size: u32,
+    aggressor: Option<BookSide>,
+) -> EsMboEvent {
+    EsMboEvent {
+        ts_event_ns,
+        ts_recv_ns: ts_event_ns,
+        sequence,
+        action: BookAction::Trade,
+        side: aggressor,
+        price_ticks: Some(PriceTicks(price_ticks)),
+        size,
+        order_id: sequence,
+        flags: 0,
+        is_last: true,
+    }
+}
