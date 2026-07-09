@@ -4,7 +4,7 @@ use ledger::clock::{ClockMode, ClockSnapshot};
 use ledger::feed::es_replay::{
     es_replay_component_id, EsReplayCells, EsReplayCursor, EsReplayStatus,
 };
-use ledger::market::PriceTicks;
+use ledger::market::{MarketDay, PriceTicks};
 use ledger::projection::{Bar, BarsCells, BarsStatus, ProjectionSpec};
 use ledger::session::{LedgerSessionBuilder, LedgerSessionHandle};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -75,9 +75,20 @@ impl SessionRegistry {
         let params = parse_params::<SessionOpenParams>(params)?;
         let projections = parse_projection_specs(params.projections.unwrap_or_default())?;
         let raw_id = parse_object_id(&params.raw_id)?;
-        if store.get_object(&raw_id)?.is_none() {
-            return Err(RpcError::object_not_found(&params.raw_id));
-        }
+        let descriptor = store
+            .get_object(&raw_id)?
+            .ok_or_else(|| RpcError::object_not_found(&params.raw_id))?;
+        // The scrubber needs a fixed time domain and the ES session calendar
+        // (DST-sensitive) lives server-side; raws without a market day open
+        // fine and just carry null bounds.
+        let market_day = descriptor
+            .metadata_json
+            .get("market_day")
+            .and_then(Value::as_str)
+            .and_then(|value| MarketDay::parse(value).ok());
+        let session_bounds = market_day
+            .as_ref()
+            .and_then(|day| day.es_session_bounds_utc().ok());
 
         let _lifecycle = self.lifecycle.lock().await;
         let replaced = self.take_active().await;
@@ -154,6 +165,9 @@ impl SessionRegistry {
                 })
                 .collect(),
             replaced: replaced_id,
+            market_day: market_day.as_ref().map(MarketDay::to_string),
+            session_start_ns: session_bounds.map(|(start, _)| ns_string(start)),
+            session_end_ns: session_bounds.map(|(_, end)| ns_string(end)),
         })
     }
 
@@ -769,6 +783,9 @@ struct SessionOpenResultDto {
     raw_id: String,
     projections: Vec<ProjectionDto>,
     replaced: Option<String>,
+    market_day: Option<String>,
+    session_start_ns: Option<String>,
+    session_end_ns: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -849,6 +866,7 @@ pub struct EsReplayCursorDto {
     total_batches: usize,
     ts_event_ns: Option<String>,
     next_ts_event_ns: Option<String>,
+    catching_up: bool,
     ended: bool,
 }
 
@@ -861,6 +879,7 @@ impl From<EsReplayCursor> for EsReplayCursorDto {
             total_batches: cursor.total_batches,
             ts_event_ns: cursor.ts_event_ns.map(ns_string),
             next_ts_event_ns: cursor.next_ts_event_ns.map(ns_string),
+            catching_up: cursor.catching_up,
             ended: cursor.ended,
         }
     }
@@ -963,14 +982,14 @@ mod tests {
     use crate::rpc::{OutboundMessage, Request};
     use async_trait::async_trait;
     use ledger::feed::es_replay::{
-        encode_event_store, ES_MBO_EVENT_STORE_FILE_NAME, ES_MBO_EVENT_STORE_KIND,
+        encode_event_store, EsReplayCursor, ES_MBO_EVENT_STORE_FILE_NAME, ES_MBO_EVENT_STORE_KIND,
         ES_MBO_EVENT_STORE_VERSION, RAW_DATABENTO_DBN_ZST_KIND,
     };
     use ledger::market::{
         build_batches, BookAction, BookSide, EsMboEvent, EsMboEventStore, MarketDay, PriceTicks,
     };
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::Path;
     use std::sync::{Arc, Mutex as StdMutex};
     use store::{
@@ -983,6 +1002,7 @@ mod tests {
     use tokio::time::{timeout, Duration};
 
     const WAKE: Duration = Duration::from_secs(3);
+    const TEST_CATCHUP_CHUNK_BATCHES: usize = 1024;
 
     #[derive(Clone, Default)]
     struct TestRemote {
@@ -1092,6 +1112,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cursor_dto_serializes_catching_up_with_camel_case() {
+        let value = serde_json::to_value(EsReplayCursorDto::from(EsReplayCursor {
+            epoch: 2,
+            feed_seq: 11,
+            batch_idx: 10,
+            total_batches: 20,
+            ts_event_ns: Some(123),
+            next_ts_event_ns: Some(456),
+            catching_up: true,
+            ended: false,
+        }))
+        .unwrap();
+
+        assert_eq!(value["catchingUp"], true);
+        assert!(value.get("catching_up").is_none());
+    }
+
     #[tokio::test]
     async fn open_validates_specs_and_raw_ids_without_creating_sessions() {
         let fixture = remux_fixture();
@@ -1140,6 +1178,14 @@ mod tests {
         assert_eq!(opened["sessionId"], "session-1");
         assert_eq!(opened["projections"][0]["spec"], "bars:1m");
         assert_eq!(opened["replaced"], Value::Null);
+
+        // Session bounds come from the raw's market_day metadata so the
+        // client's scrubber never re-derives the ES calendar.
+        let day = MarketDay::parse("2026-03-10").unwrap();
+        let (start_ns, end_ns) = day.es_session_bounds_utc().unwrap();
+        assert_eq!(opened["marketDay"], day.to_string());
+        assert_eq!(opened["sessionStartNs"], ns_string(start_ns));
+        assert_eq!(opened["sessionEndNs"], ns_string(end_ns));
     }
 
     #[tokio::test]
@@ -1219,6 +1265,47 @@ mod tests {
             starts,
             direct_bar_start_strings(&fixture.methods, "bars:1s").await
         );
+    }
+
+    #[tokio::test]
+    async fn forward_seek_bars_frame_notifications_are_bounded_by_chunking() {
+        let mut fixture = remux_fixture();
+        let batch_count = TEST_CATCHUP_CHUNK_BATCHES * 4 + 123;
+        let raw_id = fabricate_prepared_day(&fixture.store, generated_trades(batch_count))
+            .await
+            .0;
+        let session_id = open_session_id(&fixture.methods, &raw_id, vec!["bars:1s"]).await;
+
+        seek(&fixture.methods, &session_id, batch_count as u64).await;
+        let frame_count =
+            wait_bars_processed_count(&mut fixture.output_rx, &session_id, "bars:1s", batch_count)
+                .await;
+        let frame_ceiling = batch_count.div_ceil(TEST_CATCHUP_CHUNK_BATCHES) * 4 + 8;
+
+        assert!(frame_count <= frame_ceiling);
+        assert!(frame_count < batch_count / 10);
+    }
+
+    #[tokio::test]
+    async fn control_write_clock_notification_arrives_before_projection_convergence() {
+        let mut fixture = remux_fixture();
+        let batch_count = TEST_CATCHUP_CHUNK_BATCHES * 4 + 123;
+        let raw_id = fabricate_prepared_day(&fixture.store, generated_trades(batch_count))
+            .await
+            .0;
+        let session_id =
+            open_session_id(&fixture.methods, &raw_id, vec!["bars:1s", "bars:1m"]).await;
+
+        seek(&fixture.methods, &session_id, batch_count as u64).await;
+        set_speed(&fixture.methods, &session_id, 3.0).await;
+        wait_clock_speed_before_projection_convergence(
+            &mut fixture.output_rx,
+            &session_id,
+            &["bars:1s", "bars:1m"],
+            batch_count,
+            3.0,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1581,6 +1668,16 @@ mod tests {
         .unwrap();
     }
 
+    async fn set_speed(methods: &LedgerRemux<TestRemote>, session_id: &str, speed: f64) {
+        call(
+            methods,
+            SESSION_SPEED_METHOD,
+            json!({ "sessionId": session_id, "speed": speed }),
+        )
+        .await
+        .unwrap();
+    }
+
     async fn status(methods: &LedgerRemux<TestRemote>, session_id: &str) -> Value {
         call(
             methods,
@@ -1642,6 +1739,77 @@ mod tests {
                 && params["total"].as_u64() == Some(total as u64)
         })
         .await
+    }
+
+    async fn wait_bars_processed_count(
+        output_rx: &mut mpsc::Receiver<OutboundMessage>,
+        session_id: &str,
+        spec: &str,
+        processed_batches: usize,
+    ) -> usize {
+        timeout(WAKE, async {
+            let mut frame_count = 0usize;
+            loop {
+                let value = next_json(output_rx).await;
+                if value["method"] == SESSION_BARS_FRAME_NOTIFICATION
+                    && value["params"]["sessionId"].as_str() == Some(session_id)
+                    && value["params"]["spec"].as_str() == Some(spec)
+                {
+                    frame_count += 1;
+                    if value["params"]["status"]["processedBatches"].as_u64()
+                        == Some(processed_batches as u64)
+                    {
+                        return frame_count;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn wait_clock_speed_before_projection_convergence(
+        output_rx: &mut mpsc::Receiver<OutboundMessage>,
+        session_id: &str,
+        specs: &[&str],
+        processed_batches: usize,
+        speed: f64,
+    ) {
+        timeout(WAKE, async {
+            let expected = specs.iter().copied().collect::<HashSet<_>>();
+            let mut converged = HashSet::new();
+            loop {
+                let value = next_json(output_rx).await;
+                match value["method"].as_str() {
+                    Some(SESSION_CLOCK_NOTIFICATION)
+                        if value["params"]["sessionId"].as_str() == Some(session_id)
+                            && value["params"]["clock"]["speed"].as_f64() == Some(speed) =>
+                    {
+                        assert!(
+                            converged.len() < expected.len(),
+                            "all projections converged before the speed clock notification"
+                        );
+                        return;
+                    }
+                    Some(SESSION_BARS_FRAME_NOTIFICATION)
+                        if value["params"]["sessionId"].as_str() == Some(session_id) =>
+                    {
+                        if value["params"]["status"]["processedBatches"].as_u64()
+                            == Some(processed_batches as u64)
+                        {
+                            if let Some(spec) = value["params"]["spec"].as_str() {
+                                if expected.contains(spec) {
+                                    converged.insert(spec.to_string());
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap()
     }
 
     async fn wait_clock_mode(
@@ -1747,6 +1915,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let market_day = MarketDay::parse("2026-03-10").unwrap();
         let raw = store
             .register_file(RegisterFileRequest {
                 path: &raw_path,
@@ -1756,7 +1925,9 @@ mod tests {
                 format: Some("dbn.zst".to_string()),
                 media_type: None,
                 lineage: Vec::new(),
-                metadata_json: json!({}),
+                // Production raws carry market_day (the day catalog groups on
+                // it); session/open derives session bounds from it.
+                metadata_json: json!({ "market_day": market_day.to_string() }),
             })
             .await
             .unwrap();
@@ -1766,7 +1937,6 @@ mod tests {
         let encoded = encode_event_store(&event_store);
         let artifact_path = tempdir.path().join(ES_MBO_EVENT_STORE_FILE_NAME);
         tokio::fs::write(&artifact_path, encoded).await.unwrap();
-        let market_day = MarketDay::parse("2026-03-10").unwrap();
         let first_ts_event_ns = event_store
             .events
             .first()
@@ -1818,6 +1988,26 @@ mod tests {
             trade(100, 1, 200, 1, Some(BookSide::Bid)),
             trade(1_500_000_000, 2, 201, 1, Some(BookSide::Ask)),
         ]
+    }
+
+    fn generated_trades(count: usize) -> Vec<EsMboEvent> {
+        (0..count)
+            .map(|idx| {
+                let sequence = (idx + 1) as u64;
+                let side = if idx % 2 == 0 {
+                    Some(BookSide::Bid)
+                } else {
+                    Some(BookSide::Ask)
+                };
+                trade(
+                    sequence,
+                    sequence,
+                    100 + (idx % 19) as i64,
+                    1 + (idx % 7) as u32,
+                    side,
+                )
+            })
+            .collect()
     }
 
     fn trade(

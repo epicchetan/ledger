@@ -8,7 +8,7 @@ use ledger::feed::es_replay::{es_replay_component_id, EsMboFeedBatch, EsReplayCe
 use ledger::session::{LedgerSessionBuilder, LedgerSessionHandle};
 use runtime::{
     ComponentDescriptor, ComponentError, ComponentId, ExternalWriteBatch, RuntimeTask, TaskContext,
-    TaskDescriptor,
+    TaskDescriptor, TaskOutcome,
 };
 use tokio::time::timeout;
 
@@ -228,11 +228,12 @@ impl RuntimeTask for CountBatchesTask {
         &self.descriptor
     }
 
-    async fn run_once(&mut self, ctx: TaskContext<'_>) -> Result<(), ComponentError> {
+    async fn run_once(&mut self, ctx: TaskContext<'_>) -> Result<TaskOutcome, ComponentError> {
         let count = ctx.read_array(&self.input)?.len();
         let mut batch = ctx.batch();
         batch.set_value(&self.output, count);
-        ctx.submit(batch).await
+        ctx.submit(batch).await?;
+        Ok(TaskOutcome::Idle)
     }
 }
 

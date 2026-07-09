@@ -220,7 +220,10 @@ ClockSnapshotDto      mirror of ledger::clock::ClockSnapshot, camelCase,
                       ns fields as strings
 EsReplayCursorDto     { epoch: number, feedSeq: number, batchIdx: number,
                         totalBatches: number, tsEventNs: string | null,
-                        nextTsEventNs: string | null, ended: boolean }
+                        nextTsEventNs: string | null, catchingUp: boolean,
+                        ended: boolean }
+                      catchingUp is true while feed catch-up output is
+                      still converging after an already-due backlog.
 EsReplayStatusDto     { rawObjectId, artifactObjectId, clock, cursor }
 BarsStatusDto         { spec, epoch: number, processedBatches: number,
                         completedBars: number, lastTsEventNs: string | null }

@@ -10,8 +10,9 @@ use async_trait::async_trait;
 use cache::{Cache, CellDescriptor, CellKind, CellOwner, Key, ValueKey};
 use runtime::{
     ComponentDescriptor, ComponentError, ComponentId, ComponentStatus, ProcessContext,
-    RuntimeProcess, RuntimeTask, RuntimeWorker, TaskContext, TaskDescriptor,
+    RuntimeProcess, RuntimeTask, RuntimeWorker, TaskContext, TaskDescriptor, TaskOutcome,
 };
+use tokio::sync::Notify;
 
 fn key(value: &str) -> Key {
     Key::new(value).unwrap()
@@ -75,15 +76,153 @@ impl RuntimeTask for CopyTask {
         &self.descriptor
     }
 
-    async fn run_once(&mut self, ctx: TaskContext<'_>) -> Result<(), ComponentError> {
+    async fn run_once(&mut self, ctx: TaskContext<'_>) -> Result<TaskOutcome, ComponentError> {
         if let Some(value) = ctx.read_value(&self.input)? {
             self.log.lock().unwrap().push(value);
             let mut batch = ctx.batch();
             batch.set_value(&self.output, value);
             ctx.submit(batch).await?;
         }
-        Ok(())
+        Ok(TaskOutcome::Idle)
     }
+}
+
+struct WakeAgainChainTask {
+    descriptor: TaskDescriptor,
+    remaining_wakes: usize,
+    done: ValueKey<bool>,
+    first_step: Option<Arc<Notify>>,
+}
+
+#[async_trait]
+impl RuntimeTask for WakeAgainChainTask {
+    fn descriptor(&self) -> &TaskDescriptor {
+        &self.descriptor
+    }
+
+    async fn run_once(&mut self, ctx: TaskContext<'_>) -> Result<TaskOutcome, ComponentError> {
+        if let Some(first_step) = self.first_step.take() {
+            first_step.notify_waiters();
+        }
+        if self.remaining_wakes > 0 {
+            self.remaining_wakes -= 1;
+            Ok(TaskOutcome::WakeAgain)
+        } else {
+            let mut batch = ctx.batch();
+            batch.set_value(&self.done, true);
+            ctx.submit(batch).await?;
+            Ok(TaskOutcome::Idle)
+        }
+    }
+}
+
+#[tokio::test]
+async fn worker_applies_external_writes_between_wake_again_steps() {
+    let cache = Cache::new();
+    let task_id = component_id("task.chain");
+    let session_owner = CellOwner::new("session").unwrap();
+    let value = cache
+        .register_value(
+            descriptor("session.value", session_owner.clone(), CellKind::Value),
+            None::<i32>,
+        )
+        .unwrap();
+    let done = cache
+        .register_value(
+            descriptor("task.chain.done", task_id.owner(), CellKind::Value),
+            Some(false),
+        )
+        .unwrap();
+    let mut value_watch = cache.watch_key(value.key()).unwrap();
+    let first_step = Arc::new(Notify::new());
+    let (worker, handle) = RuntimeWorker::new(cache.clone());
+    let worker_join = tokio::spawn(worker.run());
+    handle
+        .install_task(WakeAgainChainTask {
+            descriptor: TaskDescriptor::new(task_id.clone(), Vec::new()),
+            remaining_wakes: 64,
+            done: done.clone(),
+            first_step: Some(first_step.clone()),
+        })
+        .await
+        .unwrap();
+
+    let writer = {
+        let handle = handle.clone();
+        let value = value.clone();
+        tokio::spawn(async move {
+            first_step.notified().await;
+            let mut batch = runtime::ExternalWriteBatch::new(session_owner);
+            batch.set_value(&value, 7);
+            handle.submit_external_writes(batch).await.unwrap();
+        })
+    };
+    let queued = {
+        let handle = handle.clone();
+        let task_id = task_id.clone();
+        tokio::spawn(async move { handle.queue_task(&task_id).await })
+    };
+
+    tokio::time::timeout(Duration::from_secs(1), value_watch.changed())
+        .await
+        .expect("external write should be applied before chain completes")
+        .unwrap();
+    assert_eq!(cache.read_value(&value).unwrap(), Some(7));
+    assert_eq!(cache.read_value(&done).unwrap(), Some(false));
+
+    queued.await.unwrap().unwrap();
+    writer.await.unwrap();
+    wait_until(|| cache.read_value(&done).unwrap() == Some(true)).await;
+    handle.shutdown().await.unwrap();
+    worker_join.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn worker_write_arm_allows_wake_again_chains_past_default_budget() {
+    let cache = Cache::new();
+    let task_id = component_id("task.long_chain");
+    let session_owner = CellOwner::new("session").unwrap();
+    let trigger = cache
+        .register_value(
+            descriptor("session.trigger", session_owner.clone(), CellKind::Value),
+            None::<i32>,
+        )
+        .unwrap();
+    let done = cache
+        .register_value(
+            descriptor("task.long_chain.done", task_id.owner(), CellKind::Value),
+            Some(false),
+        )
+        .unwrap();
+    let mut done_watch = cache.watch_key(done.key()).unwrap();
+    let (worker, handle) = RuntimeWorker::new(cache.clone());
+    let worker_join = tokio::spawn(worker.run());
+    handle
+        .install_task(WakeAgainChainTask {
+            descriptor: TaskDescriptor::new(task_id, vec![trigger.key().clone()]),
+            remaining_wakes: 1_500,
+            done: done.clone(),
+            first_step: None,
+        })
+        .await
+        .unwrap();
+
+    let mut batch = runtime::ExternalWriteBatch::new(session_owner);
+    batch.set_value(&trigger, 1);
+    handle.submit_external_writes(batch).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if cache.read_value(&done).unwrap() == Some(true) {
+                return;
+            }
+            done_watch.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("long WakeAgain chain should complete");
+
+    handle.shutdown().await.unwrap();
+    worker_join.await.unwrap().unwrap();
 }
 
 #[tokio::test]

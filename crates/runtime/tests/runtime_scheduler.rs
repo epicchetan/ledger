@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use cache::{Cache, CacheError, CellDescriptor, CellKind, CellOwner, Key, ValueKey};
 use runtime::{
     ComponentError, ComponentId, ExternalWriteBatch, Runtime, RuntimeError, RuntimeTask,
-    TaskContext, TaskDescriptor, TaskWake,
+    TaskContext, TaskDescriptor, TaskOutcome, TaskWake,
 };
 
 fn key(value: &str) -> Key {
@@ -100,7 +100,7 @@ impl RuntimeTask for CopyTask {
         &self.descriptor
     }
 
-    async fn run_once(&mut self, ctx: TaskContext<'_>) -> Result<(), ComponentError> {
+    async fn run_once(&mut self, ctx: TaskContext<'_>) -> Result<TaskOutcome, ComponentError> {
         self.log.lock().unwrap().push(self.log_name.to_string());
         if let Some(value) = ctx.read_value(&self.input)? {
             let mut batch = ctx.batch();
@@ -110,7 +110,7 @@ impl RuntimeTask for CopyTask {
         if self.fail_after_write {
             return Err(ComponentError::Message("forced_failure".to_string()));
         }
-        Ok(())
+        Ok(TaskOutcome::Idle)
     }
 }
 
@@ -125,7 +125,7 @@ impl RuntimeTask for FailingTask {
         &self.descriptor
     }
 
-    async fn run_once(&mut self, _ctx: TaskContext<'_>) -> Result<(), ComponentError> {
+    async fn run_once(&mut self, _ctx: TaskContext<'_>) -> Result<TaskOutcome, ComponentError> {
         self.log.lock().unwrap().push("failing".to_string());
         Err(ComponentError::Message("forced_failure".to_string()))
     }
@@ -142,12 +142,12 @@ impl RuntimeTask for IncrementSelfTask {
         &self.descriptor
     }
 
-    async fn run_once(&mut self, ctx: TaskContext<'_>) -> Result<(), ComponentError> {
+    async fn run_once(&mut self, ctx: TaskContext<'_>) -> Result<TaskOutcome, ComponentError> {
         let next = ctx.read_value(&self.cell)?.unwrap_or(0) + 1;
         let mut batch = ctx.batch();
         batch.set_value(&self.cell, next);
         ctx.submit(batch).await?;
-        Ok(())
+        Ok(TaskOutcome::Idle)
     }
 }
 
@@ -163,7 +163,7 @@ impl RuntimeTask for WakeLoggingTask {
         &self.descriptor
     }
 
-    async fn run_once(&mut self, ctx: TaskContext<'_>) -> Result<(), ComponentError> {
+    async fn run_once(&mut self, ctx: TaskContext<'_>) -> Result<TaskOutcome, ComponentError> {
         self.log.lock().unwrap().push(ctx.wake());
         if let Some(cell) = &self.cell {
             let next = ctx.read_value(cell)?.unwrap_or(0) + 1;
@@ -171,7 +171,30 @@ impl RuntimeTask for WakeLoggingTask {
             batch.set_value(cell, next);
             ctx.submit(batch).await?;
         }
-        Ok(())
+        Ok(TaskOutcome::Idle)
+    }
+}
+
+struct WakeAgainTask {
+    descriptor: TaskDescriptor,
+    remaining_wakes: usize,
+    log: Arc<Mutex<Vec<TaskWake>>>,
+}
+
+#[async_trait]
+impl RuntimeTask for WakeAgainTask {
+    fn descriptor(&self) -> &TaskDescriptor {
+        &self.descriptor
+    }
+
+    async fn run_once(&mut self, ctx: TaskContext<'_>) -> Result<TaskOutcome, ComponentError> {
+        self.log.lock().unwrap().push(ctx.wake());
+        if self.remaining_wakes > 0 {
+            self.remaining_wakes -= 1;
+            Ok(TaskOutcome::WakeAgain)
+        } else {
+            Ok(TaskOutcome::Idle)
+        }
     }
 }
 
@@ -202,6 +225,42 @@ async fn external_write_changed_key_queues_and_runs_dependent_task() {
     assert_eq!(step.scheduled_tasks, vec![task_id]);
     assert_eq!(cache.read_value(&output).unwrap(), Some(7));
     assert_eq!(log_snapshot(&log), vec!["copy"]);
+}
+
+#[tokio::test]
+async fn wake_again_runs_exact_steps_and_dependency_change_dedupes_mid_chain() {
+    let cache = Cache::new();
+    let source = source_cell(&cache);
+    let task_id = task_id("task.wake_again");
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut runtime = Runtime::new(cache);
+    runtime
+        .register_task(WakeAgainTask {
+            descriptor: TaskDescriptor::new(task_id.clone(), vec![source.key().clone()]),
+            remaining_wakes: 3,
+            log: log.clone(),
+        })
+        .await
+        .unwrap();
+
+    runtime.queue_task(&task_id).unwrap();
+    let first = runtime.run_once().await.unwrap();
+    runtime.submit_external_writes(external_set(feed_owner(), &source, 1));
+    let stats = runtime.run_until_idle(10).await.unwrap();
+
+    assert_eq!(first.task_run, Some(task_id));
+    assert!(!first.idle_after);
+    assert_eq!(stats.tasks_run, 3);
+    assert_eq!(
+        log.lock().unwrap().as_slice(),
+        &[
+            TaskWake::Manual,
+            TaskWake::SelfRequested,
+            TaskWake::SelfRequested,
+            TaskWake::SelfRequested,
+        ]
+    );
+    assert!(runtime.is_idle());
 }
 
 #[tokio::test]

@@ -23,6 +23,6 @@ pub use process::{ProcessContext, ProcessPrepareContext, RuntimeProcess, Shutdow
 pub use runtime::{
     ExternalWriteBatch, ExternalWriteReceiver, ExternalWriteSink, RunStats, Runtime, RuntimeStep,
 };
-pub use task::{RuntimeTask, TaskContext, TaskPrepareContext, TaskWake};
+pub use task::{RuntimeTask, TaskContext, TaskOutcome, TaskPrepareContext, TaskWake};
 pub use worker::RuntimeWorker;
 pub use write::ComponentWriteContext;

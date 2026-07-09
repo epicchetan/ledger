@@ -11,7 +11,7 @@ pub use external_write::{ExternalWriteBatch, ExternalWriteReceiver, ExternalWrit
 
 use crate::{
     ComponentId, ComponentKind, ComponentStatus, RuntimeError, RuntimeTask, TaskContext,
-    TaskPrepareContext, TaskWake,
+    TaskOutcome, TaskPrepareContext, TaskWake,
 };
 
 use self::{dependency::DependencyIndex, task_queue::TaskQueue, task_registry::TaskRegistry};
@@ -170,6 +170,7 @@ impl Runtime {
                 task.run_once(ctx).await
             };
             self.tasks.put(task_id.clone(), task);
+            let wake_again = matches!(&result, Ok(TaskOutcome::WakeAgain));
             let success = result.is_ok();
             self.task_queue.finish_running(&task_id, success);
             step.task_run = Some(task_id.clone());
@@ -179,6 +180,13 @@ impl Runtime {
                     id: task_id,
                     source,
                 });
+            }
+            if wake_again
+                && self
+                    .task_queue
+                    .enqueue_once(task_id.clone(), TaskWake::SelfRequested)
+            {
+                record_task(&mut step.scheduled_tasks, task_id);
             }
         }
 

@@ -9,6 +9,7 @@ import {
   CloudUpload,
   Loader2,
   PanelRightOpen,
+  Play,
   RefreshCw,
   Trash2,
 } from "lucide-react"
@@ -26,6 +27,7 @@ interface DayActionBarProps {
   offloadingDay: string | null
   onClose: () => void
   onInstall: (raw: EsRawStatus) => void
+  onReplay: (day: DayReadiness) => void
   onOffload: (day: DayReadiness) => void
   onDeleteObject: (object: StoreObject) => void
 }
@@ -43,6 +45,7 @@ export function DayActionBar({
   offloadingDay,
   onClose,
   onInstall,
+  onReplay,
   onOffload,
   onDeleteObject,
 }: DayActionBarProps) {
@@ -133,6 +136,14 @@ export function DayActionBar({
                     />
                   </>
                 ) : null}
+                <ActionButton
+                  icon={<Play aria-hidden="true" />}
+                  label="Replay day"
+                  disabled={!shown || shown.state !== "ready"}
+                  onClick={() => {
+                    if (shown) onReplay(shown)
+                  }}
+                />
                 <ActionButton
                   icon={
                     offloading ? (

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use cache::{ArrayKey, Cache, CellDescriptor, CellKind, CellOwner, Key, ValueKey};
-use runtime::{ComponentError, ComponentId, RuntimeTask, TaskContext, TaskDescriptor};
+use runtime::{ComponentError, ComponentId, RuntimeTask, TaskContext, TaskDescriptor, TaskOutcome};
 use serde::{Deserialize, Serialize};
 
 use crate::feed::es_replay::{EsMboFeedBatch, EsReplayCells};
@@ -10,6 +10,7 @@ use crate::LedgerError;
 pub const SECOND_NS: u64 = 1_000_000_000;
 pub const MINUTE_NS: u64 = 60 * SECOND_NS;
 pub const HOUR_NS: u64 = 60 * MINUTE_NS;
+const REBUILD_CHUNK_BATCHES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BarsParams {
@@ -102,6 +103,12 @@ pub struct BarsTask {
     completed_bars: usize,
     live: Option<Bar>,
     last_print_ts: Option<UnixNanos>,
+    fold: Fold,
+}
+
+enum Fold {
+    Incremental,
+    Rebuilding { epoch: u64, fold_idx: usize },
 }
 
 impl BarsTask {
@@ -125,6 +132,7 @@ impl BarsTask {
             completed_bars: 0,
             live: None,
             last_print_ts: None,
+            fold: Fold::Incremental,
         })
     }
 
@@ -138,18 +146,12 @@ impl BarsTask {
         }
     }
 
-    fn rebuild(&mut self, epoch: u64, batches: &[EsMboFeedBatch]) -> Vec<Bar> {
+    fn reset_fold(&mut self, epoch: u64) {
         self.epoch = epoch;
         self.processed_batches = 0;
         self.completed_bars = 0;
         self.live = None;
         self.last_print_ts = None;
-
-        let mut completed = Vec::new();
-        self.fold_batches(batches, &mut completed);
-        self.processed_batches = batches.len();
-        self.completed_bars = completed.len();
-        completed
     }
 
     fn fold_batches(&mut self, batches: &[EsMboFeedBatch], completed: &mut Vec<Bar>) {
@@ -184,6 +186,50 @@ impl BarsTask {
         }
         self.last_print_ts = Some(print.ts_event_ns);
     }
+
+    async fn run_rebuild_step(
+        &mut self,
+        ctx: TaskContext<'_>,
+        target_epoch: u64,
+        fold_idx: usize,
+        target_batch_idx: usize,
+    ) -> Result<TaskOutcome, ComponentError> {
+        let first_chunk = fold_idx == 0;
+        let chunk_end = target_batch_idx.min(fold_idx + REBUILD_CHUNK_BATCHES);
+        let batches = ctx.read_array_range(&self.feed.batches, fold_idx..chunk_end)?;
+        let previous_live = self.live.clone();
+        let mut completed = Vec::new();
+        self.fold_batches(&batches, &mut completed);
+        self.processed_batches = chunk_end;
+        self.completed_bars += completed.len();
+
+        let mut batch = ctx.batch();
+        if first_chunk {
+            batch.replace_array(&self.cells.bars, completed);
+        } else if !completed.is_empty() {
+            batch.push_array(&self.cells.bars, completed);
+        }
+        if first_chunk || self.live != previous_live {
+            if let Some(live) = &self.live {
+                batch.set_value(&self.cells.live, live.clone());
+            } else {
+                batch.clear_value(&self.cells.live);
+            }
+        }
+        batch.set_value(&self.cells.status, self.status_snapshot());
+        ctx.submit(batch).await?;
+
+        if chunk_end < target_batch_idx {
+            self.fold = Fold::Rebuilding {
+                epoch: target_epoch,
+                fold_idx: chunk_end,
+            };
+            Ok(TaskOutcome::WakeAgain)
+        } else {
+            self.fold = Fold::Incremental;
+            Ok(TaskOutcome::Idle)
+        }
+    }
 }
 
 #[async_trait]
@@ -198,23 +244,26 @@ impl RuntimeTask for BarsTask {
         ctx.submit(batch).await
     }
 
-    async fn run_once(&mut self, ctx: TaskContext<'_>) -> Result<(), ComponentError> {
+    async fn run_once(&mut self, ctx: TaskContext<'_>) -> Result<TaskOutcome, ComponentError> {
         let Some(cursor) = ctx.read_value(&self.feed.cursor)? else {
-            return Ok(());
+            return Ok(TaskOutcome::Idle);
         };
 
+        let mut rebuild_from = match self.fold {
+            Fold::Incremental => None,
+            Fold::Rebuilding { epoch, fold_idx } if epoch == cursor.epoch => Some(fold_idx),
+            Fold::Rebuilding { .. } => Some(0),
+        };
         if cursor.epoch != self.epoch || cursor.batch_idx < self.processed_batches {
-            let batches = ctx.read_array(&self.feed.batches)?;
-            let completed = self.rebuild(cursor.epoch, &batches);
-            let mut batch = ctx.batch();
-            batch.replace_array(&self.cells.bars, completed);
-            if let Some(live) = &self.live {
-                batch.set_value(&self.cells.live, live.clone());
-            } else {
-                batch.clear_value(&self.cells.live);
+            rebuild_from = Some(0);
+        }
+        if let Some(fold_idx) = rebuild_from {
+            if fold_idx == 0 {
+                self.reset_fold(cursor.epoch);
             }
-            batch.set_value(&self.cells.status, self.status_snapshot());
-            return ctx.submit(batch).await;
+            return self
+                .run_rebuild_step(ctx, cursor.epoch, fold_idx, cursor.batch_idx)
+                .await;
         }
 
         if cursor.batch_idx > self.processed_batches {
@@ -238,10 +287,11 @@ impl RuntimeTask for BarsTask {
                 }
             }
             batch.set_value(&self.cells.status, self.status_snapshot());
-            return ctx.submit(batch).await;
+            ctx.submit(batch).await?;
+            return Ok(TaskOutcome::Idle);
         }
 
-        Ok(())
+        Ok(TaskOutcome::Idle)
     }
 }
 

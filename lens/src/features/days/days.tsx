@@ -41,7 +41,7 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Unknown error"
 }
 
-export function Days() {
+export function Days({ onReplay }: { onReplay: (day: DayReadiness) => void }) {
   const [catalog, setCatalog] = useState<EsDayCatalog>(EMPTY_CATALOG)
   const [jobs, setJobs] = useState<JobRecord[]>([])
   // Last failure per day (keyed by market day, or the Unassigned pseudo-day).
@@ -286,6 +286,7 @@ export function Days() {
         offloadingDay={offloadingDay}
         onClose={() => setSelectedKey(null)}
         onInstall={(raw) => void install(raw)}
+        onReplay={onReplay}
         onOffload={(day) => void offload(day)}
         onDeleteObject={(object) => void deleteObject(object)}
       />

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{ops::Range, sync::Arc};
 
 use async_trait::async_trait;
 use cache::ValueKey;
@@ -12,6 +12,8 @@ use crate::feed::es_replay::{
 };
 use crate::market::{EsMboBatchSpan, EsMboEventStore, UnixNanos};
 use crate::LedgerError;
+
+const CATCHUP_CHUNK_BATCHES: usize = 1024;
 
 pub struct EsReplayFeed<S>
 where
@@ -113,7 +115,7 @@ where
             let now = clock.now_ns();
 
             if state.regressed(now) {
-                let kept = state.regress(now, &ctx, &cells)?;
+                let removed = state.regress(now, &event_store);
                 let cursor = state.cursor(&event_store);
                 let status = status(
                     &raw_object_id,
@@ -123,20 +125,23 @@ where
                 );
                 let mut batch = ctx.batch();
                 batch
-                    .replace_array(&cells.batches, kept)
+                    .remove_array_range(&cells.batches, removed)
                     .set_value(&cells.cursor, cursor)
                     .set_value(&cells.status, status);
                 ctx.submit(batch).await?;
                 continue;
             }
 
-            while let Some(span) = event_store.batches.get(state.next_idx) {
-                if span.ts_event_ns > now {
-                    break;
-                }
+            let chunk = state.build_due_chunk(now, &event_store);
+            if !chunk.is_empty() {
+                let more_due = event_store
+                    .batches
+                    .get(state.next_idx + chunk.len())
+                    .is_some_and(|span| span.ts_event_ns <= now);
+                state.advance_by(chunk.len(), more_due, &event_store);
                 state
-                    .emit(
-                        span,
+                    .emit_chunk(
+                        chunk,
                         &ctx,
                         &cells,
                         &raw_object_id,
@@ -145,6 +150,8 @@ where
                         &clock,
                     )
                     .await?;
+                tokio::task::yield_now().await;
+                continue;
             }
 
             if state.ended(&event_store) || clock.mode == ClockMode::Paused {
@@ -183,6 +190,7 @@ struct FeedState {
     next_idx: usize,
     feed_seq: u64,
     last_emitted_ts: Option<UnixNanos>,
+    catching_up: bool,
 }
 
 impl FeedState {
@@ -193,6 +201,7 @@ impl FeedState {
             next_idx: 0,
             feed_seq: 0,
             last_emitted_ts: None,
+            catching_up: false,
         }
     }
 
@@ -204,6 +213,7 @@ impl FeedState {
             total_batches: event_store.batches.len(),
             ts_event_ns: self.last_emitted_ts,
             next_ts_event_ns: self.next_ts(event_store),
+            catching_up: self.catching_up,
             ended: self.ended(event_store),
         }
     }
@@ -225,29 +235,57 @@ impl FeedState {
             .unwrap_or(false)
     }
 
-    fn regress(
-        &mut self,
-        now: UnixNanos,
-        ctx: &ProcessContext,
-        cells: &EsReplayCells,
-    ) -> Result<Vec<EsMboFeedBatch>, ComponentError> {
-        let kept = ctx
-            .read_array(&cells.batches)?
-            .into_iter()
-            .filter(|batch| batch.ts_event_ns <= now)
-            .collect::<Vec<_>>();
-        // The truncated array is the source of truth: unapplied feed emissions
-        // queued before the seek may be dropped by the replace below.
-        self.next_idx = kept.last().map(|batch| batch.batch_idx + 1).unwrap_or(0);
-        self.last_emitted_ts = kept.last().map(|batch| batch.ts_event_ns);
+    fn regress(&mut self, now: UnixNanos, event_store: &EsMboEventStore) -> Range<usize> {
+        // All of this feed's emits are FIFO-ordered ahead of this write on the
+        // single external-write channel, so at apply time the cache batches
+        // array is exactly event_store.batches[0..self.next_idx]. The cut can
+        // therefore be computed from the immutable event store.
+        let cut =
+            event_store.batches[..self.next_idx].partition_point(|span| span.ts_event_ns <= now);
+        let removed = cut..self.next_idx;
+        self.next_idx = cut;
+        self.last_emitted_ts = (cut > 0).then(|| event_store.batches[cut - 1].ts_event_ns);
         self.epoch = self.epoch.saturating_add(1);
+        self.catching_up = false;
 
-        Ok(kept)
+        removed
     }
 
-    async fn emit(
-        &mut self,
-        span: &EsMboBatchSpan,
+    fn build_due_chunk(
+        &self,
+        now: UnixNanos,
+        event_store: &EsMboEventStore,
+    ) -> Vec<EsMboFeedBatch> {
+        let mut chunk = Vec::new();
+        while let Some(span) = event_store.batches.get(self.next_idx + chunk.len()) {
+            if span.ts_event_ns > now || chunk.len() == CATCHUP_CHUNK_BATCHES {
+                break;
+            }
+            let feed_seq = self
+                .feed_seq
+                .saturating_add(chunk.len() as u64)
+                .saturating_add(1);
+            chunk.push(feed_batch(
+                feed_seq,
+                self.next_idx + chunk.len(),
+                span,
+                event_store,
+            ));
+        }
+        chunk
+    }
+
+    fn advance_by(&mut self, batch_count: usize, catching_up: bool, event_store: &EsMboEventStore) {
+        self.next_idx += batch_count;
+        self.feed_seq = self.feed_seq.saturating_add(batch_count as u64);
+        self.last_emitted_ts =
+            (batch_count > 0).then(|| event_store.batches[self.next_idx - 1].ts_event_ns);
+        self.catching_up = catching_up;
+    }
+
+    async fn emit_chunk(
+        &self,
+        feed_batches: Vec<EsMboFeedBatch>,
         ctx: &ProcessContext,
         cells: &EsReplayCells,
         raw_object_id: &StoreObjectId,
@@ -255,12 +293,6 @@ impl FeedState {
         event_store: &EsMboEventStore,
         clock: &ClockState,
     ) -> Result<(), ComponentError> {
-        let feed_seq = self.feed_seq.saturating_add(1);
-        let feed_batch = feed_batch(feed_seq, self.next_idx, span, event_store);
-        self.next_idx += 1;
-        self.feed_seq = feed_seq;
-        self.last_emitted_ts = Some(span.ts_event_ns);
-
         let cursor = self.cursor(event_store);
         let status = status(
             raw_object_id,
@@ -270,7 +302,7 @@ impl FeedState {
         );
         let mut batch = ctx.batch();
         batch
-            .push_array(&cells.batches, vec![feed_batch])
+            .push_array(&cells.batches, feed_batches)
             .set_value(&cells.cursor, cursor)
             .set_value(&cells.status, status);
         ctx.submit(batch).await
@@ -348,4 +380,78 @@ fn clock_or_initial(
 
 fn component_message(error: LedgerError) -> ComponentError {
     ComponentError::Message(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::market::{build_batches, BookAction, BookSide, EsMboEvent, PriceTicks};
+
+    #[test]
+    fn catch_up_chunks_advance_per_batch_and_flag_until_final_chunk() {
+        let emitted = CATCHUP_CHUNK_BATCHES * 2 + 11;
+        let event_store = event_store(emitted + 1);
+        let mut state = FeedState::new(&event_store);
+        let mut chunk_sizes = Vec::new();
+        let mut catching_up = Vec::new();
+
+        while state.next_idx < emitted {
+            let chunk = state.build_due_chunk(emitted as u64, &event_store);
+            assert!(!chunk.is_empty());
+            assert!(chunk.len() <= CATCHUP_CHUNK_BATCHES);
+            let more_due = event_store
+                .batches
+                .get(state.next_idx + chunk.len())
+                .is_some_and(|span| span.ts_event_ns <= emitted as u64);
+            state.advance_by(chunk.len(), more_due, &event_store);
+            chunk_sizes.push(chunk.len());
+            catching_up.push(state.cursor(&event_store).catching_up);
+        }
+
+        assert_eq!(
+            chunk_sizes,
+            vec![CATCHUP_CHUNK_BATCHES, CATCHUP_CHUNK_BATCHES, 11]
+        );
+        assert_eq!(catching_up, vec![true, true, false]);
+        assert_eq!(state.feed_seq, emitted as u64);
+        assert_eq!(state.next_idx, emitted);
+    }
+
+    #[test]
+    fn regress_computes_truncation_from_event_store_prefix() {
+        let emitted = CATCHUP_CHUNK_BATCHES + 3;
+        let event_store = event_store(emitted + 1);
+        let mut state = FeedState::new(&event_store);
+        state.advance_by(emitted, true, &event_store);
+
+        let removed = state.regress(10, &event_store);
+
+        assert_eq!(removed, 10..emitted);
+        assert_eq!(state.next_idx, 10);
+        assert_eq!(state.last_emitted_ts, Some(10));
+        assert_eq!(state.epoch, 1);
+        assert!(!state.catching_up);
+    }
+
+    fn event_store(count: usize) -> EsMboEventStore {
+        let events = (0..count)
+            .map(|idx| {
+                let ts_event_ns = (idx + 1) as u64;
+                EsMboEvent {
+                    ts_event_ns,
+                    ts_recv_ns: ts_event_ns,
+                    sequence: ts_event_ns,
+                    action: BookAction::Trade,
+                    side: Some(BookSide::Bid),
+                    price_ticks: Some(PriceTicks(100)),
+                    size: 1,
+                    order_id: ts_event_ns,
+                    flags: 0,
+                    is_last: true,
+                }
+            })
+            .collect::<Vec<_>>();
+        let batches = build_batches(&events);
+        EsMboEventStore { events, batches }
+    }
 }

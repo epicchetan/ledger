@@ -14,6 +14,8 @@ use tokio::time::timeout;
 use support::{event, fabricate_prepared_day, store_fixture, trade, StoreFixture};
 
 const WAKE: Duration = Duration::from_secs(2);
+const TEST_FEED_CATCHUP_CHUNK_BATCHES: usize = 1024;
+const TEST_REBUILD_CHUNK_BATCHES: usize = 4096;
 
 #[tokio::test]
 async fn prepare_publishes_initial_status_before_any_seek() {
@@ -241,6 +243,29 @@ async fn incremental_seeks_match_one_single_seek_over_the_same_events() {
 }
 
 #[tokio::test]
+async fn chunked_feed_and_one_batch_steps_converge_to_same_bars_and_cursor() {
+    let events = generated_trades(TEST_FEED_CATCHUP_CHUNK_BATCHES + 9);
+    let mut chunked = RunningBarsSession::start(events.clone()).await;
+    let chunked_cursor = chunked
+        .seek_and_wait(events.len() as u64, |cursor| cursor.ended)
+        .await;
+    chunked.wait_caught_up(&chunked_cursor).await;
+    let chunked_snapshot = chunked.snapshot();
+
+    let mut stepped = RunningBarsSession::start(events).await;
+    let stepped_cursor = step_one_batch_at_a_time(&mut stepped).await;
+    stepped.wait_caught_up(&stepped_cursor).await;
+    let stepped_snapshot = stepped.snapshot();
+
+    assert_eq!(stepped_cursor, chunked_cursor);
+    assert!(!stepped_cursor.catching_up);
+    assert_eq!(stepped_snapshot, chunked_snapshot);
+
+    chunked.shutdown().await;
+    stepped.shutdown().await;
+}
+
+#[tokio::test]
 async fn backward_seek_rebuilds_and_following_forward_seek_reproduces_bars() {
     let mut running = RunningBarsSession::start(vec![
         trade(10, 1, 100, 1, Some(BookSide::Bid)),
@@ -270,6 +295,87 @@ async fn backward_seek_rebuilds_and_following_forward_seek_reproduces_bars() {
     assert_eq!(running.snapshot(), pre_regression);
 
     running.shutdown().await;
+}
+
+#[tokio::test]
+async fn rebuild_over_multiple_chunks_matches_fresh_fold_to_same_target() {
+    let target = TEST_REBUILD_CHUNK_BATCHES * 2 + 25;
+    let events = generated_trades(target + 100);
+    let mut rebuilt = RunningBarsSession::start(events.clone()).await;
+
+    let end_cursor = rebuilt
+        .seek_and_wait(events.len() as u64, |cursor| cursor.ended)
+        .await;
+    rebuilt.wait_caught_up(&end_cursor).await;
+    let cursor = rebuilt
+        .seek_and_wait(target as u64, |cursor| {
+            cursor.epoch == 1 && cursor.batch_idx == target
+        })
+        .await;
+    let status = rebuilt.wait_caught_up(&cursor).await;
+    let rebuilt_snapshot = rebuilt.snapshot();
+
+    let mut fresh = RunningBarsSession::start(events).await;
+    let fresh_cursor = fresh
+        .seek_and_wait(target as u64, |cursor| cursor.batch_idx == target)
+        .await;
+    fresh.wait_caught_up(&fresh_cursor).await;
+
+    assert_eq!(status.processed_batches, target);
+    assert_eq!(rebuilt_snapshot, fresh.snapshot());
+
+    rebuilt.shutdown().await;
+    fresh.shutdown().await;
+}
+
+#[tokio::test]
+async fn epoch_change_mid_rebuild_restarts_and_keeps_newest_epoch() {
+    let target = TEST_REBUILD_CHUNK_BATCHES * 8 + 25;
+    let final_target = 50usize;
+    let events = generated_trades(target + 100);
+    let mut running = RunningBarsSession::start(events.clone()).await;
+
+    let end_cursor = running
+        .seek_and_wait(events.len() as u64, |cursor| cursor.ended)
+        .await;
+    running.wait_caught_up(&end_cursor).await;
+    running
+        .seek_and_wait(target as u64, |cursor| {
+            cursor.epoch == 1 && cursor.batch_idx == target
+        })
+        .await;
+    wait_for_bars_status(
+        running.session.cache(),
+        &mut running.bars_watch,
+        &running.bars,
+        |status| {
+            status.epoch == 1 && status.processed_batches > 0 && status.processed_batches < target
+        },
+    )
+    .await;
+
+    let cursor = running
+        .seek_and_wait(final_target as u64, |cursor| {
+            cursor.epoch == 2 && cursor.batch_idx == final_target
+        })
+        .await;
+    let status = running.wait_caught_up(&cursor).await;
+    let newest_snapshot = running.snapshot();
+
+    let mut fresh = RunningBarsSession::start(events).await;
+    let fresh_cursor = fresh
+        .seek_and_wait(final_target as u64, |cursor| {
+            cursor.batch_idx == final_target
+        })
+        .await;
+    fresh.wait_caught_up(&fresh_cursor).await;
+
+    assert_eq!(status.epoch, 2);
+    assert_eq!(status.processed_batches, final_target);
+    assert_eq!(newest_snapshot, fresh.snapshot());
+
+    running.shutdown().await;
+    fresh.shutdown().await;
 }
 
 #[tokio::test]
@@ -556,4 +662,44 @@ fn action_event(ts_event_ns: u64, sequence: u64, action: BookAction) -> EsMboEve
 
 fn bar_starts(bars: &[Bar]) -> Vec<u64> {
     bars.iter().map(|bar| bar.interval_start_ns).collect()
+}
+
+fn generated_trades(count: usize) -> Vec<EsMboEvent> {
+    (0..count)
+        .map(|idx| {
+            let sequence = (idx + 1) as u64;
+            let side = if idx % 2 == 0 {
+                Some(BookSide::Bid)
+            } else {
+                Some(BookSide::Ask)
+            };
+            trade(
+                sequence,
+                sequence,
+                100 + (idx % 17) as i64,
+                1 + (idx % 5) as u32,
+                side,
+            )
+        })
+        .collect()
+}
+
+async fn step_one_batch_at_a_time(running: &mut RunningBarsSession) -> EsReplayCursor {
+    loop {
+        let cursor = running
+            .session
+            .cache()
+            .read_value(&running.feed.cursor)
+            .unwrap()
+            .unwrap();
+        if cursor.ended {
+            return cursor;
+        }
+        let start_batch_idx = cursor.batch_idx;
+        running
+            .seek_and_wait(cursor.next_ts_event_ns.unwrap(), |cursor| {
+                cursor.batch_idx > start_batch_idx || cursor.ended
+            })
+            .await;
+    }
 }

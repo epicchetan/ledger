@@ -24,6 +24,8 @@ pub struct EsReplayCursor {
     pub total_batches: usize,
     pub ts_event_ns: Option<UnixNanos>,
     pub next_ts_event_ns: Option<UnixNanos>,
+    /// True while the feed is emitting a backlog of already-due batches.
+    pub catching_up: bool,
     pub ended: bool,
 }
 

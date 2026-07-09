@@ -18,6 +18,7 @@ use crate::{
 const DEFAULT_EXTERNAL_WRITE_BUFFER: usize = 1024;
 const DEFAULT_COMMAND_BUFFER: usize = 128;
 const DEFAULT_EVENT_BUFFER: usize = 128;
+#[allow(dead_code)]
 const DEFAULT_RUN_STEP_BUDGET: usize = 1024;
 
 pub struct RuntimeWorker {
@@ -28,7 +29,6 @@ pub struct RuntimeWorker {
     events_tx: mpsc::Sender<RuntimeEvent>,
     events_rx: mpsc::Receiver<RuntimeEvent>,
     processes: HashMap<ComponentId, ProcessRecord>,
-    run_step_budget: usize,
     shutdown_reply: Option<oneshot::Sender<Result<(), RuntimeError>>>,
 }
 
@@ -47,7 +47,6 @@ impl RuntimeWorker {
             events_tx,
             events_rx,
             processes: HashMap::new(),
-            run_step_budget: DEFAULT_RUN_STEP_BUDGET,
             shutdown_reply: None,
         };
         (worker, handle)
@@ -61,7 +60,7 @@ impl RuntimeWorker {
                 }
                 Some(batch) = self.writes.recv() => {
                     self.runtime.submit_external_writes(batch);
-                    self.runtime.run_until_idle(self.run_step_budget).await?;
+                    self.step_until_idle().await?;
                 }
                 Some(event) = self.events_rx.recv() => {
                     self.handle_event(event);
@@ -90,7 +89,7 @@ impl RuntimeWorker {
             RuntimeCommand::QueueTask { id, reply } => {
                 let result = async {
                     let queued = self.runtime.queue_task(&id)?;
-                    self.runtime.run_until_idle(self.run_step_budget).await?;
+                    self.step_until_idle().await?;
                     Ok(queued)
                 }
                 .await;
@@ -343,9 +342,7 @@ impl RuntimeWorker {
             self.runtime.submit_external_writes(batch);
         }
 
-        if !self.runtime.is_idle() {
-            self.runtime.run_until_idle(self.run_step_budget).await?;
-        }
+        self.step_until_idle().await?;
 
         if let Some(reply) = self.shutdown_reply.take() {
             let _ = reply.send(Ok(()));
@@ -355,6 +352,21 @@ impl RuntimeWorker {
 
     fn has_component(&self, id: &ComponentId) -> bool {
         self.processes.contains_key(id) || self.runtime.contains_task(id)
+    }
+
+    async fn step_until_idle(&mut self) -> Result<(), RuntimeError> {
+        while !self.runtime.is_idle() {
+            // New control writes land at the next step boundary instead of
+            // waiting out an entire rebuild chain.
+            while let Ok(batch) = self.writes.try_recv() {
+                self.runtime.submit_external_writes(batch);
+            }
+            self.runtime.run_once().await?;
+            // One task step can be CPU-heavy; same-thread async work must
+            // still observe cache notifications between steps.
+            tokio::task::yield_now().await;
+        }
+        Ok(())
     }
 
     fn has_active_processes(&self) -> bool {

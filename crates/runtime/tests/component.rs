@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use cache::{ArrayKey, Cache, CacheError, CellDescriptor, CellKind, CellOwner, Key, ValueKey};
 use runtime::{
     ComponentError, ComponentId, Runtime, RuntimeError, RuntimeTask, TaskContext, TaskDescriptor,
+    TaskOutcome,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,7 +62,7 @@ impl RuntimeTask for CountingTask {
         &self.descriptor
     }
 
-    async fn run_once(&mut self, ctx: TaskContext<'_>) -> Result<(), ComponentError> {
+    async fn run_once(&mut self, ctx: TaskContext<'_>) -> Result<TaskOutcome, ComponentError> {
         let batches = ctx.read_array(&self.batches)?;
         let mut batch = ctx.batch();
         batch.set_value(
@@ -71,7 +72,7 @@ impl RuntimeTask for CountingTask {
             },
         );
         ctx.submit(batch).await?;
-        Ok(())
+        Ok(TaskOutcome::Idle)
     }
 }
 
@@ -136,10 +137,11 @@ impl RuntimeTask for WrongOwnerTask {
         &self.descriptor
     }
 
-    async fn run_once(&mut self, ctx: TaskContext<'_>) -> Result<(), ComponentError> {
+    async fn run_once(&mut self, ctx: TaskContext<'_>) -> Result<TaskOutcome, ComponentError> {
         let mut batch = ctx.batch();
         batch.set_value(&self.status, TaskState { processed: 1 });
-        ctx.submit(batch).await
+        ctx.submit(batch).await?;
+        Ok(TaskOutcome::Idle)
     }
 }
 

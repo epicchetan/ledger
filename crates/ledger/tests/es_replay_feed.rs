@@ -27,6 +27,7 @@ use support::{event, fabricate_prepared_day, store_fixture};
 
 const PARK: Duration = Duration::from_millis(50);
 const WAKE: Duration = Duration::from_secs(2);
+const TEST_CATCHUP_CHUNK_BATCHES: usize = 1024;
 
 #[tokio::test]
 async fn install_process_reports_preparing_during_artifact_prepare_then_running() {
@@ -170,6 +171,44 @@ async fn feed_emits_ordered_catch_up_burst_when_seek_jumps_past_several_batches(
 }
 
 #[tokio::test]
+async fn forward_seek_emits_due_batches_in_chunks_and_marks_catch_up() {
+    let emitted = TEST_CATCHUP_CHUNK_BATCHES * 3 + 17;
+    let direct = DirectFeed::start(numbered_events(emitted + 1)).await;
+    let mut cursor_watch = direct.cursor_watch;
+
+    submit_clock(
+        &direct.handle,
+        &direct.clock_key,
+        ClockState::initial().seek_to(emitted as u64),
+    )
+    .await;
+    wait_for_cursor(
+        &direct.cache,
+        &mut cursor_watch,
+        &direct.cells.cursor,
+        |cursor| cursor.catching_up,
+    )
+    .await;
+    let cursor = wait_for_cursor(
+        &direct.cache,
+        &mut cursor_watch,
+        &direct.cells.cursor,
+        |cursor| cursor.batch_idx == emitted,
+    )
+    .await;
+    let batches = direct.cache.read_array(&direct.cells.batches).unwrap();
+
+    assert!(!cursor.catching_up);
+    assert_eq!(cursor.feed_seq, emitted as u64);
+    assert_eq!(cursor.batch_idx, emitted);
+    assert_eq!(cursor.next_ts_event_ns, Some((emitted + 1) as u64));
+    assert_eq!(batches.len(), emitted);
+    assert_eq!(batch_indices(&batches), (0..emitted).collect::<Vec<_>>());
+
+    shutdown_worker(direct.handle, direct.worker).await;
+}
+
+#[tokio::test]
 async fn feed_emits_batches_as_session_time_crosses_timestamps_in_realtime() {
     let direct = DirectFeed::start(vec![event(5_000_000, 1), event(15_000_000, 2)]).await;
     let mut cursor_watch = direct.cursor_watch;
@@ -269,7 +308,59 @@ async fn backward_seek_truncates_batches_resets_index_bumps_epoch_and_clears_end
     assert_eq!(cursor.batch_idx, 1);
     assert_eq!(batches.len(), cursor.batch_idx);
     assert_eq!(cursor.next_ts_event_ns, Some(200));
+    assert!(!cursor.catching_up);
     assert!(!cursor.ended);
+    assert_eq!(
+        direct
+            .cache
+            .read_value(&direct.cells.status)
+            .unwrap()
+            .unwrap()
+            .cursor,
+        cursor
+    );
+
+    shutdown_worker(direct.handle, direct.worker).await;
+}
+
+#[tokio::test]
+async fn mid_catch_up_backward_seek_regresses_without_finishing_stale_pass() {
+    let total = TEST_CATCHUP_CHUNK_BATCHES * 3 + 7;
+    let direct = DirectFeed::start(numbered_events(total)).await;
+    let mut cursor_watch = direct.cursor_watch;
+
+    submit_clock(
+        &direct.handle,
+        &direct.clock_key,
+        ClockState::initial().seek_to(total as u64),
+    )
+    .await;
+    wait_for_cursor(
+        &direct.cache,
+        &mut cursor_watch,
+        &direct.cells.cursor,
+        |cursor| cursor.catching_up && cursor.batch_idx >= TEST_CATCHUP_CHUNK_BATCHES,
+    )
+    .await;
+    submit_clock(
+        &direct.handle,
+        &direct.clock_key,
+        ClockState::initial().seek_to(10),
+    )
+    .await;
+    let cursor = wait_for_cursor(
+        &direct.cache,
+        &mut cursor_watch,
+        &direct.cells.cursor,
+        |cursor| cursor.epoch == 1 && cursor.batch_idx == 10,
+    )
+    .await;
+    let batches = direct.cache.read_array(&direct.cells.batches).unwrap();
+
+    assert_eq!(batches.len(), 10);
+    assert!(batches.iter().all(|batch| batch.ts_event_ns <= 10));
+    assert!(!cursor.catching_up);
+    assert!(cursor.feed_seq < total as u64);
 
     shutdown_worker(direct.handle, direct.worker).await;
 }
@@ -496,6 +587,12 @@ fn session_owner() -> CellOwner {
 
 fn batch_indices(batches: &[EsMboFeedBatch]) -> Vec<usize> {
     batches.iter().map(|batch| batch.batch_idx).collect()
+}
+
+fn numbered_events(count: usize) -> Vec<ledger::market::EsMboEvent> {
+    (0..count)
+        .map(|idx| event((idx + 1) as u64, (idx + 1) as u64))
+        .collect()
 }
 
 #[derive(Clone)]

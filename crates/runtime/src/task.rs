@@ -11,6 +11,15 @@ pub enum TaskWake {
     DependencyChanged,
     Manual,
     Rerun,
+    SelfRequested,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskOutcome {
+    /// Work complete; sleep until a dependency changes.
+    Idle,
+    /// More work pending; re-queue this task after other queued work.
+    WakeAgain,
 }
 
 #[async_trait]
@@ -22,7 +31,7 @@ pub trait RuntimeTask: Send + 'static {
         Ok(())
     }
 
-    async fn run_once(&mut self, ctx: TaskContext<'_>) -> Result<(), ComponentError>;
+    async fn run_once(&mut self, ctx: TaskContext<'_>) -> Result<TaskOutcome, ComponentError>;
 }
 
 pub struct TaskPrepareContext {
