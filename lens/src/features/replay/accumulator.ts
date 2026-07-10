@@ -29,6 +29,7 @@ export class BarsAccumulator {
   private live: Bar | null = null
   private status: BarsStatus | null = null
   private backfilling = false
+  private backfillToken = 0
   private snapshot: BarsSnapshot
   private readonly listeners = new Set<() => void>()
 
@@ -43,6 +44,32 @@ export class BarsAccumulator {
 
   ingest(frame: BarsFrame): void {
     if (frame.spec !== this.spec) return
+    if (
+      frame.status.spec !== this.spec ||
+      frame.status.epoch !== frame.epoch ||
+      frame.status.completedBars !== frame.total ||
+      frame.from + frame.bars.length !== frame.total
+    ) {
+      console.warn(`[replay] ${this.spec}: rejected inconsistent frame`)
+      return
+    }
+
+    // Pull responses and push notifications share the transport but are
+    // produced concurrently. A slow pull can therefore arrive after a newer
+    // delta. Epoch + processedBatches is the projection's monotonic version;
+    // never let an older response rewind the accumulator or its live bar.
+    if (this.epoch !== null && frame.epoch < this.epoch) return
+    if (frame.epoch === this.epoch && this.status) {
+      if (frame.status.processedBatches < this.status.processedBatches) return
+      if (frame.total < this.bars.length) return
+      const complete = this.bars.length === this.status.completedBars
+      if (
+        complete &&
+        frame.status.processedBatches === this.status.processedBatches
+      ) {
+        return
+      }
+    }
 
     // New epoch (or first frame): reset, then accept from index 0. A non-zero
     // start means the opening frame was dropped — rebuild from the pull.
@@ -50,6 +77,7 @@ export class BarsAccumulator {
       this.epoch = frame.epoch
       // A seek advanced the epoch: retire any in-flight backfill guard so the
       // new epoch can pull its own gaps.
+      this.backfillToken += 1
       this.backfilling = false
       if (frame.from === 0) {
         this.bars = frame.bars.slice()
@@ -105,14 +133,22 @@ export class BarsAccumulator {
   private requestBackfill(from: number): void {
     if (this.backfilling || !this.backfill) return
     this.backfilling = true
+    const token = ++this.backfillToken
     void this.backfill(this.spec, from)
       .then((frame) => {
+        if (token !== this.backfillToken) return
         this.backfilling = false
         // A seek may have advanced the epoch while the pull was in flight; drop
         // the stale slice and let the new epoch sync itself.
-        if (frame.epoch === this.epoch) this.ingest(frame)
+        if (frame.epoch === this.epoch) {
+          this.ingest(frame)
+          if (this.status && this.bars.length < this.status.completedBars) {
+            this.requestBackfill(this.bars.length)
+          }
+        }
       })
       .catch((error) => {
+        if (token !== this.backfillToken) return
         this.backfilling = false
         console.warn(`[replay] ${this.spec}: backfill failed`, error)
       })

@@ -1,29 +1,99 @@
-import { useCallback, useState } from "react"
+import { useCallback, useEffect, useState } from "react"
+import { updateHostTab } from "@remux/viewer-kit/host"
 
 import { Toaster } from "@/components/ui/sonner"
 import { Days } from "@/features/days/days"
 import type { DayReadiness } from "@/features/days/readiness"
 import { Replay } from "@/features/replay/replay"
+import { readReplayRoute } from "@/features/replay/route"
 
-// Two screens don't justify a router; a view-state switch does. A third screen
+// Two pages don't justify a router; a view-state switch does. A third page
 // turns this into a router mechanically.
 type LensView =
   | { kind: "days" }
-  | { kind: "replay"; rawId: string; marketDay: string; symbol: string }
+  | {
+      kind: "replay"
+      sessionId: string | null
+      rawId: string
+      marketDay: string
+      symbol: string
+    }
+
+// Remux's hamburger reload creates a fresh native WebView from the host tab
+// URL, so its resource route is authoritative. sessionStorage remains a useful
+// browser/in-page fallback but is not expected to survive that native remount.
+const VIEW_STORAGE_KEY = "lens.view.v1"
+
+function loadStoredView(): LensView {
+  const replayRoute = readReplayRoute(window.location.href)
+  if (replayRoute) return { kind: "replay", ...replayRoute }
+
+  try {
+    const raw = window.sessionStorage.getItem(VIEW_STORAGE_KEY)
+    if (!raw) return { kind: "days" }
+    const parsed: unknown = JSON.parse(raw)
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      "kind" in parsed &&
+      parsed.kind === "replay" &&
+      "rawId" in parsed &&
+      typeof parsed.rawId === "string" &&
+      "marketDay" in parsed &&
+      typeof parsed.marketDay === "string" &&
+      "symbol" in parsed &&
+      typeof parsed.symbol === "string"
+    ) {
+      return {
+        kind: "replay",
+        sessionId: null,
+        rawId: parsed.rawId,
+        marketDay: parsed.marketDay,
+        symbol: parsed.symbol,
+      }
+    }
+  } catch {
+    // Malformed storage falls through to days.
+  }
+  return { kind: "days" }
+}
 
 export function App() {
-  const [view, setView] = useState<LensView>({ kind: "days" })
+  const [view, setView] = useState<LensView>(loadStoredView)
+
+  useEffect(() => {
+    try {
+      window.sessionStorage.setItem(VIEW_STORAGE_KEY, JSON.stringify(view))
+    } catch {
+      // The Remux host route still owns native replay restoration.
+    }
+  }, [view])
 
   const handleReplay = useCallback((day: DayReadiness) => {
     setView({
       kind: "replay",
+      sessionId: null,
       rawId: day.primary.raw.raw.id,
       marketDay: day.marketDay,
       symbol: day.primary.symbol,
     })
   }, [])
 
-  const handleExit = useCallback(() => setView({ kind: "days" }), [])
+  const handleExit = useCallback(() => {
+    // Clear the host-owned reload route before unmounting Replay. Its cleanup
+    // then clears the local capability and closes the server session; immediate
+    // re-entry cannot accidentally restore the old chart.
+    void updateHostTab({
+      resourceId: null,
+      resourceKind: null,
+      status: null,
+      title: "Ledger",
+    })
+      .catch((error) => {
+        console.warn("[replay] failed to clear host replay route", error)
+      })
+      .finally(() => setView({ kind: "days" }))
+  }, [])
 
   return (
     <>
@@ -32,6 +102,7 @@ export function App() {
       ) : (
         <Replay
           key={view.rawId}
+          resumeSessionId={view.sessionId}
           rawId={view.rawId}
           marketDay={view.marketDay}
           symbol={view.symbol}

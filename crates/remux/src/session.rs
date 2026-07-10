@@ -12,11 +12,12 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use store::{RemoteStore, Store, StoreObjectId};
+use store::{RemoteStore, Store, StoreObjectDescriptor, StoreObjectId};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 pub const SESSION_OPEN_METHOD: &str = "remux/ledger/session/open";
+pub const SESSION_ATTACH_METHOD: &str = "remux/ledger/session/attach";
 pub const SESSION_CLOSE_METHOD: &str = "remux/ledger/session/close";
 pub const SESSION_STATUS_METHOD: &str = "remux/ledger/session/status";
 pub const SESSION_PLAY_METHOD: &str = "remux/ledger/session/play";
@@ -81,14 +82,7 @@ impl SessionRegistry {
         // The scrubber needs a fixed time domain and the ES session calendar
         // (DST-sensitive) lives server-side; raws without a market day open
         // fine and just carry null bounds.
-        let market_day = descriptor
-            .metadata_json
-            .get("market_day")
-            .and_then(Value::as_str)
-            .and_then(|value| MarketDay::parse(value).ok());
-        let session_bounds = market_day
-            .as_ref()
-            .and_then(|day| day.es_session_bounds_utc().ok());
+        let (market_day, session_bounds) = raw_session_calendar(&descriptor);
 
         let _lifecycle = self.lifecycle.lock().await;
         let replaced = self.take_active().await;
@@ -168,6 +162,80 @@ impl SessionRegistry {
             market_day: market_day.as_ref().map(MarketDay::to_string),
             session_start_ns: session_bounds.map(|(start, _)| ns_string(start)),
             session_end_ns: session_bounds.map(|(_, end)| ns_string(end)),
+        })
+    }
+
+    // Reattach a reloaded client to the running session: read-only — never
+    // touches the clock, never closes anything. Returns the open-shaped
+    // identity plus the current clock and cursor, because the watchers only
+    // notify on change and a paused session would otherwise stay silent
+    // forever. The exact server-issued id is the reload capability: matching
+    // only raw/spec would let a fresh navigation or another client steal the
+    // active replay. A stale id or identity mismatch is an expected typed miss;
+    // malformed input and cache/store failures remain real RPC errors.
+    pub async fn attach<S>(&self, store: &Store<S>, params: Value) -> Result<Value, RpcError>
+    where
+        S: RemoteStore + 'static,
+    {
+        let params = parse_params::<SessionAttachParams>(params)?;
+        let requested = parse_projection_specs(params.projections.unwrap_or_default())?;
+        let raw_id = parse_object_id(&params.raw_id)?;
+        let active = self.active.lock().await;
+        let Some(session) = active
+            .as_ref()
+            .filter(|session| session.id == params.session_id && session.raw_id == raw_id)
+        else {
+            return to_value(SessionAttachResultDto {
+                attached: false,
+                session: None,
+            });
+        };
+        let have: HashSet<&str> = session
+            .projections
+            .iter()
+            .map(|projection| projection.spec.as_str())
+            .collect();
+        let want: HashSet<&str> = requested
+            .iter()
+            .map(|(canonical, _)| canonical.as_str())
+            .collect();
+        if have != want {
+            return to_value(SessionAttachResultDto {
+                attached: false,
+                session: None,
+            });
+        }
+        let clock = session
+            .handle
+            .clock_snapshot()
+            .map_err(|err| RpcError::domain(err.to_string()))?;
+        let cursor = session
+            .handle
+            .cache()
+            .read_value(&session.feed.cursor)
+            .map_err(|err| RpcError::domain(err.to_string()))?;
+        let descriptor = store
+            .get_object(&raw_id)?
+            .ok_or_else(|| RpcError::object_not_found(&params.raw_id))?;
+        let (market_day, session_bounds) = raw_session_calendar(&descriptor);
+        to_value(SessionAttachResultDto {
+            attached: true,
+            session: Some(SessionAttachSnapshotDto {
+                session_id: session.id.clone(),
+                raw_id: raw_id.to_string(),
+                projections: session
+                    .projections
+                    .iter()
+                    .map(|projection| ProjectionDto {
+                        spec: projection.spec.clone(),
+                    })
+                    .collect(),
+                market_day: market_day.as_ref().map(MarketDay::to_string),
+                session_start_ns: session_bounds.map(|(start, _)| ns_string(start)),
+                session_end_ns: session_bounds.map(|(_, end)| ns_string(end)),
+                clock: ClockSnapshotDto::from(clock),
+                cursor: cursor.map(EsReplayCursorDto::from),
+            }),
         })
     }
 
@@ -653,6 +721,22 @@ fn unknown_session(session_id: &str) -> RpcError {
     RpcError::domain(format!("unknown session {session_id}"))
 }
 
+// Market day and ES session bounds from a raw's descriptor — open and attach
+// both derive them (the active session doesn't retain them).
+fn raw_session_calendar(
+    descriptor: &StoreObjectDescriptor,
+) -> (Option<MarketDay>, Option<(u64, u64)>) {
+    let market_day = descriptor
+        .metadata_json
+        .get("market_day")
+        .and_then(Value::as_str)
+        .and_then(|value| MarketDay::parse(value).ok());
+    let session_bounds = market_day
+        .as_ref()
+        .and_then(|day| day.es_session_bounds_utc().ok());
+    (market_day, session_bounds)
+}
+
 fn unknown_projection(spec: &str) -> RpcError {
     RpcError::domain(format!("unknown projection spec {spec}"))
 }
@@ -750,6 +834,14 @@ struct SessionOpenParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SessionAttachParams {
+    session_id: String,
+    raw_id: String,
+    projections: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SessionIdParams {
     session_id: String,
 }
@@ -786,6 +878,27 @@ struct SessionOpenResultDto {
     market_day: Option<String>,
     session_start_ns: Option<String>,
     session_end_ns: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionAttachResultDto {
+    attached: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<SessionAttachSnapshotDto>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionAttachSnapshotDto {
+    session_id: String,
+    raw_id: String,
+    projections: Vec<ProjectionDto>,
+    market_day: Option<String>,
+    session_start_ns: Option<String>,
+    session_end_ns: Option<String>,
+    clock: ClockSnapshotDto,
+    cursor: Option<EsReplayCursorDto>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1186,6 +1299,22 @@ mod tests {
         assert_eq!(opened["marketDay"], day.to_string());
         assert_eq!(opened["sessionStartNs"], ns_string(start_ns));
         assert_eq!(opened["sessionEndNs"], ns_string(end_ns));
+
+        // Open returns only after projection prepare, so the viewer may hydrate
+        // an authoritative frame immediately without waiting for a push.
+        let initial_frame = call(
+            &fixture.methods,
+            SESSION_BARS_METHOD,
+            json!({
+                "sessionId": opened["sessionId"],
+                "spec": "bars:1m",
+                "from": 0
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(initial_frame["from"], 0);
+        assert_eq!(initial_frame["total"], 0);
     }
 
     #[tokio::test]
@@ -1551,6 +1680,193 @@ mod tests {
         .unwrap_err();
         assert_eq!(after_close.code, DOMAIN_ERROR);
         assert!(after_close.message.contains("unknown session session-2"));
+    }
+
+    #[tokio::test]
+    async fn attach_resumes_active_session_with_clock_and_cursor() {
+        let mut fixture = remux_fixture();
+        let raw_id = fabricate_prepared_day(&fixture.store, sample_events())
+            .await
+            .0;
+        let session_id = open_session_id(&fixture.methods, &raw_id, vec!["bars:1s"]).await;
+
+        // Put the session in a distinctive state (paused, so it holds still):
+        // a committed seek and a non-default speed, each awaited through the
+        // clock stream before the next write (controls return on submit).
+        seek(&fixture.methods, &session_id, 1_500_000_000).await;
+        wait_notification(
+            &mut fixture.output_rx,
+            SESSION_CLOCK_NOTIFICATION,
+            |params| {
+                params["sessionId"].as_str() == Some(session_id.as_str())
+                    && params["clock"]["sessionNowNs"].as_str() == Some("1500000000")
+            },
+        )
+        .await;
+        set_speed(&fixture.methods, &session_id, 2.5).await;
+        wait_clock_speed(&mut fixture.output_rx, &session_id, 2.5).await;
+        wait_status(
+            &fixture.methods,
+            &mut fixture.output_rx,
+            &session_id,
+            |status| status["feed"]["cursor"].is_object(),
+        )
+        .await;
+
+        let attached = call(
+            &fixture.methods,
+            SESSION_ATTACH_METHOD,
+            json!({
+                "sessionId": session_id,
+                "rawId": raw_id.to_string(),
+                "projections": ["bars:1s"]
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(attached["attached"], true);
+        let attached = &attached["session"];
+        assert_eq!(attached["sessionId"], session_id);
+        assert_eq!(attached["rawId"], raw_id.to_string());
+        assert_eq!(attached["projections"][0]["spec"], "bars:1s");
+        assert_eq!(attached["clock"]["mode"], "paused");
+        assert_eq!(attached["clock"]["speed"], 2.5);
+        assert_eq!(attached["clock"]["sessionNowNs"], "1500000000");
+        assert!(attached["cursor"].is_object());
+
+        // Bounds re-derive from the raw's market day, matching open's result.
+        let day = MarketDay::parse("2026-03-10").unwrap();
+        let (start_ns, end_ns) = day.es_session_bounds_utc().unwrap();
+        assert_eq!(attached["marketDay"], day.to_string());
+        assert_eq!(attached["sessionStartNs"], ns_string(start_ns));
+        assert_eq!(attached["sessionEndNs"], ns_string(end_ns));
+
+        // Attach is read-only: the session still answers pulls and controls
+        // under the same id.
+        let frame = call(
+            &fixture.methods,
+            SESSION_BARS_METHOD,
+            json!({ "sessionId": session_id, "spec": "bars:1s", "from": 0 }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(frame["from"], 0);
+        call(
+            &fixture.methods,
+            SESSION_PLAY_METHOD,
+            json!({ "sessionId": session_id }),
+        )
+        .await
+        .unwrap();
+        wait_clock_mode(&mut fixture.output_rx, &session_id, "running").await;
+
+        let running = call(
+            &fixture.methods,
+            SESSION_ATTACH_METHOD,
+            json!({
+                "sessionId": session_id,
+                "rawId": raw_id.to_string(),
+                "projections": ["bars:1s"]
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(running["attached"], true);
+        assert_eq!(running["session"]["clock"]["mode"], "running");
+        assert_eq!(running["session"]["clock"]["speed"], 2.5);
+        assert!(
+            running["session"]["clock"]["sessionNowNs"]
+                .as_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+                >= 1_500_000_000
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_requires_matching_active_session() {
+        let fixture = remux_fixture();
+        let raw_id = fabricate_prepared_day(&fixture.store, sample_events())
+            .await
+            .0;
+        let other_raw_id = fabricate_prepared_day(&fixture.store, alternate_events())
+            .await
+            .0;
+        let attach = |session: String, raw: String, projections: Vec<&'static str>| {
+            call(
+                &fixture.methods,
+                SESSION_ATTACH_METHOD,
+                json!({
+                    "sessionId": session,
+                    "rawId": raw,
+                    "projections": projections
+                }),
+            )
+        };
+
+        // Nothing active yet.
+        let none = attach(
+            "session-missing".to_string(),
+            raw_id.to_string(),
+            vec!["bars:1s"],
+        )
+        .await
+        .unwrap();
+        assert_eq!(none, json!({ "attached": false }));
+
+        let session_id = open_session_id(&fixture.methods, &raw_id, vec!["bars:1s"]).await;
+
+        // Wrong session id cannot alias the active session even when the raw and
+        // specs match.
+        let wrong_session = attach(
+            "session-missing".to_string(),
+            raw_id.to_string(),
+            vec!["bars:1s"],
+        )
+        .await
+        .unwrap();
+        assert_eq!(wrong_session, json!({ "attached": false }));
+
+        // Wrong raw.
+        let wrong_raw = attach(
+            session_id.clone(),
+            other_raw_id.to_string(),
+            vec!["bars:1s"],
+        )
+        .await
+        .unwrap();
+        assert_eq!(wrong_raw, json!({ "attached": false }));
+
+        // Right raw, different projection set: must fall back to a rebuild.
+        let wrong_specs = attach(
+            session_id.clone(),
+            raw_id.to_string(),
+            vec!["bars:1s", "bars:1m"],
+        )
+        .await
+        .unwrap();
+        assert_eq!(wrong_specs, json!({ "attached": false }));
+
+        // The matching raw + spec set attaches.
+        let matched = attach(session_id.clone(), raw_id.to_string(), vec!["bars:1s"])
+            .await
+            .unwrap();
+        assert_eq!(matched["attached"], true);
+        assert_eq!(matched["session"]["sessionId"], session_id);
+
+        // Closed sessions are gone for attach too.
+        call(
+            &fixture.methods,
+            SESSION_CLOSE_METHOD,
+            json!({ "sessionId": session_id }),
+        )
+        .await
+        .unwrap();
+        let closed = attach(session_id, raw_id.to_string(), vec!["bars:1s"])
+            .await
+            .unwrap();
+        assert_eq!(closed, json!({ "attached": false }));
     }
 
     #[tokio::test]

@@ -74,6 +74,25 @@ export interface SessionOpenResult {
   sessionEndNs: string | null
 }
 
+// The open-shaped identity of an already-running session, plus its current
+// clock and feed cursor. Attach itself is a discriminated outcome: a stale
+// persisted id is an expected miss, while transport/server failures still
+// reject the RPC and must not silently replace the session.
+export interface SessionAttachSnapshot {
+  sessionId: string
+  rawId: string
+  projections: SessionProjection[]
+  marketDay: string | null
+  sessionStartNs: string | null
+  sessionEndNs: string | null
+  clock: Clock
+  cursor: Cursor | null
+}
+
+export type SessionAttachResult =
+  | { attached: false }
+  | { attached: true; session: SessionAttachSnapshot }
+
 export interface SessionCloseResult {
   closed: boolean
 }

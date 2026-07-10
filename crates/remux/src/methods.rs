@@ -2,9 +2,9 @@ use crate::error::RpcError;
 use crate::jobs::{JobRecord, JobRegistry, JobStartDto};
 use crate::rpc::{send_notification, OutboundSender, Request};
 use crate::session::{
-    SessionRegistry, SESSION_BARS_METHOD, SESSION_CLOSE_METHOD, SESSION_OPEN_METHOD,
-    SESSION_PAUSE_METHOD, SESSION_PLAY_METHOD, SESSION_SEEK_METHOD, SESSION_SPEED_METHOD,
-    SESSION_STATUS_METHOD,
+    SessionRegistry, SESSION_ATTACH_METHOD, SESSION_BARS_METHOD, SESSION_CLOSE_METHOD,
+    SESSION_OPEN_METHOD, SESSION_PAUSE_METHOD, SESSION_PLAY_METHOD, SESSION_SEEK_METHOD,
+    SESSION_SPEED_METHOD, SESSION_STATUS_METHOD,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use ledger::feed::es_replay::{
@@ -74,6 +74,7 @@ impl<S: RemoteStore + 'static> LedgerRemux<S> {
                     .open(&self.store, &self.output_tx, request.params)
                     .await
             }
+            SESSION_ATTACH_METHOD => self.sessions.attach(&self.store, request.params).await,
             SESSION_CLOSE_METHOD => self.sessions.close(&self.output_tx, request.params).await,
             SESSION_STATUS_METHOD => self.sessions.status(request.params).await,
             SESSION_PLAY_METHOD => self.sessions.play(request.params).await,

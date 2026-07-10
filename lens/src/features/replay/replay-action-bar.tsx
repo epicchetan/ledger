@@ -1,4 +1,4 @@
-import { openHostOverview } from "@remux/viewer-kit/host"
+import { openHostOverview, reloadHostView } from "@remux/viewer-kit/host"
 import {
   ActionBar,
   ActionButton,
@@ -10,18 +10,27 @@ import {
   Check,
   Gauge,
   Loader2,
+  Menu,
   PanelRightOpen,
   Pause,
   Play,
+  RefreshCw,
 } from "lucide-react"
-import { useEffect, useMemo, useState } from "react"
+import { useMemo, useState } from "react"
 
+import {
+  AutoScaleAction,
+  JumpToLiveAction,
+} from "@/features/replay/chart/overlays"
+import type { ChartUi } from "@/features/replay/chart/ui-state"
 import type { Clock, Cursor } from "@/features/replay/types"
+import { nsToMs, useSessionNowMs } from "@/features/replay/use-session-clock"
 
 // The wire takes any positive float; these are the surfaced presets.
 const SPEED_PRESETS = [1, 2, 5, 10, 25, 100]
 
 interface ReplayActionBarProps {
+  ui: ChartUi
   clock: Clock | null
   clockReceivedAt: number | null
   cursor: Cursor | null
@@ -36,14 +45,20 @@ interface ReplayActionBarProps {
   onPause: () => void
   onSpeed: (speed: number) => void
   onSeek: (sessionNs: string) => void
+  onScrub: (sessionMs: number | null) => void
 }
 
 // The bar carries the whole transport (reference: day-action-bar): a
-// full-width seek slider rides its own row above the pinned buttons — tab-out,
-// back, play/pause, a speed menu, and the ET clock readout pushed right. Feed
-// progress, market day/symbol, and the syncing state ride the bar's native
-// status caption — the page content above carries no nav of its own.
+// full-width seek slider rides its own row above the pinned buttons. Left group
+// is tab-out, reload, back, then the conditional chart actions (jump-to-live,
+// price re-fit — their own components with narrow store snapshots, so the bar
+// itself never re-renders on frame churn); play/pause sits rightmost (right
+// thumb) with the speed menu beside it. The session clock lives on the chart
+// now, not here. Feed progress, market day/symbol, and the syncing state ride
+// the bar's native status caption — the page content above carries no nav of
+// its own.
 export function ReplayActionBar({
+  ui,
   clock,
   clockReceivedAt,
   cursor,
@@ -58,6 +73,7 @@ export function ReplayActionBar({
   onPause,
   onSpeed,
   onSeek,
+  onScrub,
 }: ReplayActionBarProps) {
   const running = clock?.mode === "running"
   const sessionNowMs = useSessionNowMs(clock, clockReceivedAt)
@@ -80,11 +96,13 @@ export function ReplayActionBar({
   const commitSeek = () => {
     if (drag === null || startNs === null || endNs === null) {
       setDrag(null)
+      onScrub(null)
       return
     }
     // Seek never changes mode: scrubbing while playing keeps playing.
     onSeek(fractionToNs(drag, startNs, endNs))
     setDrag(null)
+    onScrub(null)
   }
 
   return (
@@ -109,11 +127,20 @@ export function ReplayActionBar({
               value={Math.round(sliderFraction * 1000)}
               disabled={disabled}
               aria-label="Seek session time"
-              className="h-1.5 w-full cursor-pointer accent-primary disabled:cursor-default disabled:opacity-50"
-              onChange={(event) => setDrag(Number(event.target.value) / 1000)}
+              className="h-7 w-full cursor-pointer accent-primary disabled:cursor-default disabled:opacity-50"
+              onChange={(event) => {
+                const fraction = Number(event.target.value) / 1000
+                setDrag(fraction)
+                if (startNs !== null && endNs !== null) {
+                  onScrub(fractionToMs(fraction, startNs, endNs))
+                }
+              }}
               onPointerUp={commitSeek}
               onKeyUp={commitSeek}
-              onBlur={() => setDrag(null)}
+              onBlur={() => {
+                setDrag(null)
+                onScrub(null)
+              }}
             />
           ) : null}
 
@@ -125,26 +152,33 @@ export function ReplayActionBar({
                 void openHostOverview({ section: "tabs" })
               }}
             />
-            <ActionButton
-              icon={<ArrowLeft aria-hidden="true" />}
-              label="Back to days"
-              onClick={onExit}
-            />
-            <ActionButton
-              icon={
-                running ? (
-                  <Pause aria-hidden="true" />
-                ) : (
-                  <Play aria-hidden="true" />
-                )
-              }
-              label={running ? "Pause" : "Play"}
-              tone="primary"
-              disabled={disabled || !clock}
-              onClick={() => (running ? onPause() : onPlay())}
-            />
             <ActionMenu
               align="start"
+              icon={<Menu aria-hidden="true" />}
+              label="Replay menu"
+            >
+              <ActionMenuItem
+                icon={<RefreshCw aria-hidden="true" />}
+                label="Reload viewer"
+                onSelect={() => {
+                  void reloadHostView()
+                }}
+              />
+              <ActionMenuItem
+                icon={<ArrowLeft aria-hidden="true" />}
+                label="Back to days"
+                onSelect={onExit}
+              />
+            </ActionMenu>
+            <JumpToLiveAction ui={ui} />
+            <AutoScaleAction ui={ui} />
+            {/* Speed panel: the default 232px width dwarfs the short preset
+            labels; !important because viewer-kit's stylesheet is unlayered
+            and would otherwise win over the utility. */}
+            <ActionMenu
+              align="end"
+              className="ml-auto"
+              panelClassName="!w-auto !min-w-24"
               label="Playback speed"
               disabled={disabled}
               icon={
@@ -170,30 +204,23 @@ export function ReplayActionBar({
                 />
               ))}
             </ActionMenu>
-
-            <ClockReadout sessionNowMs={sessionNowMs} />
+            <ActionButton
+              icon={
+                running ? (
+                  <Pause aria-hidden="true" />
+                ) : (
+                  <Play aria-hidden="true" />
+                )
+              }
+              label={running ? "Pause" : "Play"}
+              tone="primary"
+              disabled={disabled || !clock}
+              onClick={() => (running ? onPause() : onPlay())}
+            />
           </div>
         </div>
       }
     />
-  )
-}
-
-// A readout, not a control: quiet weight, digits in tabular mono, the AM/PM +
-// timezone suffix demoted to a caption so nothing here reads as tappable.
-function ClockReadout({ sessionNowMs }: { sessionNowMs: number | null }) {
-  const parts = sessionNowMs === null ? null : formatEtTime(sessionNowMs)
-  return (
-    <div className="ml-auto flex shrink-0 items-baseline gap-1.5 pr-1">
-      <span className="font-mono text-sm text-foreground/90 tabular-nums">
-        {parts?.time ?? "--:--:--"}
-      </span>
-      {parts ? (
-        <span className="text-[0.65rem] font-medium tracking-wide text-muted-foreground">
-          {parts.suffix}
-        </span>
-      ) : null}
-    </div>
   )
 }
 
@@ -242,58 +269,19 @@ function TransportStatus({
   )
 }
 
-// Clock notifications arrive only when the clock cell changes, not continuously
-// during playback, so session time is extrapolated between them: while running,
-// now = sessionNow + (wall - receivedAt) * speed; while paused, sessionNow
-// verbatim (no timer). A new notification re-anchors both terms.
-function useSessionNowMs(
-  clock: Clock | null,
-  clockReceivedAt: number | null
-): number | null {
-  const running = clock?.mode === "running"
-  const [wallNow, setWallNow] = useState(() => performance.now())
-
-  useEffect(() => {
-    if (!running) return
-    const id = window.setInterval(() => setWallNow(performance.now()), 100)
-    return () => window.clearInterval(id)
-  }, [running])
-
-  return useMemo(() => {
-    if (!clock || clockReceivedAt === null) return null
-    const baseMs = nsToMs(clock.sessionNowNs)
-    if (clock.mode !== "running") return baseMs
-    return baseMs + (wallNow - clockReceivedAt) * clock.speed
-  }, [clock, clockReceivedAt, wallNow])
-}
-
 function formatSpeed(speed: number): string {
   return Number.isInteger(speed) ? speed.toString() : speed.toFixed(2)
 }
 
-const ET_TIME = new Intl.DateTimeFormat("en-US", {
-  timeZone: "America/New_York",
-  hour: "2-digit",
-  minute: "2-digit",
-  second: "2-digit",
-  hour12: true,
-  // Short zone name tracks DST (EST/EDT) instead of hardcoding one.
-  timeZoneName: "short",
-})
-
-function formatEtTime(ms: number): { time: string; suffix: string } {
-  const parts = ET_TIME.formatToParts(new Date(ms))
-  const part = (type: Intl.DateTimeFormatPartTypes) =>
-    parts.find((candidate) => candidate.type === type)?.value ?? ""
-  return {
-    time: `${part("hour")}:${part("minute")}:${part("second")}`,
-    suffix: `${part("dayPeriod")} ${part("timeZoneName")}`.trim(),
-  }
-}
-
-// ns strings exceed 2^53; divide as BigInt, then work in ms-scale numbers.
-function nsToMs(ns: string): number {
-  return Number(BigInt(ns) / 1000000n)
+// fraction in [0,1] → session-ms within bounds, for the mid-drag scrub preview.
+function fractionToMs(
+  fraction: number,
+  startNs: string,
+  endNs: string
+): number {
+  const startMs = nsToMs(startNs)
+  const endMs = nsToMs(endNs)
+  return startMs + clamp01(fraction) * (endMs - startMs)
 }
 
 // fraction in [0,1] → an integer nanosecond string (no exponent) within bounds.

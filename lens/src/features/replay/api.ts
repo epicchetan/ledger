@@ -10,6 +10,7 @@ import type {
   BarsStatus,
   Clock,
   Cursor,
+  SessionAttachResult,
   SessionClockEvent,
   SessionCloseResult,
   SessionClosedEvent,
@@ -24,6 +25,21 @@ export async function openSession(
   projections: string[]
 ): Promise<SessionOpenResult> {
   return requestIpc<SessionOpenResult>("remux/ledger/session/open", {
+    rawId,
+    projections,
+  })
+}
+
+// Reattach by the exact server-issued id persisted across a webview reload.
+// A stale id/raw/spec identity returns { attached: false }; real RPC failures
+// reject and must not be treated as permission to replace the active session.
+export async function attachSession(
+  sessionId: string,
+  rawId: string,
+  projections: string[]
+): Promise<SessionAttachResult> {
+  return requestIpc<SessionAttachResult>("remux/ledger/session/attach", {
+    sessionId,
     rawId,
     projections,
   })
