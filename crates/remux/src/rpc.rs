@@ -68,6 +68,20 @@ struct JsonRpcNotification {
     params: Value,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TargetedJsonRpcNotification {
+    jsonrpc: &'static str,
+    method: String,
+    params: Value,
+    remux_target: RemuxTarget,
+}
+
+#[derive(Debug, Serialize)]
+struct RemuxTarget {
+    origin: String,
+}
+
 pub async fn serve_stdio(make_dispatch: impl FnOnce(OutboundSender) -> DispatchFn) -> Result<()> {
     let (output_tx, output_rx) = mpsc::channel::<OutboundMessage>(1024);
     let writer = tokio::spawn(stdout_writer(output_rx));
@@ -253,6 +267,24 @@ pub async fn send_notification(
     params: Value,
 ) -> std::result::Result<(), mpsc::error::SendError<OutboundMessage>> {
     send_json(output_tx, notification(method, params)).await
+}
+
+pub async fn send_targeted_notification(
+    output_tx: &OutboundSender,
+    origin: impl Into<String>,
+    method: impl Into<String>,
+    params: Value,
+) -> std::result::Result<(), mpsc::error::SendError<OutboundMessage>> {
+    let notification = serde_json::to_value(TargetedJsonRpcNotification {
+        jsonrpc: "2.0",
+        method: method.into(),
+        params,
+        remux_target: RemuxTarget {
+            origin: origin.into(),
+        },
+    })
+    .expect("targeted JSON-RPC notification serializes");
+    send_json(output_tx, notification).await
 }
 
 async fn flush_output(output_tx: &OutboundSender) {

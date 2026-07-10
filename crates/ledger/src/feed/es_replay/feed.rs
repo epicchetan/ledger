@@ -96,15 +96,17 @@ where
         let mut clock_watch = ctx.cache().watch_key(clock_key.key())?;
         let mut state = FeedState::new(&event_store);
 
+        let initial_clock = clock_or_initial(&ctx, &clock_key)?;
         publish_cursor_status(
             &ctx,
             &cells,
             &raw_object_id,
             artifact_object_id.as_deref(),
             &state.cursor(&event_store),
-            &clock_or_initial(&ctx, &clock_key)?.snapshot(),
+            &initial_clock.snapshot(),
         )
         .await?;
+        let mut published_clock_revision = initial_clock.revision;
 
         loop {
             if shutdown.is_shutdown() {
@@ -129,6 +131,7 @@ where
                     .set_value(&cells.cursor, cursor)
                     .set_value(&cells.status, status);
                 ctx.submit(batch).await?;
+                published_clock_revision = clock.revision;
                 continue;
             }
 
@@ -150,7 +153,28 @@ where
                         &clock,
                     )
                     .await?;
+                published_clock_revision = clock.revision;
                 tokio::task::yield_now().await;
+                continue;
+            }
+
+            // A seek can land between feed batches (or at the current feed
+            // extent), leaving no batch mutation with which to acknowledge
+            // the new clock. Publish the unchanged cursor and status only
+            // after regression/catch-up work is exhausted. Delivery barriers
+            // can then distinguish this post-clock state from the identical
+            // pre-seek cursor without briefly accepting stale convergence.
+            if published_clock_revision < clock.revision {
+                publish_cursor_status(
+                    &ctx,
+                    &cells,
+                    &raw_object_id,
+                    artifact_object_id.as_deref(),
+                    &state.cursor(&event_store),
+                    &clock.snapshot(),
+                )
+                .await?;
+                published_clock_revision = clock.revision;
                 continue;
             }
 

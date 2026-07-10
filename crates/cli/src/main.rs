@@ -9,17 +9,23 @@ use clap::{Args, Parser, Subcommand};
 use ledger::feed::es_replay;
 use ledger::feed::es_replay::{
     es_day_catalog, fetch_es_raw, find_es_replay_artifact_descriptor, prepare_es_replay_artifact,
-    EsPrepareSummary, EsReplayCells, EsReplayCursor, FetchProgress, PrepareProgress,
-    ES_MBO_EVENT_STORE_KIND, RAW_DATABENTO_DBN_ZST_KIND,
+    EsMboFeedBatch, EsPrepareSummary, EsReplayCells, EsReplayCursor, EsReplayStatus, FetchProgress,
+    PrepareProgress, ES_MBO_EVENT_STORE_KIND, RAW_DATABENTO_DBN_ZST_KIND,
 };
 use ledger::market::MarketDay;
-use ledger::projection::{BarsCells, BarsStatus, ProjectionSpec};
-use ledger::session::LedgerSessionBuilder;
+use ledger::projection::{
+    Bar, BarsCells, BarsStatus, ProjectionDeliveryEvent, ProjectionDemand, ProjectionSpec,
+    ProjectionSubscriptionProjectionRequest, ProjectionSubscriptionRequest,
+};
+use ledger::session::{LedgerSessionBuilder, LedgerSessionHandle};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use store::{ObjectFilter, R2Store, RegisterFileRequest, StoreObjectId, StoreObjectRole};
 use tokio::sync::mpsc;
@@ -103,6 +109,9 @@ struct SessionRunEsReplayArgs {
     /// Projections to compute over the feed, e.g. `bars:1m`. Repeatable.
     #[arg(long = "projection")]
     projections: Vec<String>,
+    /// Enable the projection delivery subscriber at this FPS for profiling.
+    #[arg(long)]
+    delivery_fps: Option<u16>,
 }
 
 #[derive(Args, Clone)]
@@ -288,6 +297,8 @@ async fn run_session_es_replay_command(
             ));
         }
     };
+    let delivery_probe =
+        start_delivery_probe(&session, &projection_specs, args.delivery_fps).await?;
 
     let mode = if args.realtime { "realtime" } else { "step" };
     let start_feed_seq = cursor.feed_seq;
@@ -331,22 +342,34 @@ async fn run_session_es_replay_command(
     }
 
     if let Err(error) =
-        wait_for_projection_catch_up_all(session.cache(), &projection_cells, &cells.cursor).await
+        wait_for_projection_catch_up_all(session.runtime(), &projection_cells, &cells.cursor).await
     {
         let _ = session.shutdown().await;
         return Err(error);
     }
+    if delivery_probe.is_some() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let delivery_summary = delivery_probe
+        .as_ref()
+        .and_then(|probe| probe.summary(&session));
 
     let summary = session_summary(
         &cells,
-        session.cache(),
+        session.runtime(),
         &raw_id,
         mode,
         args.batches,
         start_feed_seq,
         preexisting_artifact_id.as_deref(),
         &projection_cells,
-    )?;
+        delivery_summary,
+    )
+    .await?;
+    if let Some(probe) = delivery_probe {
+        probe.join.abort();
+    }
     session.shutdown().await?;
     print_json(&summary)?;
     Ok(())
@@ -500,7 +523,7 @@ fn parse_projection_specs(raw_specs: &[String]) -> Result<Vec<(String, Projectio
 }
 
 async fn wait_for_cursor_value(
-    cache: &cache::Cache,
+    cache: &cache::CacheReader,
     watch: &mut cache::CellWatch,
     key: &cache::ValueKey<EsReplayCursor>,
 ) -> Result<EsReplayCursor> {
@@ -513,7 +536,7 @@ async fn wait_for_cursor_value(
 }
 
 async fn wait_for_cursor_progress(
-    cache: &cache::Cache,
+    cache: &cache::CacheReader,
     watch: &mut cache::CellWatch,
     key: &cache::ValueKey<EsReplayCursor>,
     last_seen: u64,
@@ -529,7 +552,7 @@ async fn wait_for_cursor_progress(
 }
 
 async fn wait_until_requested_or_ended(
-    cache: &cache::Cache,
+    cache: &cache::CacheReader,
     watch: &mut cache::CellWatch,
     key: &cache::ValueKey<EsReplayCursor>,
     start_feed_seq: u64,
@@ -545,15 +568,15 @@ async fn wait_until_requested_or_ended(
 }
 
 async fn wait_for_projection_catch_up_all(
-    cache: &cache::Cache,
+    runtime: &runtime::RuntimeHandle,
     projections: &[(String, BarsCells)],
     cursor_key: &cache::ValueKey<EsReplayCursor>,
 ) -> Result<()> {
     for (spec, cells) in projections {
-        let mut watch = cache.watch_key(cells.status.key())?;
+        let mut watch = runtime.cache().watch_key(cells.status.key())?;
         match tokio::time::timeout(
             SESSION_STEP_TIMEOUT,
-            wait_for_projection_catch_up(cache, &mut watch, &cells.status, cursor_key),
+            wait_for_projection_catch_up(runtime, &mut watch, &cells.status, cursor_key),
         )
         .await
         {
@@ -561,11 +584,13 @@ async fn wait_for_projection_catch_up_all(
                 result?;
             }
             Err(_) => {
-                let processed = cache
+                let processed = runtime
+                    .cache()
                     .read_value(&cells.status)?
                     .map(|status| status.processed_batches.to_string())
                     .unwrap_or_else(|| "unpublished".to_string());
-                let batch_idx = cache
+                let batch_idx = runtime
+                    .cache()
                     .read_value(cursor_key)?
                     .map(|cursor| cursor.batch_idx.to_string())
                     .unwrap_or_else(|| "unpublished".to_string());
@@ -579,18 +604,20 @@ async fn wait_for_projection_catch_up_all(
 }
 
 async fn wait_for_projection_catch_up(
-    cache: &cache::Cache,
+    runtime: &runtime::RuntimeHandle,
     watch: &mut cache::CellWatch,
     key: &cache::ValueKey<BarsStatus>,
     cursor_key: &cache::ValueKey<EsReplayCursor>,
 ) -> Result<BarsStatus> {
     loop {
-        // Re-read the cursor each pass: in realtime mode the feed can emit
-        // in-flight batches after pause() resolves, so a cursor pinned before
-        // the wait can sit permanently behind the projection's progress.
-        if let (Some(cursor), Some(status)) =
-            (cache.read_value(cursor_key)?, cache.read_value(key)?)
-        {
+        let cursor_key = cursor_key.clone();
+        let status_key = key.clone();
+        let state = runtime
+            .snapshot(move |view| {
+                Ok((view.read_value(&cursor_key)?, view.read_value(&status_key)?))
+            })
+            .await?;
+        if let (Some(cursor), Some(status)) = state {
             if status.epoch == cursor.epoch && status.processed_batches == cursor.batch_idx {
                 return Ok(status);
             }
@@ -609,23 +636,58 @@ fn requested_reached(
         .unwrap_or(false)
 }
 
-fn session_summary(
+#[allow(clippy::too_many_arguments)]
+async fn session_summary(
     cells: &EsReplayCells,
-    cache: &cache::Cache,
+    runtime: &runtime::RuntimeHandle,
     raw_id: &StoreObjectId,
     mode: &str,
     batches_requested: Option<usize>,
     start_feed_seq: u64,
     preexisting_artifact_id: Option<&str>,
     projections: &[(String, BarsCells)],
+    projection_delivery: Option<SessionDeliverySummary>,
 ) -> Result<SessionRunEsReplaySummary> {
-    let cursor = cache
-        .read_value(&cells.cursor)?
+    let feed = cells.clone();
+    let projection_keys = projections.to_vec();
+    let snapshot = runtime
+        .snapshot(move |view| {
+            let cursor = view.read_value(&feed.cursor)?;
+            let status = view.read_value(&feed.status)?;
+            let (first_batch, last_batch) = match cursor.as_ref().map(|cursor| cursor.batch_idx) {
+                Some(0) | None => (None, None),
+                Some(batch_count) => (
+                    view.read_array_range(&feed.batches, 0..1)?
+                        .into_iter()
+                        .next(),
+                    view.read_array_range(&feed.batches, batch_count - 1..batch_count)?
+                        .into_iter()
+                        .next(),
+                ),
+            };
+            let mut projection_state = Vec::with_capacity(projection_keys.len());
+            for (spec, cells) in projection_keys {
+                projection_state.push((
+                    spec,
+                    view.read_array(&cells.bars)?,
+                    view.read_value(&cells.live)?,
+                ));
+            }
+            Ok(SessionSummarySnapshot {
+                cursor,
+                status,
+                first_batch,
+                last_batch,
+                projections: projection_state,
+            })
+        })
+        .await?;
+    let cursor = snapshot
+        .cursor
         .ok_or_else(|| anyhow!("ES replay cursor was not published"))?;
-    let status = cache
-        .read_value(&cells.status)?
+    let status = snapshot
+        .status
         .ok_or_else(|| anyhow!("ES replay status was not published"))?;
-    let batches = cache.read_array(&cells.batches)?;
     let artifact_reused = status
         .artifact_object_id
         .as_deref()
@@ -639,23 +701,25 @@ fn session_summary(
         mode: mode.to_string(),
         batches_requested,
         batches_emitted: cursor.feed_seq.saturating_sub(start_feed_seq),
-        first_ts_event_ns: batches.first().map(|batch| batch.ts_event_ns.to_string()),
-        last_ts_event_ns: batches.last().map(|batch| batch.ts_event_ns.to_string()),
+        first_ts_event_ns: snapshot
+            .first_batch
+            .map(|batch| batch.ts_event_ns.to_string()),
+        last_ts_event_ns: snapshot
+            .last_batch
+            .map(|batch| batch.ts_event_ns.to_string()),
         ended: cursor.ended,
         epoch: cursor.epoch,
         feed_seq: cursor.feed_seq,
-        projections: projection_summaries(cache, projections)?,
+        projections: projection_summaries(snapshot.projections),
+        projection_delivery,
     })
 }
 
 fn projection_summaries(
-    cache: &cache::Cache,
-    projections: &[(String, BarsCells)],
-) -> Result<Vec<SessionProjectionSummary>> {
+    projections: Vec<(String, Vec<Bar>, Option<Bar>)>,
+) -> Vec<SessionProjectionSummary> {
     let mut summaries = Vec::new();
-    for (spec, cells) in projections {
-        let bars = cache.read_array(&cells.bars)?;
-        let live = cache.read_value(&cells.live)?;
+    for (spec, bars, live) in projections {
         let completed_volume = bars.iter().map(|bar| bar.volume).sum::<u64>();
         let completed_trade_count = bars.iter().map(|bar| bar.trade_count).sum::<u64>();
         let volume = completed_volume + live.as_ref().map(|bar| bar.volume).unwrap_or(0);
@@ -673,7 +737,7 @@ fn projection_summaries(
             .map(|value| value.to_string());
 
         summaries.push(SessionProjectionSummary {
-            spec: spec.clone(),
+            spec,
             completed_bars: bars.len(),
             live_bar: live.is_some(),
             volume,
@@ -682,7 +746,15 @@ fn projection_summaries(
             last_bar_start_ns,
         });
     }
-    Ok(summaries)
+    summaries
+}
+
+struct SessionSummarySnapshot {
+    cursor: Option<EsReplayCursor>,
+    status: Option<EsReplayStatus>,
+    first_batch: Option<EsMboFeedBatch>,
+    last_batch: Option<EsMboFeedBatch>,
+    projections: Vec<(String, Vec<Bar>, Option<Bar>)>,
 }
 
 #[derive(Debug, Serialize)]
@@ -700,6 +772,120 @@ struct SessionRunEsReplaySummary {
     feed_seq: u64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     projections: Vec<SessionProjectionSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    projection_delivery: Option<SessionDeliverySummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionDeliverySummary {
+    events_received: u64,
+    dirty_notifications: u64,
+    coalesced_dirty_notifications: u64,
+    atomic_collects: u64,
+    frames_admitted: u64,
+    snapshot_frames: u64,
+    suffix_frames: u64,
+    frames_suppressed_during_seek: u64,
+    outbound_backpressure: u64,
+    seek_barriers_completed: u64,
+    total_seek_barrier_ns: u64,
+}
+
+struct DeliveryProbe {
+    events_received: Arc<AtomicU64>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl DeliveryProbe {
+    fn summary(&self, session: &LedgerSessionHandle) -> Option<SessionDeliverySummary> {
+        let metrics = session.projection_delivery()?.metrics();
+        Some(SessionDeliverySummary {
+            events_received: self.events_received.load(Ordering::Relaxed),
+            dirty_notifications: metrics.dirty_notifications,
+            coalesced_dirty_notifications: metrics.coalesced_dirty_notifications,
+            atomic_collects: metrics.atomic_collects,
+            frames_admitted: metrics.frames_admitted,
+            snapshot_frames: metrics.snapshot_frames,
+            suffix_frames: metrics.suffix_frames,
+            frames_suppressed_during_seek: metrics.frames_suppressed_during_seek,
+            outbound_backpressure: metrics.outbound_backpressure,
+            seek_barriers_completed: metrics.seek_barriers_completed,
+            total_seek_barrier_ns: metrics.total_seek_barrier_ns,
+        })
+    }
+}
+
+async fn start_delivery_probe(
+    session: &LedgerSessionHandle,
+    projection_specs: &[(String, ProjectionSpec)],
+    fps: Option<u16>,
+) -> Result<Option<DeliveryProbe>> {
+    let Some(fps) = fps else {
+        return Ok(None);
+    };
+    if fps == 0 {
+        return Err(anyhow!("--delivery-fps must be greater than zero"));
+    }
+    let delivery = session
+        .projection_delivery()
+        .ok_or_else(|| anyhow!("--delivery-fps requires at least one projection"))?
+        .clone();
+    let mut events = session
+        .take_projection_events()
+        .ok_or_else(|| anyhow!("projection delivery event stream unavailable"))?;
+    let subscription = delivery
+        .subscribe(ProjectionSubscriptionRequest {
+            consumer_instance_id: "ledger-cli-profile".to_string(),
+            projections: projection_specs
+                .iter()
+                .map(|(spec, _)| ProjectionSubscriptionProjectionRequest {
+                    spec: spec.clone(),
+                    schema_versions: vec![1],
+                    requested_max_fps: Some(fps),
+                    have: None,
+                })
+                .collect(),
+        })
+        .await?;
+    let subscription_id = subscription.subscription_id;
+    let events_received = Arc::new(AtomicU64::new(0));
+    let received = events_received.clone();
+    let join = tokio::spawn(async move {
+        let mut lease = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            tokio::select! {
+                event = events.recv() => {
+                    match event {
+                        Some(ProjectionDeliveryEvent::Frame(_)) => {
+                            received.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Some(ProjectionDeliveryEvent::Watermark(_))
+                        | Some(ProjectionDeliveryEvent::SubscriptionExpired { .. }) => {}
+                        None => return,
+                    }
+                }
+                _ = lease.tick() => {
+                    if delivery
+                        .demand(
+                            subscription_id.clone(),
+                            ProjectionDemand {
+                                active: true,
+                                requested_max_fps: Some(fps),
+                            },
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    Ok(Some(DeliveryProbe {
+        events_received,
+        join,
+    }))
 }
 
 #[derive(Debug, Serialize)]

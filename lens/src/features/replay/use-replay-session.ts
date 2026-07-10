@@ -3,37 +3,40 @@ import { subscribeHostResume } from "@remux/viewer-kit/host"
 
 import { BarsAccumulator } from "@/features/replay/accumulator"
 import {
+  acknowledgeSessionProjections,
   attachSession,
   closeSession,
-  fetchSessionBars,
+  demandSessionProjections,
   fetchSessionStatus,
   openSession,
   pauseSession,
   playSession,
+  resyncSessionProjections,
   seekSession,
   setSessionSpeed,
   subscribeSessionEvents,
+  subscribeSessionProjections,
 } from "@/features/replay/api"
+import { getBarsProjectionClient } from "@/features/replay/projection-client"
 import type {
-  BarsFrame,
+  BarsPosition,
+  BarsProjectionFrame,
   Clock,
   Cursor,
+  ProjectionDeliveryState,
+  ProjectionWatermark,
   SessionAttachSnapshot,
   SessionClosedReason,
   SessionOpenResult,
 } from "@/features/replay/types"
 
-// Which projections a replay session requests. A product decision per
-// projection kind, not something the UI discovers — headless specs that feed
-// stat panels would join this list without joining any chart registry.
 const REPLAY_SPECS = ["bars:1m"]
-
-// Initial attach/open hydration and host-resume revalidation buffer the push
-// stream while a pull snapshot is in flight. Keep the newest events if a
-// pathological burst reaches the cap; monotonic frame versions and gap
-// backfill make a dropped older event harmless.
+const REQUESTED_MAX_FPS = 15
 const EVENT_BUFFER_CAP = 4096
 const RESUME_STORAGE_KEY = "lens.replay.session.v1"
+const ACK_INTERVAL_MS = 750
+const INITIAL_PROJECTION_TIMEOUT_MS = 5_000
+const CONSUMER_INSTANCE_ID = createConsumerInstanceId()
 
 export type ReplayPhase = "opening" | "live" | "ended" | "error"
 
@@ -50,22 +53,538 @@ export interface ReplaySession {
   error: string | null
   endedReason: SessionClosedReason | null
   clock: Clock | null
-  // performance.now() when the clock notification landed — the anchor the
-  // scrubber extrapolates from while running.
   clockReceivedAt: number | null
   cursor: Cursor | null
+  deliveryState: ProjectionDeliveryState
   projections: BarsAccumulator[]
   controls: ReplayControls
-}
-
-function errorMessage(error: unknown) {
-  return error instanceof Error ? error.message : "Unknown error"
 }
 
 interface StoredReplaySession {
   sessionId: string
   rawId: string
   projections: string[]
+}
+
+export function useReplaySession(
+  rawId: string,
+  routedSessionId: string | null = null
+): ReplaySession {
+  const sessionIdRef = useRef<string | null>(null)
+  const projections = useMemo(() => {
+    const client = getBarsProjectionClient()
+    return REPLAY_SPECS.map((spec) => client.createAccumulator(spec))
+  }, [])
+  const projectionsBySpec = useMemo(() => {
+    const map = new Map<string, BarsAccumulator>()
+    for (const accumulator of projections) map.set(accumulator.spec, accumulator)
+    return map
+  }, [projections])
+
+  const [phase, setPhase] = useState<ReplayPhase>("opening")
+  const [open, setOpen] = useState<SessionOpenResult | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [endedReason, setEndedReason] = useState<SessionClosedReason | null>(
+    null
+  )
+  const [clockState, setClockState] = useState<{
+    clock: Clock
+    receivedAt: number
+  } | null>(null)
+  const [cursor, setCursor] = useState<Cursor | null>(null)
+  const [deliveryState, setDeliveryState] =
+    useState<ProjectionDeliveryState>("delivery_pending")
+
+  useEffect(() => {
+    let cancelled = false
+    let buffering = true
+    let established = false
+    let hostResyncing = false
+    let resumeRequested = false
+    let closed = false
+    let resumeCandidate = routedSessionId ?? loadStoredSession(rawId)
+    let latestClock: Clock | null = null
+    let latestCursor: Cursor | null = null
+    let subscriptionId: string | null = null
+    let sessionGeneration: number | null = null
+    let demandTimer: ReturnType<typeof setInterval> | null = null
+    let ackTimer: ReturnType<typeof setTimeout> | null = null
+    let projectionResyncing = false
+    let resyncFrameApplied = false
+    let latestWatermark: ProjectionWatermark | null = null
+    const pendingAcks = new Map<string, BarsPosition>()
+    const buffer: Array<() => void> = []
+    sessionIdRef.current = null
+
+    const applyClock = (id: string, next: Clock) => {
+      if (id !== sessionIdRef.current) return
+      if (latestClock && next.revision <= latestClock.revision) return
+      latestClock = next
+      setClockState({ clock: next, receivedAt: performance.now() })
+    }
+    const seedClock = (next: Clock) => {
+      if (latestClock && next.revision < latestClock.revision) return
+      latestClock = next
+      setClockState({ clock: next, receivedAt: performance.now() })
+    }
+    const seedCursor = (next: Cursor) => {
+      if (isOlderCursor(next, latestCursor)) return
+      latestCursor = next
+      setCursor(next)
+    }
+
+    const currentApplied = () =>
+      projections.flatMap((accumulator) => {
+        const head = accumulator.getAppliedPosition()
+        return head ? [{ spec: accumulator.spec, head }] : []
+      })
+
+    const requestProjectionResync = (reason: string) => {
+      if (cancelled || projectionResyncing || !subscriptionId) return
+      projectionResyncing = true
+      resyncFrameApplied = false
+      setDeliveryState("resyncing")
+      void resyncSessionProjections(
+        subscriptionId,
+        currentApplied(),
+        reason
+      )
+        .then(() => {
+          projectionResyncing = false
+          if (!cancelled && resyncFrameApplied) {
+            setDeliveryState(
+              latestWatermark
+                ? deriveDeliveryState(latestWatermark, projectionsBySpec)
+                : "current"
+            )
+          }
+        })
+        .catch((err) => {
+          if (!cancelled) {
+            console.warn("[replay] projection resync failed", err)
+            setDeliveryState("disconnected_unknown")
+          }
+        })
+        .finally(() => {
+          projectionResyncing = false
+        })
+    }
+
+    const flushAcks = () => {
+      if (ackTimer) {
+        clearTimeout(ackTimer)
+        ackTimer = null
+      }
+      if (!subscriptionId || pendingAcks.size === 0) return
+      const id = subscriptionId
+      const applied = Array.from(pendingAcks, ([spec, head]) => ({ spec, head }))
+      pendingAcks.clear()
+      void acknowledgeSessionProjections(id, applied).catch((err) => {
+        if (!cancelled) {
+          console.warn("[replay] projection acknowledgment failed", err)
+          requestProjectionResync("ack_rejected")
+        }
+      })
+    }
+
+    const queueAck = (
+      spec: string,
+      head: BarsPosition,
+      immediate: boolean
+    ) => {
+      pendingAcks.set(spec, head)
+      if (immediate) {
+        queueMicrotask(flushAcks)
+      } else if (!ackTimer) {
+        ackTimer = setTimeout(flushAcks, ACK_INTERVAL_MS)
+      }
+    }
+
+    const applyProjectionFrame = (frame: BarsProjectionFrame) => {
+      if (
+        frame.subscriptionId !== subscriptionId ||
+        frame.sessionGeneration !== sessionGeneration
+      ) {
+        return
+      }
+      const accumulator = projectionsBySpec.get(frame.spec)
+      if (!accumulator) return
+      const result = accumulator.apply(frame)
+      if (result.kind === "base_mismatch") {
+        requestProjectionResync("base_mismatch")
+      } else if (result.kind === "applied" || result.kind === "duplicate") {
+        queueAck(frame.spec, result.head, result.immediateAck)
+        if (projectionResyncing && frame.reason === "resync") {
+          resyncFrameApplied = true
+        }
+        if (!projectionResyncing) {
+          setDeliveryState(
+            latestWatermark
+              ? deriveDeliveryState(latestWatermark, projectionsBySpec)
+              : "current"
+          )
+        }
+      } else {
+        requestProjectionResync("malformed_frame")
+      }
+    }
+
+    const applyWatermark = (watermark: ProjectionWatermark) => {
+      if (
+        watermark.subscriptionId !== subscriptionId ||
+        watermark.sessionGeneration !== sessionGeneration
+      ) {
+        return
+      }
+      latestWatermark = watermark
+      if (watermark.feed) seedCursor(watermark.feed)
+      if (!projectionResyncing) {
+        setDeliveryState(deriveDeliveryState(watermark, projectionsBySpec))
+      }
+    }
+
+    const applyClosed = (id: string, reason: SessionClosedReason) => {
+      if (id !== sessionIdRef.current) return
+      closed = true
+      setEndedReason(reason)
+      setDeliveryState("current")
+      setPhase("ended")
+    }
+
+    const route = (deliver: () => void) => {
+      if (buffering || sessionIdRef.current === null) {
+        if (buffer.length === EVENT_BUFFER_CAP) buffer.shift()
+        buffer.push(deliver)
+        return
+      }
+      deliver()
+    }
+    const drainBuffer = () => {
+      buffering = false
+      for (const deliver of buffer.splice(0)) deliver()
+    }
+
+    const unsubscribe = subscribeSessionEvents({
+      clock: (event) => route(() => applyClock(event.sessionId, event.clock)),
+      // The legacy feed notification can run at compute/chunk cadence during a
+      // large seek. Projection watermarks carry the same authoritative cursor
+      // at presentation cadence, keeping React work independent of replay
+      // throughput while the server continues at full speed.
+      cursor: () => undefined,
+      projectionFrame: (frame) => route(() => applyProjectionFrame(frame)),
+      projectionWatermark: (watermark) =>
+        route(() => applyWatermark(watermark)),
+      closed: (event) =>
+        route(() => applyClosed(event.sessionId, event.reason)),
+    })
+
+    const establish = async (): Promise<{
+      result: SessionOpenResult
+      attached: SessionAttachSnapshot | null
+    }> => {
+      if (resumeCandidate) {
+        const outcome = await attachSession(
+          resumeCandidate,
+          rawId,
+          REPLAY_SPECS
+        )
+        if (outcome.attached) {
+          return {
+            result: { ...outcome.session, replaced: null },
+            attached: outcome.session,
+          }
+        }
+        clearStoredSession(resumeCandidate)
+        resumeCandidate = null
+      }
+      if (cancelled) throw new Error("Replay session establishment cancelled")
+      return {
+        result: await openSession(rawId, REPLAY_SPECS),
+        attached: null,
+      }
+    }
+
+    const hydrateStatus = async (
+      id: string,
+      fallback: SessionAttachSnapshot | null = null
+    ) => {
+      const status = await fetchSessionStatus(id)
+      if (cancelled || id !== sessionIdRef.current) return
+      seedClock(status.clock)
+      const nextCursor = status.feed.cursor ?? fallback?.cursor ?? null
+      if (nextCursor) seedCursor(nextCursor)
+    }
+
+    const sendDemand = () => {
+      if (!subscriptionId) return
+      void demandSessionProjections(
+        subscriptionId,
+        document.visibilityState !== "hidden",
+        REQUESTED_MAX_FPS
+      ).catch(() => {
+        if (!cancelled) setDeliveryState("disconnected_unknown")
+      })
+    }
+
+    const installDemandLease = (leaseMs: number) => {
+      if (demandTimer) clearInterval(demandTimer)
+      const interval = Math.max(5_000, Math.min(15_000, leaseMs / 2))
+      demandTimer = setInterval(sendDemand, interval)
+      sendDemand()
+    }
+
+    const subscribeProjectionStream = async (
+      id: string,
+      retainAppliedState: boolean
+    ) => {
+      const response = await subscribeSessionProjections(
+        id,
+        CONSUMER_INSTANCE_ID,
+        projections.map((accumulator) => ({
+          spec: accumulator.spec,
+          schemaVersions: [1],
+          requestedMaxFps: REQUESTED_MAX_FPS,
+          have: retainAppliedState ? accumulator.getAppliedPosition() : null,
+        }))
+      )
+      for (const projection of response.projections) {
+        if (projection.kind !== "bars" || projection.schemaVersion !== 1) {
+          throw new Error(
+            `Unsupported projection schema ${projection.kind}:${projection.schemaVersion}`
+          )
+        }
+      }
+      subscriptionId = response.subscriptionId
+      sessionGeneration = response.sessionGeneration
+      pendingAcks.clear()
+      for (const accumulator of projections) {
+        accumulator.beginSubscription(
+          response.subscriptionId,
+          response.sessionGeneration,
+          retainAppliedState
+        )
+      }
+      latestWatermark = null
+      setDeliveryState("delivery_pending")
+      installDemandLease(response.leaseMs)
+    }
+
+    const resumeProjectionStream = async (id: string) => {
+      if (!subscriptionId) {
+        await subscribeProjectionStream(id, true)
+        return
+      }
+      try {
+        await demandSessionProjections(
+          subscriptionId,
+          true,
+          REQUESTED_MAX_FPS
+        )
+        await resyncSessionProjections(
+          subscriptionId,
+          currentApplied(),
+          "resume_after_disconnect"
+        )
+      } catch {
+        await subscribeProjectionStream(id, true)
+      }
+    }
+
+    const requestHostResync = () => {
+      if (cancelled || !established) return
+      if (hostResyncing) {
+        resumeRequested = true
+        return
+      }
+      const id = sessionIdRef.current
+      if (!id) return
+      hostResyncing = true
+      resumeRequested = false
+      buffering = true
+      setDeliveryState("disconnected_unknown")
+      void attachSession(id, rawId, REPLAY_SPECS)
+        .then(async (outcome) => {
+          if (!outcome.attached) {
+            throw new Error("The replay session is no longer active")
+          }
+          setOpen({ ...outcome.session, replaced: null })
+          seedClock(outcome.session.clock)
+          if (outcome.session.cursor) seedCursor(outcome.session.cursor)
+          await hydrateStatus(id, outcome.session)
+          await resumeProjectionStream(id)
+          if (!cancelled) drainBuffer()
+        })
+        .catch((err) => {
+          if (cancelled) return
+          drainBuffer()
+          if (closed) return
+          setError(errorMessage(err))
+          setPhase("error")
+        })
+        .finally(() => {
+          hostResyncing = false
+          if (resumeRequested && !cancelled) requestHostResync()
+        })
+    }
+
+    const onVisibilityChange = () => sendDemand()
+    document.addEventListener("visibilitychange", onVisibilityChange)
+    const unsubscribeResume = subscribeHostResume(requestHostResync)
+
+    void establish()
+      .then(async ({ result, attached }) => {
+        if (cancelled) {
+          clearStoredSession(result.sessionId)
+          void closeSession(result.sessionId).catch(() => undefined)
+          return
+        }
+        sessionIdRef.current = result.sessionId
+        resumeCandidate = result.sessionId
+        storeSession(result.sessionId, rawId)
+        setOpen(result)
+        if (attached) {
+          seedClock(attached.clock)
+          if (attached.cursor) seedCursor(attached.cursor)
+        } else if (result.sessionStartNs) {
+          await seekSession(result.sessionId, result.sessionStartNs)
+        }
+
+        await subscribeProjectionStream(result.sessionId, false)
+        await hydrateStatus(result.sessionId, attached)
+        if (cancelled || result.sessionId !== sessionIdRef.current) return
+        drainBuffer()
+        await waitForProjectionSnapshots(projections)
+        established = true
+        if (closed || cancelled) return
+        setPhase("live")
+        if (resumeRequested) requestHostResync()
+      })
+      .catch((err) => {
+        if (cancelled) return
+        drainBuffer()
+        if (closed) return
+        setError(errorMessage(err))
+        setDeliveryState("disconnected_unknown")
+        setPhase("error")
+      })
+
+    return () => {
+      cancelled = true
+      unsubscribe()
+      unsubscribeResume()
+      document.removeEventListener("visibilitychange", onVisibilityChange)
+      if (demandTimer) clearInterval(demandTimer)
+      if (ackTimer) clearTimeout(ackTimer)
+      flushAcks()
+      const id = sessionIdRef.current
+      sessionIdRef.current = null
+      const closeId = id ?? resumeCandidate
+      if (closeId) {
+        clearStoredSession(closeId)
+        void closeSession(closeId).catch(() => undefined)
+      }
+    }
+  }, [rawId, routedSessionId, projections, projectionsBySpec])
+
+  const controls = useMemo<ReplayControls>(
+    () => ({
+      play: () => {
+        const id = sessionIdRef.current
+        if (id) void playSession(id).catch(logControlError("play"))
+      },
+      pause: () => {
+        const id = sessionIdRef.current
+        if (id) void pauseSession(id).catch(logControlError("pause"))
+      },
+      setSpeed: (speed) => {
+        const id = sessionIdRef.current
+        if (id) void setSessionSpeed(id, speed).catch(logControlError("speed"))
+      },
+      seek: (sessionNs) => {
+        const id = sessionIdRef.current
+        if (id) void seekSession(id, sessionNs).catch(logControlError("seek"))
+      },
+    }),
+    []
+  )
+
+  return {
+    phase,
+    open,
+    error,
+    endedReason,
+    clock: clockState?.clock ?? null,
+    clockReceivedAt: clockState?.receivedAt ?? null,
+    cursor,
+    deliveryState,
+    projections,
+    controls,
+  }
+}
+
+function deriveDeliveryState(
+  watermark: ProjectionWatermark,
+  accumulators: Map<string, BarsAccumulator>
+): ProjectionDeliveryState {
+  if (watermark.feed?.catchingUp) return "projection_catching_up"
+  for (const projection of watermark.projections) {
+    if (
+      watermark.feed &&
+      (projection.head.epoch < watermark.feed.epoch ||
+        (projection.head.epoch === watermark.feed.epoch &&
+          projection.head.processedBatches < watermark.feed.batchIdx))
+    ) {
+      return "projection_catching_up"
+    }
+    const applied = accumulators.get(projection.spec)?.getAppliedPosition() ?? null
+    if (!applied) return "delivery_pending"
+    if (
+      applied.epoch < projection.head.epoch ||
+      (applied.epoch === projection.head.epoch &&
+        applied.projectionRevision < projection.head.projectionRevision)
+    ) {
+      return "viewer_lagging"
+    }
+  }
+  return "current"
+}
+
+function waitForProjectionSnapshots(
+  accumulators: BarsAccumulator[]
+): Promise<void> {
+  if (accumulators.every((accumulator) => accumulator.getAppliedPosition())) {
+    return Promise.resolve()
+  }
+  return new Promise((resolve, reject) => {
+    const unsubscribers: Array<() => void> = []
+    const finish = () => {
+      if (!accumulators.every((accumulator) => accumulator.getAppliedPosition())) {
+        return
+      }
+      clearTimeout(timeout)
+      for (const unsubscribe of unsubscribers) unsubscribe()
+      resolve()
+    }
+    const timeout = setTimeout(() => {
+      for (const unsubscribe of unsubscribers) unsubscribe()
+      reject(new Error("Timed out waiting for projection snapshots"))
+    }, INITIAL_PROJECTION_TIMEOUT_MS)
+    for (const accumulator of accumulators) {
+      unsubscribers.push(accumulator.subscribe(finish))
+    }
+    finish()
+  })
+}
+
+function createConsumerInstanceId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID()
+  }
+  return `consumer-${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Unknown error"
 }
 
 function loadStoredSession(rawId: string): string | null {
@@ -110,8 +629,7 @@ function storeSession(sessionId: string, rawId: string): void {
   try {
     window.sessionStorage.setItem(RESUME_STORAGE_KEY, JSON.stringify(stored))
   } catch {
-    // The host route still covers native reload; only the browser-only fallback
-    // is unavailable.
+    // The exact native route remains the primary reload capability.
   }
 }
 
@@ -133,319 +651,8 @@ function clearStoredSession(sessionId: string): void {
   }
 }
 
-// Owns one session's whole lifecycle: subscribe → open → stream, and
-// close-on-unmount. Rendered clock state comes from authoritative server
-// snapshots (push notifications plus attach/status pulls); controls submit and
-// wait for one of those snapshots, never flip state locally.
-export function useReplaySession(
-  rawId: string,
-  routedSessionId: string | null = null
-): ReplaySession {
-  // The live session id, readable by the long-lived subscription and the
-  // controls without a stale render capture. Touched only in the effect and in
-  // event handlers, never during render.
-  const sessionIdRef = useRef<string | null>(null)
-
-  // Accumulators are created once and outlive individual frames; their backfill
-  // is wired from the effect once the session id exists.
-  const projections = useMemo(
-    () => REPLAY_SPECS.map((spec) => new BarsAccumulator(spec)),
-    []
-  )
-  const projectionsBySpec = useMemo(() => {
-    const map = new Map<string, BarsAccumulator>()
-    for (const accumulator of projections)
-      map.set(accumulator.spec, accumulator)
-    return map
-  }, [projections])
-
-  const [phase, setPhase] = useState<ReplayPhase>("opening")
-  const [open, setOpen] = useState<SessionOpenResult | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  const [endedReason, setEndedReason] = useState<SessionClosedReason | null>(
-    null
-  )
-  const [clockState, setClockState] = useState<{
-    clock: Clock
-    receivedAt: number
-  } | null>(null)
-  const [cursor, setCursor] = useState<Cursor | null>(null)
-
-  useEffect(() => {
-    let cancelled = false
-    let buffering = true
-    let established = false
-    let resyncing = false
-    let resumeRequested = false
-    let closed = false
-    let resumeCandidate = routedSessionId ?? loadStoredSession(rawId)
-    let latestClock: Clock | null = null
-    let latestCursor: Cursor | null = null
-    sessionIdRef.current = null
-    // Until initial hydration completes, notifications are buffered as
-    // id-filtered thunks. The same barrier is reused after a Remux host resume,
-    // when iOS suspension or a socket reconnect may have dropped events.
-    const buffer: Array<() => void> = []
-
-    for (const accumulator of projections) {
-      accumulator.setBackfill((spec, from) => {
-        const id = sessionIdRef.current
-        if (!id) return Promise.reject(new Error("session not open"))
-        return fetchSessionBars(id, spec, from)
-      })
-    }
-
-    const applyClock = (id: string, clock: Clock) => {
-      if (id !== sessionIdRef.current) return
-      if (latestClock && clock.revision <= latestClock.revision) return
-      latestClock = clock
-      setClockState({ clock, receivedAt: performance.now() })
-    }
-    const seedClock = (clock: Clock) => {
-      if (latestClock && clock.revision < latestClock.revision) return
-      latestClock = clock
-      setClockState({ clock, receivedAt: performance.now() })
-    }
-    const applyCursor = (id: string, next: Cursor) => {
-      if (id !== sessionIdRef.current) return
-      if (!isNewerCursor(next, latestCursor)) return
-      latestCursor = next
-      setCursor(next)
-    }
-    const seedCursor = (next: Cursor) => {
-      if (isOlderCursor(next, latestCursor)) return
-      latestCursor = next
-      setCursor(next)
-    }
-    const applyFrame = (frame: BarsFrame) => {
-      if (frame.sessionId !== sessionIdRef.current) return
-      projectionsBySpec.get(frame.spec)?.ingest(frame)
-    }
-    const applyClosed = (id: string, reason: SessionClosedReason) => {
-      if (id !== sessionIdRef.current) return
-      closed = true
-      setEndedReason(reason)
-      setPhase("ended")
-    }
-
-    const route = (deliver: () => void) => {
-      if (buffering || sessionIdRef.current === null) {
-        if (buffer.length === EVENT_BUFFER_CAP) buffer.shift()
-        buffer.push(deliver)
-        return
-      }
-      deliver()
-    }
-
-    const drainBuffer = () => {
-      buffering = false
-      const pending = buffer.splice(0)
-      for (const deliver of pending) deliver()
-    }
-
-    const unsubscribe = subscribeSessionEvents({
-      clock: (event) => route(() => applyClock(event.sessionId, event.clock)),
-      cursor: (event) =>
-        route(() => applyCursor(event.sessionId, event.cursor)),
-      barsFrame: (frame) => route(() => applyFrame(frame)),
-      closed: (event) =>
-        route(() => applyClosed(event.sessionId, event.reason)),
-    })
-
-    // Only an exact id persisted by this webview authorizes resume. A fresh
-    // days→replay navigation has no token and opens immediately; a stale token
-    // is a typed miss, while a real attach failure is surfaced rather than
-    // destructively replacing an ambiguous active session.
-    const establish = async (): Promise<{
-      result: SessionOpenResult
-      attached: SessionAttachSnapshot | null
-    }> => {
-      if (resumeCandidate) {
-        const outcome = await attachSession(
-          resumeCandidate,
-          rawId,
-          REPLAY_SPECS
-        )
-        if (outcome.attached) {
-          return {
-            result: { ...outcome.session, replaced: null },
-            attached: outcome.session,
-          }
-        }
-        clearStoredSession(resumeCandidate)
-        resumeCandidate = null
-      }
-      if (cancelled) throw new Error("Replay session establishment cancelled")
-      return {
-        result: await openSession(rawId, REPLAY_SPECS),
-        attached: null,
-      }
-    }
-
-    // Cache history stays server-side, but a new JS context still needs one
-    // authoritative frame. Pull bars first, then status so the running clock is
-    // anchored near the end of hydration; buffered pushes newer than either
-    // snapshot are replayed afterward and stale ones are rejected by version.
-    const hydrate = async (
-      id: string,
-      fallback: SessionAttachSnapshot | null = null
-    ) => {
-      buffering = true
-      const frames = await Promise.all(
-        projections.map((accumulator) =>
-          fetchSessionBars(id, accumulator.spec, 0)
-        )
-      )
-      if (cancelled || id !== sessionIdRef.current) return
-      for (const frame of frames) {
-        projectionsBySpec.get(frame.spec)?.ingest(frame)
-      }
-
-      const status = await fetchSessionStatus(id)
-      if (cancelled || id !== sessionIdRef.current) return
-      seedClock(status.clock)
-      const cursor = status.feed.cursor ?? fallback?.cursor ?? null
-      if (cursor) seedCursor(cursor)
-    }
-
-    const requestResync = () => {
-      if (cancelled) return
-      // Initial hydration already covers resume signals delivered during page
-      // bootstrap. Only coalesce another pass once a live resync is in flight.
-      if (!established) return
-      if (resyncing) {
-        resumeRequested = true
-        return
-      }
-      const id = sessionIdRef.current
-      if (!id) return
-      resumeRequested = false
-      resyncing = true
-      buffering = true
-      void attachSession(id, rawId, REPLAY_SPECS)
-        .then(async (outcome) => {
-          if (!outcome.attached) {
-            throw new Error("The replay session is no longer active")
-          }
-          setOpen({ ...outcome.session, replaced: null })
-          seedClock(outcome.session.clock)
-          if (outcome.session.cursor) seedCursor(outcome.session.cursor)
-          await hydrate(id, outcome.session)
-          if (!cancelled) drainBuffer()
-        })
-        .catch((err) => {
-          if (cancelled) return
-          drainBuffer()
-          if (closed) return
-          setError(errorMessage(err))
-          setPhase("error")
-        })
-        .finally(() => {
-          resyncing = false
-          if (resumeRequested && !cancelled) requestResync()
-        })
-    }
-
-    const unsubscribeResume = subscribeHostResume(() => requestResync())
-
-    void establish()
-      .then(async ({ result, attached }) => {
-        if (cancelled) {
-          clearStoredSession(result.sessionId)
-          void closeSession(result.sessionId).catch(() => undefined)
-          return
-        }
-        sessionIdRef.current = result.sessionId
-        resumeCandidate = result.sessionId
-        storeSession(result.sessionId, rawId)
-        setOpen(result)
-        if (attached) {
-          seedClock(attached.clock)
-          if (attached.cursor) seedCursor(attached.cursor)
-        } else if (result.sessionStartNs) {
-          // Ledger clocks use absolute Unix nanoseconds. A new session starts at
-          // zero internally, so commit the market-session start before exposing
-          // controls; attach must never perform this seek.
-          await seekSession(result.sessionId, result.sessionStartNs)
-        }
-
-        await hydrate(result.sessionId, attached)
-        if (cancelled || result.sessionId !== sessionIdRef.current) return
-        drainBuffer()
-        established = true
-        if (closed) return
-        setPhase("live")
-        if (resumeRequested) requestResync()
-      })
-      .catch((err) => {
-        if (cancelled) return
-        drainBuffer()
-        if (closed) return
-        setError(errorMessage(err))
-        setPhase("error")
-      })
-
-    return () => {
-      cancelled = true
-      unsubscribe()
-      unsubscribeResume()
-      const id = sessionIdRef.current
-      sessionIdRef.current = null
-      // React cleanup is an intentional SPA exit (a document reload destroys
-      // the JS context without running it). Clear the capability synchronously
-      // before the fire-and-forget close so immediate re-entry always opens.
-      const closeId = id ?? resumeCandidate
-      if (closeId) {
-        clearStoredSession(closeId)
-        void closeSession(closeId).catch(() => undefined)
-      }
-    }
-  }, [rawId, routedSessionId, projections, projectionsBySpec])
-
-  const controls = useMemo<ReplayControls>(
-    () => ({
-      play: () => {
-        const id = sessionIdRef.current
-        if (id) void playSession(id).catch(logControlError("play"))
-      },
-      pause: () => {
-        const id = sessionIdRef.current
-        if (id) void pauseSession(id).catch(logControlError("pause"))
-      },
-      setSpeed: (speed) => {
-        const id = sessionIdRef.current
-        if (id) void setSessionSpeed(id, speed).catch(logControlError("speed"))
-      },
-      seek: (sessionNs) => {
-        const id = sessionIdRef.current
-        if (id) void seekSession(id, sessionNs).catch(logControlError("seek"))
-      },
-    }),
-    []
-  )
-
-  return {
-    phase,
-    open,
-    error,
-    endedReason,
-    clock: clockState?.clock ?? null,
-    clockReceivedAt: clockState?.receivedAt ?? null,
-    cursor,
-    projections,
-    controls,
-  }
-}
-
 function logControlError(control: string) {
   return (error: unknown) => console.warn(`[replay] ${control} failed`, error)
-}
-
-function isNewerCursor(next: Cursor, current: Cursor | null): boolean {
-  if (!current) return true
-  if (next.epoch !== current.epoch) return next.epoch > current.epoch
-  if (next.feedSeq !== current.feedSeq) return next.feedSeq > current.feedSeq
-  return next.batchIdx > current.batchIdx
 }
 
 function isOlderCursor(next: Cursor, current: Cursor | null): boolean {

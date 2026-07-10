@@ -47,6 +47,7 @@ class BarsLayer implements ChartLayer {
   private candles: ISeriesApi<"Candlestick"> | null = null
   private volume: ISeriesApi<"Histogram"> | null = null
   private unsubscribe: (() => void) | null = null
+  private paintFrame: number | null = null
 
   // Parallel to the accumulator's bars. sourceBars holds the accumulator array
   // by reference so the append check can compare element identity; the live bar
@@ -124,6 +125,10 @@ class BarsLayer implements ChartLayer {
   detach(): void {
     this.unsubscribe?.()
     this.unsubscribe = null
+    if (this.paintFrame !== null) {
+      cancelAnimationFrame(this.paintFrame)
+      this.paintFrame = null
+    }
     if (this.chart) {
       this.chart.unsubscribeCrosshairMove(this.onCrosshairMove)
       this.chart
@@ -155,11 +160,15 @@ class BarsLayer implements ChartLayer {
 
   // A rendering bug must degrade to a stale chart, never a white screen.
   private onPublish = (): void => {
-    try {
-      this.apply(this.ctx.accumulator.getSnapshot())
-    } catch (error) {
-      console.warn(`[replay] ${this.ctx.spec}: chart apply failed`, error)
-    }
+    if (this.paintFrame !== null) return
+    this.paintFrame = requestAnimationFrame(() => {
+      this.paintFrame = null
+      try {
+        this.apply(this.ctx.accumulator.getSnapshot())
+      } catch (error) {
+        console.warn(`[replay] ${this.ctx.spec}: chart apply failed`, error)
+      }
+    })
   }
 
   private apply(snap: BarsSnapshot): void {

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use cache::{ArrayKey, Cache, CellOwner, ValueKey};
+use cache::{ArrayKey, CacheReader, CellOwner, ValueKey};
 
 use crate::{
     ComponentError, ComponentId, ComponentWriteContext, ExternalWriteBatch, ExternalWriteSink,
@@ -41,7 +41,7 @@ pub struct TaskPrepareContext {
 impl TaskPrepareContext {
     pub(crate) fn new(
         component_id: ComponentId,
-        cache: Cache,
+        cache: CacheReader,
         writes: Option<ExternalWriteSink>,
     ) -> Self {
         let writes = match writes {
@@ -59,7 +59,7 @@ impl TaskPrepareContext {
         self.writes.owner()
     }
 
-    pub fn cache(&self) -> &Cache {
+    pub fn cache(&self) -> &CacheReader {
         self.writes.cache()
     }
 
@@ -105,7 +105,7 @@ pub struct TaskContext<'a> {
 impl<'a> TaskContext<'a> {
     pub(crate) fn new(
         component_id: ComponentId,
-        cache: Cache,
+        cache: CacheReader,
         wake: TaskWake,
         writes: crate::write::LocalComponentWriteSubmitter<'a>,
     ) -> Self {
@@ -121,7 +121,7 @@ impl<'a> TaskContext<'a> {
         self.writes.owner()
     }
 
-    pub fn cache(&self) -> &Cache {
+    pub fn cache(&self) -> &CacheReader {
         self.writes.cache()
     }
 

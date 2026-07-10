@@ -54,6 +54,15 @@ pub enum RuntimeError {
     #[error("runtime worker stopped")]
     RuntimeStopped,
 
+    #[error("runtime snapshot ingress closed")]
+    SnapshotIngressClosed,
+
+    #[error("runtime snapshot reader panicked")]
+    SnapshotPanicked,
+
+    #[error("runtime snapshot result type mismatch")]
+    SnapshotTypeMismatch,
+
     #[error("process `{id}` join failed: {message}")]
     ProcessJoin { id: ComponentId, message: String },
 

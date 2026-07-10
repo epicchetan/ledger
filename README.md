@@ -311,6 +311,9 @@ active feed-driven Session controller
 headless CLI session run
 Session WebSocket transport
 Lens Charts tab over Session WebSocket
+owner-executed atomic multi-cell snapshots
+projection-owned bounded-FPS delivery with seek barriers
+validated viewer base/head acknowledgments and targeted Remux streams
 local ReplayDataset cache
 study graph vision and phased implementation plan
 ```
@@ -325,12 +328,16 @@ Phase 2
   Add deterministic session-clock validation. Done.
 
 Phase 3
-  Expose Session over WebSocket. Implemented as transport over Ledger
-  Session/ProjectionFrame primitives. Done.
+  Expose Session over WebSocket with atomic projection snapshots and
+  subscription-scoped ProjectionFrames. Done.
 
 Phase 4
   Open Replay from Data Center and render bars:v1 ProjectionFrames in
-  the Lens Charts tab. Done.
+  the Lens Charts tab through validated base/head accumulators. Done.
+
+Phase 4.5
+  Decouple projection compute from delivery/render cadence, suppress explicit
+  seek catch-up frames, and target streams to their Remux viewer. Done.
 
 Phase 5+
   Product-driven projection expansion, first simple studies, journaling,

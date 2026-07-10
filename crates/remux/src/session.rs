@@ -1,15 +1,23 @@
 use crate::error::RpcError;
-use crate::rpc::{send_notification, OutboundSender};
-use ledger::clock::{ClockMode, ClockSnapshot};
+use crate::rpc::{send_notification, send_targeted_notification, OutboundSender};
+use ledger::clock::{ClockMode, ClockSnapshot, ClockState};
 use ledger::feed::es_replay::{
     es_replay_component_id, EsReplayCells, EsReplayCursor, EsReplayStatus,
 };
 use ledger::market::{MarketDay, PriceTicks};
+use ledger::projection::{
+    AppliedProjectionPosition, BarsDeliveryPosition, ProjectionDeliveryEvent,
+    ProjectionDeliveryFrame, ProjectionDeliverySemantics, ProjectionDemand,
+    ProjectionFrameOperation, ProjectionFramePayload, ProjectionFrameReason, ProjectionPosition,
+    ProjectionResumeMode, ProjectionSubscriptionProjectionRequest, ProjectionSubscriptionRequest,
+    ProjectionWatermark,
+};
 use ledger::projection::{Bar, BarsCells, BarsStatus, ProjectionSpec};
 use ledger::session::{LedgerSessionBuilder, LedgerSessionHandle};
+use runtime::RuntimeHandle;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use store::{RemoteStore, Store, StoreObjectDescriptor, StoreObjectId};
@@ -25,11 +33,17 @@ pub const SESSION_PAUSE_METHOD: &str = "remux/ledger/session/pause";
 pub const SESSION_SPEED_METHOD: &str = "remux/ledger/session/speed";
 pub const SESSION_SEEK_METHOD: &str = "remux/ledger/session/seek";
 pub const SESSION_BARS_METHOD: &str = "remux/ledger/session/bars";
+pub const SESSION_PROJECTIONS_SUBSCRIBE_METHOD: &str = "remux/ledger/session/projections/subscribe";
+pub const SESSION_PROJECTIONS_ACK_METHOD: &str = "remux/ledger/session/projections/ack";
+pub const SESSION_PROJECTIONS_DEMAND_METHOD: &str = "remux/ledger/session/projections/demand";
+pub const SESSION_PROJECTIONS_RESYNC_METHOD: &str = "remux/ledger/session/projections/resync";
 
 const SESSION_CLOSED_NOTIFICATION: &str = "remux/ledger/session/closed";
 const SESSION_CLOCK_NOTIFICATION: &str = "remux/ledger/session/clock";
 const SESSION_FEED_NOTIFICATION: &str = "remux/ledger/session/feed";
-const SESSION_BARS_FRAME_NOTIFICATION: &str = "remux/ledger/session/barsFrame";
+const SESSION_PROJECTION_FRAME_NOTIFICATION: &str = "remux/ledger/session/projections/frame";
+const SESSION_PROJECTION_WATERMARK_NOTIFICATION: &str =
+    "remux/ledger/session/projections/watermark";
 
 #[derive(Clone)]
 pub struct SessionRegistry {
@@ -45,12 +59,32 @@ struct ActiveSession {
     feed: EsReplayCells,
     projections: Vec<ActiveProjection>,
     watchers: Vec<JoinHandle<()>>,
+    projection_origins: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
 struct ActiveProjection {
     spec: String,
     cells: BarsCells,
+}
+
+struct SessionCacheStatusSnapshot {
+    clock: ClockSnapshot,
+    feed_status: Option<EsReplayStatus>,
+    feed_cursor: Option<EsReplayCursor>,
+    projections: Vec<ProjectionCacheStatusSnapshot>,
+}
+
+struct ProjectionCacheStatusSnapshot {
+    spec: String,
+    status: Option<BarsStatus>,
+    live_bar: bool,
+}
+
+struct BarsCacheSnapshot {
+    status: Option<BarsStatus>,
+    bars: Vec<Bar>,
+    live: Option<Bar>,
 }
 
 impl Default for SessionRegistry {
@@ -119,6 +153,7 @@ impl SessionRegistry {
             .start()
             .await
             .map_err(|err| RpcError::domain(err.to_string()))?;
+        let delivery_events = handle.take_projection_events();
         let session_id = self.allocate_id();
         {
             let mut active = self.active.lock().await;
@@ -129,6 +164,7 @@ impl SessionRegistry {
                 feed: feed.clone(),
                 projections: active_projections.clone(),
                 watchers: Vec::new(),
+                projection_origins: HashMap::new(),
             });
         }
 
@@ -137,6 +173,7 @@ impl SessionRegistry {
             output_tx.clone(),
             feed.clone(),
             active_projections.clone(),
+            delivery_events,
         );
         {
             let mut active = self.active.lock().await;
@@ -205,14 +242,26 @@ impl SessionRegistry {
                 session: None,
             });
         }
-        let clock = session
-            .handle
-            .clock_snapshot()
-            .map_err(|err| RpcError::domain(err.to_string()))?;
-        let cursor = session
-            .handle
-            .cache()
-            .read_value(&session.feed.cursor)
+        let runtime = session.handle.runtime().clone();
+        let clock_key = session.handle.clock_key().clone();
+        let cursor_key = session.feed.cursor.clone();
+        let session_id = session.id.clone();
+        let projection_specs = session
+            .projections
+            .iter()
+            .map(|projection| projection.spec.clone())
+            .collect::<Vec<_>>();
+        drop(active);
+        let (clock, cursor) = runtime
+            .snapshot(move |view| {
+                let clock = view
+                    .read_value(&clock_key)?
+                    .unwrap_or_else(ClockState::initial)
+                    .snapshot();
+                let cursor = view.read_value(&cursor_key)?;
+                Ok((clock, cursor))
+            })
+            .await
             .map_err(|err| RpcError::domain(err.to_string()))?;
         let descriptor = store
             .get_object(&raw_id)?
@@ -221,14 +270,11 @@ impl SessionRegistry {
         to_value(SessionAttachResultDto {
             attached: true,
             session: Some(SessionAttachSnapshotDto {
-                session_id: session.id.clone(),
+                session_id,
                 raw_id: raw_id.to_string(),
-                projections: session
-                    .projections
-                    .iter()
-                    .map(|projection| ProjectionDto {
-                        spec: projection.spec.clone(),
-                    })
+                projections: projection_specs
+                    .into_iter()
+                    .map(|spec| ProjectionDto { spec })
                     .collect(),
                 market_day: market_day.as_ref().map(MarketDay::to_string),
                 session_start_ns: session_bounds.map(|(start, _)| ns_string(start)),
@@ -261,61 +307,72 @@ impl SessionRegistry {
 
     pub async fn status(&self, params: Value) -> Result<Value, RpcError> {
         let params = parse_params::<SessionIdParams>(params)?;
-        let active = self.active.lock().await;
-        let session = matching_session(active.as_ref(), &params.session_id)?;
-        let clock = session
-            .handle
-            .clock_snapshot()
-            .map_err(|err| RpcError::domain(err.to_string()))?;
-        let component_status = session
-            .handle
-            .runtime()
+        let (runtime, clock_key, feed, projection_cells, session_id, raw_id) = {
+            let active = self.active.lock().await;
+            let session = matching_session(active.as_ref(), &params.session_id)?;
+            (
+                session.handle.runtime().clone(),
+                session.handle.clock_key().clone(),
+                session.feed.clone(),
+                session.projections.clone(),
+                session.id.clone(),
+                session.raw_id.to_string(),
+            )
+        };
+        let component_status = runtime
             .component_status(&es_replay_component_id())
             .await
             .map_err(|err| RpcError::domain(err.to_string()))?;
-        let feed_status = session
-            .handle
-            .cache()
-            .read_value(&session.feed.status)
+        let snapshot = runtime
+            .snapshot(move |view| {
+                let clock = view
+                    .read_value(&clock_key)?
+                    .unwrap_or_else(ClockState::initial)
+                    .snapshot();
+                let feed_status = view.read_value(&feed.status)?;
+                let feed_cursor = view.read_value(&feed.cursor)?;
+                let mut projections = Vec::with_capacity(projection_cells.len());
+                for projection in projection_cells {
+                    let status = view.read_value(&projection.cells.status)?;
+                    let live_bar = view.read_value(&projection.cells.live)?.is_some();
+                    projections.push(ProjectionCacheStatusSnapshot {
+                        spec: projection.spec,
+                        status,
+                        live_bar,
+                    });
+                }
+                Ok(SessionCacheStatusSnapshot {
+                    clock,
+                    feed_status,
+                    feed_cursor,
+                    projections,
+                })
+            })
+            .await
             .map_err(|err| RpcError::domain(err.to_string()))?;
-        let feed_cursor = session
-            .handle
-            .cache()
-            .read_value(&session.feed.cursor)
-            .map_err(|err| RpcError::domain(err.to_string()))?;
-        let mut projections = Vec::new();
-        for projection in &session.projections {
-            let status = session
-                .handle
-                .cache()
-                .read_value(&projection.cells.status)
-                .map_err(|err| RpcError::domain(err.to_string()))?;
-            let live_bar = session
-                .handle
-                .cache()
-                .read_value(&projection.cells.live)
-                .map_err(|err| RpcError::domain(err.to_string()))?
-                .is_some();
-            let completed_bars = status
+        let mut projections = Vec::with_capacity(snapshot.projections.len());
+        for projection in snapshot.projections {
+            let completed_bars = projection
+                .status
                 .as_ref()
                 .map(|status| status.completed_bars)
                 .unwrap_or_default();
             projections.push(ProjectionStatusDto {
-                spec: projection.spec.clone(),
-                status: status.map(BarsStatusDto::from),
+                spec: projection.spec,
+                status: projection.status.map(BarsStatusDto::from),
                 completed_bars,
-                live_bar,
+                live_bar: projection.live_bar,
             });
         }
 
         to_value(SessionStatusDto {
-            session_id: session.id.clone(),
-            raw_id: session.raw_id.to_string(),
-            clock: ClockSnapshotDto::from(clock),
+            session_id,
+            raw_id,
+            clock: ClockSnapshotDto::from(snapshot.clock),
             feed: FeedStatusDto {
                 component_status: component_status_string(component_status),
-                status: feed_status.map(EsReplayStatusDto::from),
-                cursor: feed_cursor.map(EsReplayCursorDto::from),
+                status: snapshot.feed_status.map(EsReplayStatusDto::from),
+                cursor: snapshot.feed_cursor.map(EsReplayCursorDto::from),
             },
             projections,
         })
@@ -374,21 +431,156 @@ impl SessionRegistry {
         let params = parse_params::<SessionBarsParams>(params)?;
         let from = params.from.unwrap_or_default();
         let canonical = parse_projection_spec(&params.spec)?.0;
-        let active = self.active.lock().await;
-        let session = matching_session(active.as_ref(), &params.session_id)?;
-        let projection = session
-            .projections
-            .iter()
-            .find(|projection| projection.spec == canonical)
-            .ok_or_else(|| unknown_projection(&params.spec))?;
+        let (runtime, session_id, projection) = {
+            let active = self.active.lock().await;
+            let session = matching_session(active.as_ref(), &params.session_id)?;
+            let projection = session
+                .projections
+                .iter()
+                .find(|projection| projection.spec == canonical)
+                .cloned()
+                .ok_or_else(|| unknown_projection(&params.spec))?;
+            (
+                session.handle.runtime().clone(),
+                session.id.clone(),
+                projection,
+            )
+        };
         let frame = read_bars_frame(
-            &session.handle,
-            &session.id,
+            &runtime,
+            &session_id,
             &projection.spec,
             &projection.cells,
             from,
-        )?;
+        )
+        .await?;
         to_value(frame)
+    }
+
+    pub async fn subscribe_projections(&self, params: Value) -> Result<Value, RpcError> {
+        let params = parse_params::<ProjectionSubscribeParams>(params)?;
+        let mut active = self.active.lock().await;
+        let session = matching_session(active.as_ref(), &params.session_id)?;
+        let delivery = session
+            .handle
+            .projection_delivery()
+            .ok_or_else(|| RpcError::domain("session has no projection delivery executor"))?;
+        let session_generation = delivery.session_generation();
+        let projections = params
+            .projections
+            .into_iter()
+            .map(|projection| {
+                let have = projection.have.map(|position| {
+                    ProjectionPosition::Bars(position.into_position(session_generation))
+                });
+                ProjectionSubscriptionProjectionRequest {
+                    spec: projection.spec,
+                    schema_versions: projection.schema_versions,
+                    requested_max_fps: projection.requested_max_fps,
+                    have,
+                }
+            })
+            .collect();
+        let response = delivery
+            .subscribe(ProjectionSubscriptionRequest {
+                consumer_instance_id: params.consumer_instance_id,
+                projections,
+            })
+            .await
+            .map_err(|err| RpcError::domain(err.to_string()))?;
+        if let Some(origin) = params.remux_origin {
+            let session = active
+                .as_mut()
+                .expect("matching active session remains present");
+            session
+                .projection_origins
+                .insert(response.subscription_id.clone(), origin);
+        }
+        to_value(ProjectionSubscribeResultDto::from(response))
+    }
+
+    pub async fn acknowledge_projections(&self, params: Value) -> Result<Value, RpcError> {
+        let params = parse_params::<ProjectionAckParams>(params)?;
+        let active = self.active.lock().await;
+        let session = active.as_ref().ok_or_else(|| unknown_session("active"))?;
+        validate_projection_origin(
+            session,
+            &params.subscription_id,
+            params.remux_origin.as_deref(),
+        )?;
+        let delivery = session
+            .handle
+            .projection_delivery()
+            .ok_or_else(|| RpcError::domain("session has no projection delivery executor"))?;
+        let generation = delivery.session_generation();
+        let applied = params
+            .applied
+            .into_iter()
+            .map(|applied| AppliedProjectionPosition {
+                spec: applied.spec,
+                head: ProjectionPosition::Bars(applied.head.into_position(generation)),
+            })
+            .collect();
+        delivery
+            .acknowledge(params.subscription_id, applied)
+            .await
+            .map_err(|err| RpcError::domain(err.to_string()))?;
+        ok()
+    }
+
+    pub async fn demand_projections(&self, params: Value) -> Result<Value, RpcError> {
+        let params = parse_params::<ProjectionDemandParams>(params)?;
+        let active = self.active.lock().await;
+        let session = active.as_ref().ok_or_else(|| unknown_session("active"))?;
+        validate_projection_origin(
+            session,
+            &params.subscription_id,
+            params.remux_origin.as_deref(),
+        )?;
+        let delivery = session
+            .handle
+            .projection_delivery()
+            .ok_or_else(|| RpcError::domain("session has no projection delivery executor"))?;
+        delivery
+            .demand(
+                params.subscription_id,
+                ProjectionDemand {
+                    active: params.active,
+                    requested_max_fps: params.requested_max_fps,
+                },
+            )
+            .await
+            .map_err(|err| RpcError::domain(err.to_string()))?;
+        ok()
+    }
+
+    pub async fn resync_projections(&self, params: Value) -> Result<Value, RpcError> {
+        let params = parse_params::<ProjectionResyncParams>(params)?;
+        let active = self.active.lock().await;
+        let session = active.as_ref().ok_or_else(|| unknown_session("active"))?;
+        validate_projection_origin(
+            session,
+            &params.subscription_id,
+            params.remux_origin.as_deref(),
+        )?;
+        let delivery = session
+            .handle
+            .projection_delivery()
+            .ok_or_else(|| RpcError::domain("session has no projection delivery executor"))?;
+        let generation = delivery.session_generation();
+        let applied = params
+            .applied
+            .into_iter()
+            .map(|applied| AppliedProjectionPosition {
+                spec: applied.spec,
+                head: ProjectionPosition::Bars(applied.head.into_position(generation)),
+            })
+            .collect();
+        delivery
+            .resync(params.subscription_id, applied, params.reason)
+            .await
+            .map_err(|err| RpcError::domain(err.to_string()))?;
+        ok()
     }
 
     async fn take_active(&self) -> Option<ActiveSession> {
@@ -414,6 +606,7 @@ impl SessionRegistry {
         output_tx: OutboundSender,
         feed: EsReplayCells,
         projections: Vec<ActiveProjection>,
+        delivery_events: Option<tokio::sync::mpsc::Receiver<ProjectionDeliveryEvent>>,
     ) -> Vec<JoinHandle<()>> {
         let mut watchers = Vec::new();
         watchers.push(tokio::spawn(watch_clock(
@@ -421,18 +614,24 @@ impl SessionRegistry {
             session_id.clone(),
             output_tx.clone(),
         )));
-        watchers.push(tokio::spawn(watch_feed(
-            self.active.clone(),
-            session_id.clone(),
-            output_tx.clone(),
-            feed,
-        )));
-        for projection in projections {
-            watchers.push(tokio::spawn(watch_bars(
+        let _ = projections;
+        if let Some(events) = delivery_events {
+            watchers.push(tokio::spawn(watch_projection_delivery(
                 self.active.clone(),
-                session_id.clone(),
-                output_tx.clone(),
-                projection,
+                session_id,
+                output_tx,
+                events,
+            )));
+        } else {
+            // Headless/legacy sessions still receive the direct cursor stream.
+            // Projection sessions carry cursor progress in the bounded-rate
+            // delivery watermark and must not serialize one notification per
+            // feed catch-up chunk.
+            watchers.push(tokio::spawn(watch_feed(
+                self.active.clone(),
+                session_id,
+                output_tx,
+                feed,
             )));
         }
         watchers
@@ -551,110 +750,67 @@ async fn watch_feed(
     }
 }
 
-async fn watch_bars(
+async fn watch_projection_delivery(
     active: Arc<Mutex<Option<ActiveSession>>>,
     session_id: String,
     output_tx: OutboundSender,
-    projection: ActiveProjection,
+    mut events: tokio::sync::mpsc::Receiver<ProjectionDeliveryEvent>,
 ) {
-    let cache = {
-        let active = active.lock().await;
-        match active.as_ref() {
-            Some(session) if session.id == session_id => session.handle.cache().clone(),
-            _ => return,
-        }
-    };
-    let mut watch = match cache.watch_key(projection.cells.status.key()) {
-        Ok(watch) => watch,
-        Err(error) => {
-            eprintln!("[ledger-remux] failed to watch session bars status: {error}");
-            return;
-        }
-    };
-    let mut sent_epoch = None;
-    let mut sent_count = 0usize;
-    loop {
-        let frame = {
-            let active = active.lock().await;
-            match active.as_ref() {
-                Some(session) if session.id == session_id => read_bars_frame_for_watcher(
-                    &session.handle,
-                    &session_id,
-                    &projection.spec,
-                    &projection.cells,
-                    &mut sent_epoch,
-                    &mut sent_count,
-                ),
-                _ => return,
+    while let Some(event) = events.recv().await {
+        if let ProjectionDeliveryEvent::SubscriptionExpired { subscription_id } = &event {
+            let mut active = active.lock().await;
+            if let Some(session) = active.as_mut().filter(|session| session.id == session_id) {
+                session.projection_origins.remove(subscription_id);
             }
+            continue;
+        }
+        let subscription_id = match &event {
+            ProjectionDeliveryEvent::Frame(frame) => frame.subscription_id.as_str(),
+            ProjectionDeliveryEvent::Watermark(watermark) => watermark.subscription_id.as_str(),
+            ProjectionDeliveryEvent::SubscriptionExpired { .. } => unreachable!(),
         };
-        match frame {
-            Ok(Some(frame)) => {
-                if let Err(error) =
-                    send_notification(&output_tx, SESSION_BARS_FRAME_NOTIFICATION, json!(frame))
-                        .await
-                {
-                    eprintln!("[ledger-remux] failed to broadcast session bars frame: {error}");
-                }
-            }
-            Ok(None) | Err(()) => {}
-        }
-        if watch.changed().await.is_err() {
+        let origin = {
+            let active = active.lock().await;
+            active
+                .as_ref()
+                .filter(|session| session.id == session_id)
+                .and_then(|session| session.projection_origins.get(subscription_id))
+                .cloned()
+        };
+        let (method, params) = match event {
+            ProjectionDeliveryEvent::Frame(frame) => (
+                SESSION_PROJECTION_FRAME_NOTIFICATION,
+                json!(ProjectionFrameDto::from(*frame)),
+            ),
+            ProjectionDeliveryEvent::Watermark(watermark) => (
+                SESSION_PROJECTION_WATERMARK_NOTIFICATION,
+                json!(ProjectionWatermarkDto::from(watermark)),
+            ),
+            ProjectionDeliveryEvent::SubscriptionExpired { .. } => unreachable!(),
+        };
+        let sent = match origin {
+            Some(origin) => send_targeted_notification(&output_tx, origin, method, params).await,
+            None => send_notification(&output_tx, method, params).await,
+        };
+        if let Err(error) = sent {
+            eprintln!("[ledger-remux] failed to broadcast projection delivery: {error}");
             return;
         }
     }
 }
 
-fn read_bars_frame_for_watcher(
-    handle: &LedgerSessionHandle,
-    session_id: &str,
-    spec: &str,
-    cells: &BarsCells,
-    sent_epoch: &mut Option<u64>,
-    sent_count: &mut usize,
-) -> Result<Option<BarsFrameDto>, ()> {
-    let status = handle.cache().read_value(&cells.status).map_err(|_| ())?;
-    let Some(status) = status else {
-        return Ok(None);
-    };
-    if *sent_epoch != Some(status.epoch) {
-        *sent_epoch = Some(status.epoch);
-        *sent_count = 0;
-    }
-    let from = *sent_count;
-    let bars = if status.completed_bars > from {
-        handle
-            .cache()
-            .read_array_range(&cells.bars, from..status.completed_bars)
-            .map_err(|_| ())?
-    } else {
-        Vec::new()
-    };
-    let live = handle.cache().read_value(&cells.live).map_err(|_| ())?;
-    *sent_count = status.completed_bars;
-    Ok(Some(BarsFrameDto {
-        session_id: session_id.to_string(),
-        spec: spec.to_string(),
-        epoch: status.epoch,
-        from,
-        bars: bars.into_iter().map(BarDto::from).collect(),
-        total: status.completed_bars,
-        live: live.map(BarDto::from),
-        status: BarsStatusDto::from(status),
-    }))
-}
-
-fn read_bars_frame(
-    handle: &LedgerSessionHandle,
+async fn read_bars_frame(
+    runtime: &RuntimeHandle,
     session_id: &str,
     spec: &str,
     cells: &BarsCells,
     from: usize,
 ) -> Result<BarsFrameDto, RpcError> {
-    let status = handle
-        .cache()
-        .read_value(&cells.status)
-        .map_err(|err| RpcError::domain(err.to_string()))?
+    let snapshot = collect_bars_snapshot(runtime, cells, from)
+        .await
+        .map_err(|err| RpcError::domain(err.to_string()))?;
+    let status = snapshot
+        .status
         .ok_or_else(|| RpcError::domain(format!("projection {spec} status unavailable")))?;
     if from > status.completed_bars {
         return Err(RpcError::invalid_params(format!(
@@ -662,28 +818,37 @@ fn read_bars_frame(
             status.completed_bars
         )));
     }
-    let bars = if status.completed_bars > from {
-        handle
-            .cache()
-            .read_array_range(&cells.bars, from..status.completed_bars)
-            .map_err(|err| RpcError::domain(err.to_string()))?
-    } else {
-        Vec::new()
-    };
-    let live = handle
-        .cache()
-        .read_value(&cells.live)
-        .map_err(|err| RpcError::domain(err.to_string()))?;
     Ok(BarsFrameDto {
         session_id: session_id.to_string(),
         spec: spec.to_string(),
         epoch: status.epoch,
         from,
-        bars: bars.into_iter().map(BarDto::from).collect(),
+        bars: snapshot.bars.into_iter().map(BarDto::from).collect(),
         total: status.completed_bars,
-        live: live.map(BarDto::from),
+        live: snapshot.live.map(BarDto::from),
         status: BarsStatusDto::from(status),
     })
+}
+
+async fn collect_bars_snapshot(
+    runtime: &RuntimeHandle,
+    cells: &BarsCells,
+    from: usize,
+) -> Result<BarsCacheSnapshot, runtime::RuntimeError> {
+    let cells = cells.clone();
+    runtime
+        .snapshot(move |view| {
+            let status = view.read_value(&cells.status)?;
+            let bars = match status.as_ref() {
+                Some(status) if from <= status.completed_bars => {
+                    view.read_array_range(&cells.bars, from..status.completed_bars)?
+                }
+                Some(_) | None => Vec::new(),
+            };
+            let live = view.read_value(&cells.live)?;
+            Ok(BarsCacheSnapshot { status, bars, live })
+        })
+        .await
 }
 
 fn parse_projection_specs(specs: Vec<String>) -> Result<Vec<(String, ProjectionSpec)>, RpcError> {
@@ -739,6 +904,23 @@ fn raw_session_calendar(
 
 fn unknown_projection(spec: &str) -> RpcError {
     RpcError::domain(format!("unknown projection spec {spec}"))
+}
+
+fn validate_projection_origin(
+    session: &ActiveSession,
+    subscription_id: &str,
+    request_origin: Option<&str>,
+) -> Result<(), RpcError> {
+    match (
+        session.projection_origins.get(subscription_id),
+        request_origin,
+    ) {
+        (Some(expected), Some(actual)) if expected == actual => Ok(()),
+        (None, None) => Ok(()),
+        (Some(_), None) | (Some(_), Some(_)) | (None, Some(_)) => Err(RpcError::domain(format!(
+            "unknown projection subscription {subscription_id}"
+        ))),
+    }
 }
 
 async fn send_session_closed(output_tx: &OutboundSender, session_id: &str, reason: &str) {
@@ -868,6 +1050,61 @@ struct SessionBarsParams {
     from: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectionSubscribeParams {
+    session_id: String,
+    consumer_instance_id: String,
+    projections: Vec<ProjectionSubscribeProjectionParams>,
+    #[serde(rename = "_remuxOrigin")]
+    remux_origin: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectionSubscribeProjectionParams {
+    spec: String,
+    schema_versions: Vec<u16>,
+    requested_max_fps: Option<u16>,
+    have: Option<BarsPositionDto>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectionAckParams {
+    subscription_id: String,
+    applied: Vec<ProjectionAppliedParams>,
+    #[serde(rename = "_remuxOrigin")]
+    remux_origin: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectionAppliedParams {
+    spec: String,
+    head: BarsPositionDto,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectionDemandParams {
+    subscription_id: String,
+    active: bool,
+    requested_max_fps: Option<u16>,
+    #[serde(rename = "_remuxOrigin")]
+    remux_origin: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectionResyncParams {
+    subscription_id: String,
+    applied: Vec<ProjectionAppliedParams>,
+    reason: String,
+    #[serde(rename = "_remuxOrigin")]
+    remux_origin: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionOpenResultDto {
@@ -917,6 +1154,165 @@ struct SessionCloseResultDto {
 #[serde(rename_all = "camelCase")]
 struct OkDto {
     ok: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectionSubscribeResultDto {
+    subscription_id: String,
+    session_generation: u64,
+    lease_ms: u64,
+    projections: Vec<ProjectionSubscribeProjectionResultDto>,
+}
+
+impl From<ledger::projection::ProjectionSubscriptionResponse> for ProjectionSubscribeResultDto {
+    fn from(response: ledger::projection::ProjectionSubscriptionResponse) -> Self {
+        Self {
+            subscription_id: response.subscription_id,
+            session_generation: response.session_generation,
+            lease_ms: response.lease_ms,
+            projections: response
+                .projections
+                .into_iter()
+                .map(|projection| ProjectionSubscribeProjectionResultDto {
+                    spec: projection.spec,
+                    kind: projection.kind,
+                    schema_version: projection.schema_version,
+                    semantics: semantics_string(projection.semantics),
+                    effective_max_fps: projection.effective_max_fps,
+                    resume: resume_string(projection.resume),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectionSubscribeProjectionResultDto {
+    spec: String,
+    kind: &'static str,
+    schema_version: u16,
+    semantics: &'static str,
+    effective_max_fps: u16,
+    resume: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BarsPositionDto {
+    epoch: u64,
+    projection_revision: u64,
+    processed_batches: usize,
+    completed_bars: usize,
+}
+
+impl BarsPositionDto {
+    fn into_position(self, session_generation: u64) -> BarsDeliveryPosition {
+        BarsDeliveryPosition {
+            session_generation,
+            epoch: self.epoch,
+            projection_revision: self.projection_revision,
+            processed_batches: self.processed_batches,
+            completed_bars: self.completed_bars,
+        }
+    }
+}
+
+impl From<ProjectionPosition> for BarsPositionDto {
+    fn from(position: ProjectionPosition) -> Self {
+        match position {
+            ProjectionPosition::Bars(position) => Self {
+                epoch: position.epoch,
+                projection_revision: position.projection_revision,
+                processed_batches: position.processed_batches,
+                completed_bars: position.completed_bars,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectionFrameDto {
+    subscription_id: String,
+    session_generation: u64,
+    spec: String,
+    kind: &'static str,
+    schema_version: u16,
+    frame_sequence: u64,
+    base: Option<BarsPositionDto>,
+    head: BarsPositionDto,
+    operation: &'static str,
+    reason: &'static str,
+    payload: BarsDeliveryPayloadDto,
+}
+
+impl From<ProjectionDeliveryFrame> for ProjectionFrameDto {
+    fn from(frame: ProjectionDeliveryFrame) -> Self {
+        let payload = match frame.payload {
+            ProjectionFramePayload::Bars(payload) => BarsDeliveryPayloadDto {
+                bars: payload.bars.into_iter().map(BarDto::from).collect(),
+                live: payload.live.map(BarDto::from),
+                status: BarsStatusDto::from(payload.status),
+            },
+        };
+        Self {
+            subscription_id: frame.subscription_id,
+            session_generation: frame.session_generation,
+            spec: frame.spec,
+            kind: frame.kind,
+            schema_version: frame.schema_version,
+            frame_sequence: frame.frame_sequence,
+            base: frame.base.map(BarsPositionDto::from),
+            head: BarsPositionDto::from(frame.head),
+            operation: operation_string(frame.operation),
+            reason: reason_string(frame.reason),
+            payload,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BarsDeliveryPayloadDto {
+    bars: Vec<BarDto>,
+    live: Option<BarDto>,
+    status: BarsStatusDto,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectionWatermarkDto {
+    subscription_id: String,
+    session_generation: u64,
+    feed: Option<EsReplayCursorDto>,
+    projections: Vec<ProjectionWatermarkEntryDto>,
+}
+
+impl From<ProjectionWatermark> for ProjectionWatermarkDto {
+    fn from(watermark: ProjectionWatermark) -> Self {
+        Self {
+            subscription_id: watermark.subscription_id,
+            session_generation: watermark.session_generation,
+            feed: watermark.feed.map(EsReplayCursorDto::from),
+            projections: watermark
+                .projections
+                .into_iter()
+                .map(|projection| ProjectionWatermarkEntryDto {
+                    spec: projection.spec,
+                    head: BarsPositionDto::from(projection.position),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectionWatermarkEntryDto {
+    spec: String,
+    head: BarsPositionDto,
 }
 
 #[derive(Debug, Serialize)]
@@ -1025,6 +1421,7 @@ pub struct BarsStatusDto {
     epoch: u64,
     processed_batches: usize,
     completed_bars: usize,
+    revision: u64,
     last_ts_event_ns: Option<String>,
 }
 
@@ -1035,8 +1432,44 @@ impl From<BarsStatus> for BarsStatusDto {
             epoch: status.epoch,
             processed_batches: status.processed_batches,
             completed_bars: status.completed_bars,
+            revision: status.revision,
             last_ts_event_ns: status.last_ts_event_ns.map(ns_string),
         }
+    }
+}
+
+fn semantics_string(semantics: ProjectionDeliverySemantics) -> &'static str {
+    match semantics {
+        ProjectionDeliverySemantics::ReplaceLatest => "replaceLatest",
+        ProjectionDeliverySemantics::AppendOrdered => "appendOrdered",
+        ProjectionDeliverySemantics::AppendOrderedWithLatest => "appendOrderedWithLatestLive",
+        ProjectionDeliverySemantics::PatchByKey => "patchByKey",
+        ProjectionDeliverySemantics::Snapshot => "snapshot",
+    }
+}
+
+fn resume_string(resume: ProjectionResumeMode) -> &'static str {
+    match resume {
+        ProjectionResumeMode::Snapshot => "snapshot",
+        ProjectionResumeMode::Suffix => "suffix",
+    }
+}
+
+fn operation_string(operation: ProjectionFrameOperation) -> &'static str {
+    match operation {
+        ProjectionFrameOperation::Snapshot => "snapshot",
+        ProjectionFrameOperation::Append => "append",
+        ProjectionFrameOperation::Replace => "replace",
+        ProjectionFrameOperation::Patch => "patch",
+    }
+}
+
+fn reason_string(reason: ProjectionFrameReason) -> &'static str {
+    match reason {
+        ProjectionFrameReason::Initial => "initial",
+        ProjectionFrameReason::Cadence => "cadence",
+        ProjectionFrameReason::Resync => "resync",
+        ProjectionFrameReason::SeekFinal => "seekFinal",
     }
 }
 
@@ -1338,30 +1771,28 @@ mod tests {
         .await;
         assert_eq!(clock["clock"]["mode"], "paused");
 
-        let feed = wait_notification(
-            &mut fixture.output_rx,
-            SESSION_FEED_NOTIFICATION,
-            |params| {
-                params["sessionId"].as_str() == Some(session_id.as_str())
-                    && params["cursor"]["ended"].as_bool() == Some(true)
-            },
-        )
-        .await;
-        let batch_idx = feed["cursor"]["batchIdx"].as_u64().unwrap();
-        let frame = wait_notification(
-            &mut fixture.output_rx,
-            SESSION_BARS_FRAME_NOTIFICATION,
-            |params| {
-                params["sessionId"].as_str() == Some(session_id.as_str())
-                    && params["spec"].as_str() == Some("bars:1s")
-                    && params["status"]["processedBatches"].as_u64() == Some(batch_idx)
-                    && params["total"].as_u64() == Some(3)
-            },
-        )
-        .await;
+        let frame = projection_frame_as_legacy(
+            wait_notification(
+                &mut fixture.output_rx,
+                SESSION_PROJECTION_FRAME_NOTIFICATION,
+                |params| {
+                    params["spec"].as_str() == Some("bars:1s")
+                        && params["head"]["completedBars"].as_u64() == Some(3)
+                },
+            )
+            .await,
+        );
 
+        let session_status = status(&fixture.methods, &session_id).await;
+        let batch_idx = session_status["feed"]["cursor"]["batchIdx"]
+            .as_u64()
+            .unwrap();
         let cache_bars = direct_bars(&fixture.methods, "bars:1s").await;
         assert_eq!(cache_bars.len(), 3);
+        assert_eq!(
+            frame["status"]["processedBatches"].as_u64(),
+            Some(batch_idx)
+        );
         assert_eq!(frame["from"], 0);
         assert_eq!(frame["bars"].as_array().unwrap().len(), cache_bars.len());
         assert_eq!(frame["bars"][0]["open"], 100);
@@ -1370,6 +1801,77 @@ mod tests {
         assert_eq!(frame["bars"][0]["buyVolume"], 2);
         assert_eq!(frame["bars"][0]["sellVolume"], 3);
         assert_eq!(frame["live"]["intervalStartNs"], "3000000000");
+    }
+
+    #[tokio::test]
+    async fn projection_notifications_preserve_the_remux_origin_for_targeted_delivery() {
+        let mut fixture = remux_fixture();
+        let raw_id = fabricate_prepared_day(&fixture.store, sample_events())
+            .await
+            .0;
+        let opened = open_session(&fixture.methods, &raw_id, vec!["bars:1s"]).await;
+        let session_id = opened["sessionId"].as_str().unwrap();
+        let subscribed = call(
+            &fixture.methods,
+            SESSION_PROJECTIONS_SUBSCRIBE_METHOD,
+            json!({
+                "sessionId": session_id,
+                "consumerInstanceId": "targeted-consumer",
+                "projections": [{
+                    "spec": "bars:1s",
+                    "schemaVersions": [1],
+                    "requestedMaxFps": 20,
+                    "have": null
+                }],
+                "_remuxOrigin": "opaque-remux-origin"
+            }),
+        )
+        .await
+        .unwrap();
+        let subscription_id = subscribed["subscriptionId"].as_str().unwrap();
+
+        let wrong_origin = call(
+            &fixture.methods,
+            SESSION_PROJECTIONS_DEMAND_METHOD,
+            json!({
+                "subscriptionId": subscription_id,
+                "active": false,
+                "requestedMaxFps": 5,
+                "_remuxOrigin": "another-remux-origin"
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(wrong_origin
+            .message
+            .contains("unknown projection subscription"));
+
+        call(
+            &fixture.methods,
+            SESSION_PROJECTIONS_DEMAND_METHOD,
+            json!({
+                "subscriptionId": subscription_id,
+                "active": true,
+                "requestedMaxFps": 20,
+                "_remuxOrigin": "opaque-remux-origin"
+            }),
+        )
+        .await
+        .unwrap();
+
+        let notification = timeout(WAKE, async {
+            loop {
+                let value = next_json(&mut fixture.output_rx).await;
+                if value["method"] == SESSION_PROJECTION_FRAME_NOTIFICATION
+                    && value["params"]["subscriptionId"].as_str() == Some(subscription_id)
+                {
+                    return value;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(notification["remuxTarget"]["origin"], "opaque-remux-origin");
     }
 
     #[tokio::test]
@@ -1450,17 +1952,18 @@ mod tests {
         assert_eq!(frame_starts(&full), vec!["0", "1000000000", "2000000000"]);
 
         seek(&fixture.methods, &session_id, 1_750_000_000).await;
-        let regressed = wait_notification(
-            &mut fixture.output_rx,
-            SESSION_BARS_FRAME_NOTIFICATION,
-            |params| {
-                params["sessionId"].as_str() == Some(session_id.as_str())
-                    && params["epoch"].as_u64() == Some(1)
-                    && params["from"].as_u64() == Some(0)
-                    && params["total"].as_u64() == Some(1)
-            },
-        )
-        .await;
+        let regressed = projection_frame_as_legacy(
+            wait_notification(
+                &mut fixture.output_rx,
+                SESSION_PROJECTION_FRAME_NOTIFICATION,
+                |params| {
+                    params["head"]["epoch"].as_u64() == Some(1)
+                        && params["base"].is_null()
+                        && params["head"]["completedBars"].as_u64() == Some(1)
+                },
+            )
+            .await,
+        );
         assert_eq!(frame_starts(&regressed), vec!["0"]);
         assert_eq!(
             direct_bar_starts(&fixture.methods, "bars:1s").await,
@@ -1468,17 +1971,18 @@ mod tests {
         );
 
         seek(&fixture.methods, &session_id, 3_500_000_000).await;
-        let reemitted = wait_notification(
-            &mut fixture.output_rx,
-            SESSION_BARS_FRAME_NOTIFICATION,
-            |params| {
-                params["sessionId"].as_str() == Some(session_id.as_str())
-                    && params["epoch"].as_u64() == Some(1)
-                    && params["from"].as_u64() == Some(1)
-                    && params["total"].as_u64() == Some(3)
-            },
-        )
-        .await;
+        let reemitted = projection_frame_as_legacy(
+            wait_notification(
+                &mut fixture.output_rx,
+                SESSION_PROJECTION_FRAME_NOTIFICATION,
+                |params| {
+                    params["head"]["epoch"].as_u64() == Some(1)
+                        && params["base"]["completedBars"].as_u64() == Some(1)
+                        && params["head"]["completedBars"].as_u64() == Some(3)
+                },
+            )
+            .await,
+        );
         let mut starts = frame_starts(&regressed);
         starts.extend(frame_starts(&reemitted));
         assert_eq!(starts, vec!["0", "1000000000", "2000000000"]);
@@ -1951,7 +2455,7 @@ mod tests {
         raw_id: &StoreObjectId,
         projections: Vec<&str>,
     ) -> Value {
-        call(
+        let opened = call(
             methods,
             SESSION_OPEN_METHOD,
             json!({
@@ -1960,7 +2464,36 @@ mod tests {
             }),
         )
         .await
-        .unwrap()
+        .unwrap();
+        let session_id = opened["sessionId"].as_str().unwrap();
+        let projections = opened["projections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|projection| projection["spec"].as_str())
+            .map(|spec| {
+                json!({
+                    "spec": spec,
+                    "schemaVersions": [1],
+                    "requestedMaxFps": 20,
+                    "have": null
+                })
+            })
+            .collect::<Vec<_>>();
+        if !projections.is_empty() {
+            call(
+                methods,
+                SESSION_PROJECTIONS_SUBSCRIBE_METHOD,
+                json!({
+                    "sessionId": session_id,
+                    "consumerInstanceId": format!("test-{session_id}"),
+                    "projections": projections
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        opened
     }
 
     async fn open_session_id(
@@ -2049,12 +2582,13 @@ mod tests {
         epoch: u64,
         total: usize,
     ) -> Value {
-        wait_notification(output_rx, SESSION_BARS_FRAME_NOTIFICATION, |params| {
-            params["sessionId"].as_str() == Some(session_id)
-                && params["epoch"].as_u64() == Some(epoch)
-                && params["total"].as_u64() == Some(total as u64)
+        let _ = session_id;
+        let frame = wait_notification(output_rx, SESSION_PROJECTION_FRAME_NOTIFICATION, |params| {
+            params["head"]["epoch"].as_u64() == Some(epoch)
+                && params["head"]["completedBars"].as_u64() == Some(total as u64)
         })
-        .await
+        .await;
+        projection_frame_as_legacy(frame)
     }
 
     async fn wait_bars_processed_count(
@@ -2063,16 +2597,16 @@ mod tests {
         spec: &str,
         processed_batches: usize,
     ) -> usize {
+        let _ = session_id;
         timeout(WAKE, async {
             let mut frame_count = 0usize;
             loop {
                 let value = next_json(output_rx).await;
-                if value["method"] == SESSION_BARS_FRAME_NOTIFICATION
-                    && value["params"]["sessionId"].as_str() == Some(session_id)
+                if value["method"] == SESSION_PROJECTION_FRAME_NOTIFICATION
                     && value["params"]["spec"].as_str() == Some(spec)
                 {
                     frame_count += 1;
-                    if value["params"]["status"]["processedBatches"].as_u64()
+                    if value["params"]["payload"]["status"]["processedBatches"].as_u64()
                         == Some(processed_batches as u64)
                     {
                         return frame_count;
@@ -2107,16 +2641,13 @@ mod tests {
                         );
                         return;
                     }
-                    Some(SESSION_BARS_FRAME_NOTIFICATION)
-                        if value["params"]["sessionId"].as_str() == Some(session_id) =>
+                    Some(SESSION_PROJECTION_FRAME_NOTIFICATION)
+                        if value["params"]["payload"]["status"]["processedBatches"].as_u64()
+                            == Some(processed_batches as u64) =>
                     {
-                        if value["params"]["status"]["processedBatches"].as_u64()
-                            == Some(processed_batches as u64)
-                        {
-                            if let Some(spec) = value["params"]["spec"].as_str() {
-                                if expected.contains(spec) {
-                                    converged.insert(spec.to_string());
-                                }
+                        if let Some(spec) = value["params"]["spec"].as_str() {
+                            if expected.contains(spec) {
+                                converged.insert(spec.to_string());
                             }
                         }
                     }
@@ -2214,6 +2745,19 @@ mod tests {
             .iter()
             .map(|bar| bar["intervalStartNs"].as_str().unwrap().to_string())
             .collect()
+    }
+
+    fn projection_frame_as_legacy(frame: Value) -> Value {
+        let from = frame["base"]["completedBars"].as_u64().unwrap_or(0);
+        json!({
+            "spec": frame["spec"],
+            "epoch": frame["head"]["epoch"],
+            "from": from,
+            "bars": frame["payload"]["bars"],
+            "total": frame["head"]["completedBars"],
+            "live": frame["payload"]["live"],
+            "status": frame["payload"]["status"],
+        })
     }
 
     async fn fabricate_prepared_day<S>(

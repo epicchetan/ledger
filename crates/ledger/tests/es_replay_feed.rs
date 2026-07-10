@@ -85,7 +85,7 @@ async fn feed_treats_missing_clock_value_as_paused_at_zero_and_emits_nothing() {
 }
 
 #[tokio::test]
-async fn feed_emits_nothing_while_paused_before_its_data() {
+async fn feed_acknowledges_paused_clock_without_emitting_data() {
     let direct = DirectFeed::start(vec![event(100, 1)]).await;
     let mut cursor_watch = direct.cursor_watch;
 
@@ -96,7 +96,25 @@ async fn feed_emits_nothing_while_paused_before_its_data() {
     )
     .await;
 
-    assert!(timeout(PARK, cursor_watch.changed()).await.is_err());
+    timeout(PARK, cursor_watch.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    let cursor = direct
+        .cache
+        .read_value(&direct.cells.cursor)
+        .unwrap()
+        .unwrap();
+    assert_eq!(cursor.feed_seq, 0);
+    assert_eq!(cursor.batch_idx, 0);
+    let status = direct
+        .cache
+        .read_value(&direct.cells.status)
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.clock.revision, 1);
+    assert_eq!(status.clock.session_now_ns, 99);
+    assert_eq!(status.cursor, cursor);
     assert!(direct
         .cache
         .read_array(&direct.cells.batches)

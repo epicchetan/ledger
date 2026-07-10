@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use cache::{ArrayKey, Cache, CellOwner, ValueKey};
+use cache::{ArrayKey, CacheReader, CellOwner, ValueKey};
 use tokio::sync::watch;
 
 use crate::{
@@ -61,7 +61,7 @@ pub struct ProcessPrepareContext {
 impl ProcessPrepareContext {
     pub(crate) fn new(
         component_id: ComponentId,
-        cache: Cache,
+        cache: CacheReader,
         writes: ExternalWriteSink,
         shutdown: ShutdownReceiver,
     ) -> Self {
@@ -77,7 +77,7 @@ impl ProcessPrepareContext {
         self.writes.owner()
     }
 
-    pub fn cache(&self) -> &Cache {
+    pub fn cache(&self) -> &CacheReader {
         self.writes.cache()
     }
 
@@ -127,7 +127,7 @@ pub struct ProcessContext {
 impl ProcessContext {
     pub(crate) fn new(
         component_id: ComponentId,
-        cache: Cache,
+        cache: CacheReader,
         writes: ExternalWriteSink,
         shutdown: ShutdownReceiver,
     ) -> Self {
@@ -143,7 +143,7 @@ impl ProcessContext {
         self.writes.owner()
     }
 
-    pub fn cache(&self) -> &Cache {
+    pub fn cache(&self) -> &CacheReader {
         self.writes.cache()
     }
 

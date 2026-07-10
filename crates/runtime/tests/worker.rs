@@ -94,6 +94,33 @@ struct WakeAgainChainTask {
     first_step: Option<Arc<Notify>>,
 }
 
+struct TwoCommitTask {
+    descriptor: TaskDescriptor,
+    first: ValueKey<i32>,
+    second: ValueKey<i32>,
+    first_committed: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl RuntimeTask for TwoCommitTask {
+    fn descriptor(&self) -> &TaskDescriptor {
+        &self.descriptor
+    }
+
+    async fn run_once(&mut self, ctx: TaskContext<'_>) -> Result<TaskOutcome, ComponentError> {
+        let mut first = ctx.batch();
+        first.set_value(&self.first, 1);
+        ctx.submit(first).await?;
+        self.first_committed.notify_one();
+        self.release.notified().await;
+        let mut second = ctx.batch();
+        second.set_value(&self.second, 1);
+        ctx.submit(second).await?;
+        Ok(TaskOutcome::Idle)
+    }
+}
+
 #[async_trait]
 impl RuntimeTask for WakeAgainChainTask {
     fn descriptor(&self) -> &TaskDescriptor {
@@ -537,4 +564,192 @@ async fn worker_rejects_duplicate_component_ids_across_processes_and_tasks() {
     assert!(matches!(err, runtime::RuntimeError::DuplicateComponent(found) if found == id));
     handle.shutdown().await.unwrap();
     worker_join.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn snapshots_never_observe_half_of_one_external_write_batch() {
+    let cache = Cache::new();
+    let owner = CellOwner::new("session").unwrap();
+    let first = cache
+        .register_value(
+            descriptor("session.first", owner.clone(), CellKind::Value),
+            Some(0_i32),
+        )
+        .unwrap();
+    let second = cache
+        .register_value(
+            descriptor("session.second", owner.clone(), CellKind::Value),
+            Some(0_i32),
+        )
+        .unwrap();
+    let (worker, handle) = RuntimeWorker::new(cache);
+    let worker_join = tokio::spawn(worker.run());
+
+    for value in 1..=256 {
+        let mut batch = runtime::ExternalWriteBatch::new(owner.clone());
+        batch.set_value(&first, value).set_value(&second, value);
+        handle.submit_external_writes(batch).await.unwrap();
+        let first_key = first.clone();
+        let second_key = second.clone();
+        let pair = handle
+            .snapshot(move |view| {
+                Ok((
+                    view.read_value(&first_key)?.unwrap(),
+                    view.read_value(&second_key)?.unwrap(),
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(pair.0, pair.1);
+    }
+
+    let metrics = handle.snapshot_metrics();
+    assert_eq!(metrics.requests, 256);
+    assert_eq!(metrics.completed, 256);
+    handle.shutdown().await.unwrap();
+    worker_join.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn snapshot_waits_until_a_task_step_with_multiple_local_commits_finishes() {
+    let cache = Cache::new();
+    let task_id = component_id("task.two_commit");
+    let first = cache
+        .register_value(
+            descriptor("task.two_commit.first", task_id.owner(), CellKind::Value),
+            Some(0_i32),
+        )
+        .unwrap();
+    let second = cache
+        .register_value(
+            descriptor("task.two_commit.second", task_id.owner(), CellKind::Value),
+            Some(0_i32),
+        )
+        .unwrap();
+    let first_committed = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let (worker, handle) = RuntimeWorker::new(cache);
+    let worker_join = tokio::spawn(worker.run());
+    handle
+        .install_task(TwoCommitTask {
+            descriptor: TaskDescriptor::new(task_id.clone(), Vec::new()),
+            first: first.clone(),
+            second: second.clone(),
+            first_committed: first_committed.clone(),
+            release: release.clone(),
+        })
+        .await
+        .unwrap();
+
+    let queued = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.queue_task(&task_id).await })
+    };
+    first_committed.notified().await;
+    let snapshot = {
+        let handle = handle.clone();
+        let first = first.clone();
+        let second = second.clone();
+        tokio::spawn(async move {
+            handle
+                .snapshot(move |view| {
+                    Ok((
+                        view.read_value(&first)?.unwrap(),
+                        view.read_value(&second)?.unwrap(),
+                    ))
+                })
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(!snapshot.is_finished());
+    release.notify_one();
+
+    assert_eq!(snapshot.await.unwrap().unwrap(), (1, 1));
+    queued.await.unwrap().unwrap();
+    handle.shutdown().await.unwrap();
+    worker_join.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn snapshots_are_served_between_wake_again_steps() {
+    let cache = Cache::new();
+    let task_id = component_id("task.snapshot_chain");
+    let done = cache
+        .register_value(
+            descriptor("task.snapshot_chain.done", task_id.owner(), CellKind::Value),
+            Some(false),
+        )
+        .unwrap();
+    let first_step = Arc::new(Notify::new());
+    let (worker, handle) = RuntimeWorker::new(cache);
+    let worker_join = tokio::spawn(worker.run());
+    handle
+        .install_task(WakeAgainChainTask {
+            descriptor: TaskDescriptor::new(task_id.clone(), Vec::new()),
+            remaining_wakes: 20_000,
+            done: done.clone(),
+            first_step: Some(first_step.clone()),
+        })
+        .await
+        .unwrap();
+    let queued = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.queue_task(&task_id).await })
+    };
+    first_step.notified().await;
+    let observed_done = handle
+        .snapshot(move |view| Ok(view.read_value(&done)?.unwrap()))
+        .await
+        .unwrap();
+    assert!(
+        !observed_done,
+        "snapshot should run before the chain converges"
+    );
+
+    queued.await.unwrap().unwrap();
+    handle.shutdown().await.unwrap();
+    worker_join.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn snapshot_panic_is_reported_without_stopping_the_runtime() {
+    let cache = Cache::new();
+    let owner = CellOwner::new("session").unwrap();
+    let value = cache
+        .register_value(
+            descriptor("session.snapshot_value", owner, CellKind::Value),
+            Some(7_i32),
+        )
+        .unwrap();
+    let (worker, handle) = RuntimeWorker::new(cache);
+    let worker_join = tokio::spawn(worker.run());
+
+    let error = handle
+        .snapshot::<(), _>(|_| panic!("forced snapshot panic"))
+        .await
+        .unwrap_err();
+    assert_eq!(error, runtime::RuntimeError::SnapshotPanicked);
+    let read = handle
+        .snapshot(move |view| Ok(view.read_value(&value)?.unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(read, 7);
+    assert_eq!(handle.snapshot_metrics().panicked, 1);
+
+    handle.shutdown().await.unwrap();
+    worker_join.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn snapshot_requests_are_rejected_after_shutdown() {
+    let cache = Cache::new();
+    let (worker, handle) = RuntimeWorker::new(cache);
+    let worker_join = tokio::spawn(worker.run());
+    handle.shutdown().await.unwrap();
+    worker_join.await.unwrap().unwrap();
+
+    let error = handle.snapshot(|_| Ok(())).await.unwrap_err();
+    assert_eq!(error, runtime::RuntimeError::SnapshotIngressClosed);
+    assert_eq!(handle.snapshot_metrics().rejected, 1);
 }

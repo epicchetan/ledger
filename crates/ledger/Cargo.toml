@@ -22,3 +22,4 @@ tokio.workspace = true
 [dev-dependencies]
 store = { path = "../store", features = ["test-util"] }
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

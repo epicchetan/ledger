@@ -31,6 +31,7 @@ export interface BarsStatus {
   epoch: number
   processedBatches: number
   completedBars: number
+  revision: number
   lastTsEventNs: string | null
 }
 
@@ -58,6 +59,77 @@ export interface BarsFrame {
   live: Bar | null
   status: BarsStatus
 }
+
+export interface BarsPosition {
+  epoch: number
+  projectionRevision: number
+  processedBatches: number
+  completedBars: number
+}
+
+export type ProjectionFrameOperation = "snapshot" | "append" | "replace" | "patch"
+export type ProjectionFrameReason = "initial" | "cadence" | "resync" | "seekFinal"
+
+export interface BarsProjectionPayload {
+  bars: Bar[]
+  live: Bar | null
+  status: BarsStatus
+}
+
+export interface BarsProjectionFrame {
+  subscriptionId: string
+  sessionGeneration: number
+  spec: string
+  kind: "bars"
+  schemaVersion: 1
+  frameSequence: number
+  base: BarsPosition | null
+  head: BarsPosition
+  operation: ProjectionFrameOperation
+  reason: ProjectionFrameReason
+  payload: BarsProjectionPayload
+}
+
+export interface ProjectionWatermarkEntry {
+  spec: string
+  head: BarsPosition
+}
+
+export interface ProjectionWatermark {
+  subscriptionId: string
+  sessionGeneration: number
+  feed: Cursor | null
+  projections: ProjectionWatermarkEntry[]
+}
+
+export interface ProjectionSubscribeRequest {
+  spec: string
+  schemaVersions: number[]
+  requestedMaxFps: number
+  have: BarsPosition | null
+}
+
+export interface ProjectionSubscribeResult {
+  subscriptionId: string
+  sessionGeneration: number
+  leaseMs: number
+  projections: Array<{
+    spec: string
+    kind: string
+    schemaVersion: number
+    semantics: string
+    effectiveMaxFps: number
+    resume: "snapshot" | "suffix"
+  }>
+}
+
+export type ProjectionDeliveryState =
+  | "current"
+  | "projection_catching_up"
+  | "delivery_pending"
+  | "viewer_lagging"
+  | "resyncing"
+  | "disconnected_unknown"
 
 export interface SessionProjection {
   spec: string

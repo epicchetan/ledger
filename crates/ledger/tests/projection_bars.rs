@@ -34,6 +34,7 @@ async fn prepare_publishes_initial_status_before_any_seek() {
             epoch: 0,
             processed_batches: 0,
             completed_bars: 0,
+            revision: 0,
             last_ts_event_ns: None,
         }
     );
@@ -596,7 +597,7 @@ async fn seek_to(session: &LedgerSessionHandle, session_ns: u64) {
 }
 
 async fn wait_for_cursor(
-    cache: &cache::Cache,
+    cache: &cache::CacheReader,
     watch: &mut cache::CellWatch,
     cells: &EsReplayCells,
     mut predicate: impl FnMut(&EsReplayCursor) -> bool,
@@ -616,7 +617,7 @@ async fn wait_for_cursor(
 }
 
 async fn wait_for_bars_status(
-    cache: &cache::Cache,
+    cache: &cache::CacheReader,
     watch: &mut cache::CellWatch,
     cells: &BarsCells,
     mut predicate: impl FnMut(&BarsStatus) -> bool,
@@ -636,7 +637,7 @@ async fn wait_for_bars_status(
 }
 
 async fn wait_for_catch_up(
-    cache: &cache::Cache,
+    cache: &cache::CacheReader,
     watch: &mut cache::CellWatch,
     cells: &BarsCells,
     cursor: &EsReplayCursor,

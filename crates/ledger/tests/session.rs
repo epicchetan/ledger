@@ -43,7 +43,12 @@ async fn feed_submitted_writes_enter_runtime_through_generic_external_write_path
 #[tokio::test]
 async fn task_component_depending_on_batches_runs_when_batches_key_changes() {
     let running = RunningSession::start(vec![event(100, 1)]).await;
-    let (output, mut output_watch) = install_count_task(&running.session, &running.cells).await;
+    let (output, mut output_watch) = install_count_task(
+        &running.session,
+        &running.cells,
+        running.count_output.clone(),
+    )
+    .await;
 
     seek_to(&running.session, 100).await;
     wait_for_output(running.session.cache(), &mut output_watch, &output, 1).await;
@@ -54,7 +59,12 @@ async fn task_component_depending_on_batches_runs_when_batches_key_changes() {
 #[tokio::test]
 async fn ledger_session_does_not_implement_component_scheduling_policy() {
     let mut running = RunningSession::start(vec![event(100, 1), event(200, 2)]).await;
-    let (output, mut output_watch) = install_count_task(&running.session, &running.cells).await;
+    let (output, mut output_watch) = install_count_task(
+        &running.session,
+        &running.cells,
+        running.count_output.clone(),
+    )
+    .await;
 
     seek_to(&running.session, 200).await;
     wait_for_output(running.session.cache(), &mut output_watch, &output, 2).await;
@@ -94,9 +104,8 @@ async fn runtime_handle_shutdown_stops_feed_process_cleanly() {
 async fn session_shutdown_awaits_worker_join_and_surfaces_worker_errors() {
     let fixture = store_fixture();
     let builder = LedgerSessionBuilder::new(fixture.store.clone()).unwrap();
-    let session = timeout(WAKE, builder.start()).await.unwrap().unwrap();
     let owner = CellOwner::new("test.owner").unwrap();
-    let key = session
+    let key = builder
         .cache()
         .register_value::<u64>(
             CellDescriptor {
@@ -108,6 +117,7 @@ async fn session_shutdown_awaits_worker_join_and_surfaces_worker_errors() {
             None,
         )
         .unwrap();
+    let session = timeout(WAKE, builder.start()).await.unwrap().unwrap();
     let mut batch = ExternalWriteBatch::new(CellOwner::new("wrong.owner").unwrap());
     batch.set_value(&key, 1);
 
@@ -156,6 +166,7 @@ struct RunningSession {
     _fixture: StoreFixture,
     session: LedgerSessionHandle,
     cells: EsReplayCells,
+    count_output: ValueKey<usize>,
     cursor_watch: cache::CellWatch,
 }
 
@@ -165,6 +176,19 @@ impl RunningSession {
         let (raw_id, _artifact) = fabricate_prepared_day(&fixture.store, events).await;
         let mut builder = LedgerSessionBuilder::new(fixture.store.clone()).unwrap();
         let cells = builder.es_replay(raw_id).unwrap();
+        let count_id = ComponentId::new("task.count_batches").unwrap();
+        let count_output = builder
+            .cache()
+            .register_value::<usize>(
+                CellDescriptor {
+                    key: Key::new("task.count_batches.output").unwrap(),
+                    owner: count_id.owner(),
+                    kind: CellKind::Value,
+                    public_read: true,
+                },
+                None,
+            )
+            .unwrap();
         let session = timeout(WAKE, builder.start()).await.unwrap().unwrap();
         let mut cursor_watch = session.cache().watch_key(cells.cursor.key()).unwrap();
         wait_for_cursor(session.cache(), &mut cursor_watch, &cells, |cursor| {
@@ -176,6 +200,7 @@ impl RunningSession {
             _fixture: fixture,
             session,
             cells,
+            count_output,
             cursor_watch,
         }
     }
@@ -184,20 +209,9 @@ impl RunningSession {
 async fn install_count_task(
     session: &LedgerSessionHandle,
     cells: &EsReplayCells,
+    output: ValueKey<usize>,
 ) -> (ValueKey<usize>, cache::CellWatch) {
     let id = ComponentId::new("task.count_batches").unwrap();
-    let output = session
-        .cache()
-        .register_value::<usize>(
-            CellDescriptor {
-                key: Key::new("task.count_batches.output").unwrap(),
-                owner: id.owner(),
-                kind: CellKind::Value,
-                public_read: true,
-            },
-            None,
-        )
-        .unwrap();
     let output_watch = session.cache().watch_key(output.key()).unwrap();
     timeout(
         WAKE,
@@ -271,7 +285,7 @@ async fn seek_to(session: &LedgerSessionHandle, session_ns: u64) {
 }
 
 async fn wait_for_cursor(
-    cache: &cache::Cache,
+    cache: &cache::CacheReader,
     watch: &mut cache::CellWatch,
     cells: &EsReplayCells,
     mut predicate: impl FnMut(&ledger::feed::es_replay::EsReplayCursor) -> bool,
@@ -291,7 +305,7 @@ async fn wait_for_cursor(
 }
 
 async fn wait_for_output(
-    cache: &cache::Cache,
+    cache: &cache::CacheReader,
     watch: &mut cache::CellWatch,
     key: &ValueKey<usize>,
     expected: usize,

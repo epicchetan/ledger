@@ -19,7 +19,7 @@ import {
 import { chartColors } from "@/features/replay/chart/theme"
 import { etOffsetSeconds } from "@/features/replay/chart/time"
 import { ChartUi } from "@/features/replay/chart/ui-state"
-import type { Bar, BarsFrame, Clock } from "@/features/replay/types"
+import type { Bar, BarsProjectionFrame, Clock } from "@/features/replay/types"
 
 import "../index.css"
 
@@ -66,28 +66,52 @@ function synthFrame(
   from: number,
   count: number,
   withLive: boolean
-): BarsFrame {
+): BarsProjectionFrame {
   const bars = Array.from({ length: count }, (_, k) => synthBar(from + k))
+  const total = from + count
   return {
-    sessionId: "harness",
+    subscriptionId: "harness",
+    sessionGeneration: 1,
     spec: SPEC,
-    epoch,
-    from,
-    bars,
-    total: from + count,
-    live: withLive ? synthBar(from + count) : null,
-    status: {
-      spec: SPEC,
+    kind: "bars",
+    schemaVersion: 1,
+    frameSequence: ++frameSequence,
+    base:
+      from === 0
+        ? null
+        : {
+            epoch,
+            projectionRevision: from,
+            processedBatches: from,
+            completedBars: from,
+          },
+    head: {
       epoch,
-      processedBatches: from + count,
-      completedBars: from + count,
-      lastTsEventNs: null,
+      projectionRevision: total,
+      processedBatches: total,
+      completedBars: total,
+    },
+    operation: from === 0 ? "snapshot" : "append",
+    reason: from === 0 ? "initial" : "cadence",
+    payload: {
+      bars,
+      live: withLive ? synthBar(total) : null,
+      status: {
+        spec: SPEC,
+        epoch,
+        processedBatches: total,
+        completedBars: total,
+        revision: total,
+        lastTsEventNs: null,
+      },
     },
   }
 }
 
 const accumulator = new BarsAccumulator(SPEC)
+accumulator.beginSubscription("harness", 1, false)
 const ui = new ChartUi()
+let frameSequence = 0
 
 declare global {
   interface Window {
@@ -107,15 +131,15 @@ window.harness = {
   ui,
   seed: (count, withLive = true) => {
     appended = count
-    accumulator.ingest(synthFrame(1, 0, count, withLive))
+    accumulator.apply(synthFrame(1, 0, count, withLive))
   },
   append: (count) => {
-    accumulator.ingest(synthFrame(1, appended, count, true))
+    accumulator.apply(synthFrame(1, appended, count, true))
     appended += count
   },
   reseek: (epoch, count) => {
     appended = count
-    accumulator.ingest(synthFrame(epoch, 0, count, true))
+    accumulator.apply(synthFrame(epoch, 0, count, true))
   },
 }
 

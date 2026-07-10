@@ -4,12 +4,17 @@ import {
   type JsonRpcMessage,
 } from "@remux/viewer-kit/ipc"
 
+import { parseProjectionFrame } from "@/features/replay/projection-client"
+
 import type {
-  Bar,
   BarsFrame,
-  BarsStatus,
+  BarsPosition,
+  BarsProjectionFrame,
   Clock,
   Cursor,
+  ProjectionSubscribeRequest,
+  ProjectionSubscribeResult,
+  ProjectionWatermark,
   SessionAttachResult,
   SessionClockEvent,
   SessionCloseResult,
@@ -105,10 +110,54 @@ export async function fetchSessionBars(
   })
 }
 
+export async function subscribeSessionProjections(
+  sessionId: string,
+  consumerInstanceId: string,
+  projections: ProjectionSubscribeRequest[]
+): Promise<ProjectionSubscribeResult> {
+  return requestIpc<ProjectionSubscribeResult>(
+    "remux/ledger/session/projections/subscribe",
+    { sessionId, consumerInstanceId, projections }
+  )
+}
+
+export async function acknowledgeSessionProjections(
+  subscriptionId: string,
+  applied: Array<{ spec: string; head: BarsPosition }>
+): Promise<SessionOkResult> {
+  return requestIpc<SessionOkResult>("remux/ledger/session/projections/ack", {
+    subscriptionId,
+    applied,
+  })
+}
+
+export async function demandSessionProjections(
+  subscriptionId: string,
+  active: boolean,
+  requestedMaxFps = 15
+): Promise<SessionOkResult> {
+  return requestIpc<SessionOkResult>(
+    "remux/ledger/session/projections/demand",
+    { subscriptionId, active, requestedMaxFps }
+  )
+}
+
+export async function resyncSessionProjections(
+  subscriptionId: string,
+  applied: Array<{ spec: string; head: BarsPosition }>,
+  reason: string
+): Promise<SessionOkResult> {
+  return requestIpc<SessionOkResult>(
+    "remux/ledger/session/projections/resync",
+    { subscriptionId, applied, reason }
+  )
+}
+
 export interface SessionEventHandlers {
   clock: (event: SessionClockEvent) => void
   cursor: (event: SessionCursorEvent) => void
-  barsFrame: (frame: BarsFrame) => void
+  projectionFrame: (frame: BarsProjectionFrame) => void
+  projectionWatermark: (watermark: ProjectionWatermark) => void
   closed: (event: SessionClosedEvent) => void
 }
 
@@ -129,9 +178,14 @@ export function subscribeSessionEvents(handlers: SessionEventHandlers) {
         handlers.cursor(cursor)
         continue
       }
-      const frame = parseBarsFrame(message)
+      const frame = parseProjectionFrameEvent(message)
       if (frame) {
-        handlers.barsFrame(frame)
+        handlers.projectionFrame(frame)
+        continue
+      }
+      const watermark = parseProjectionWatermarkEvent(message)
+      if (watermark) {
+        handlers.projectionWatermark(watermark)
         continue
       }
       const closed = parseClosedEvent(message)
@@ -158,9 +212,43 @@ function parseCursorEvent(message: JsonRpcMessage): SessionCursorEvent | null {
   return parsed ? { sessionId, cursor: parsed } : null
 }
 
-function parseBarsFrame(message: JsonRpcMessage): BarsFrame | null {
-  if (message.method !== "remux/ledger/session/barsFrame") return null
-  return parseFrame(message.params)
+function parseProjectionFrameEvent(
+  message: JsonRpcMessage
+): BarsProjectionFrame | null {
+  if (message.method !== "remux/ledger/session/projections/frame") return null
+  return parseProjectionFrame(message.params)
+}
+
+function parseProjectionWatermarkEvent(
+  message: JsonRpcMessage
+): ProjectionWatermark | null {
+  if (message.method !== "remux/ledger/session/projections/watermark") {
+    return null
+  }
+  if (!isRecord(message.params)) return null
+  const { subscriptionId, sessionGeneration, feed, projections } = message.params
+  if (
+    typeof subscriptionId !== "string" ||
+    !isNumber(sessionGeneration) ||
+    !Array.isArray(projections)
+  ) {
+    return null
+  }
+  const parsedFeed = feed === null ? null : parseCursor(feed)
+  if (feed !== null && !parsedFeed) return null
+  const parsedProjections: ProjectionWatermark["projections"] = []
+  for (const projection of projections) {
+    if (!isRecord(projection) || typeof projection.spec !== "string") return null
+    const head = parsePosition(projection.head)
+    if (!head) return null
+    parsedProjections.push({ spec: projection.spec, head })
+  }
+  return {
+    subscriptionId,
+    sessionGeneration,
+    feed: parsedFeed,
+    projections: parsedProjections,
+  }
 }
 
 function parseClosedEvent(message: JsonRpcMessage): SessionClosedEvent | null {
@@ -218,87 +306,18 @@ function parseCursor(value: unknown): Cursor | null {
   }
 }
 
-function parseFrame(value: unknown): BarsFrame | null {
+function parsePosition(value: unknown): BarsPosition | null {
   if (!isRecord(value)) return null
-  const { sessionId, spec, epoch, from, bars, total, live, status } = value
-  if (typeof sessionId !== "string" || typeof spec !== "string") return null
-  if (!isNumber(epoch) || !isNumber(from) || !isNumber(total)) return null
-  if (!Array.isArray(bars)) return null
-  const parsedBars: Bar[] = []
-  for (const bar of bars) {
-    // A single malformed bar taints the frame's contiguity, so drop it whole.
-    const parsedBar = parseBar(bar)
-    if (!parsedBar) return null
-    parsedBars.push(parsedBar)
-  }
-  const parsedStatus = parseBarsStatus(status)
-  if (!parsedStatus) return null
-  const parsedLive = live === null ? null : parseBar(live)
-  if (live !== null && parsedLive === null) return null
-  return {
-    sessionId,
-    spec,
-    epoch,
-    from,
-    bars: parsedBars,
-    total,
-    live: parsedLive,
-    status: parsedStatus,
-  }
-}
-
-function parseBar(value: unknown): Bar | null {
-  if (!isRecord(value)) return null
-  const { intervalStartNs, firstTsEventNs, lastTsEventNs } = value
-  const { open, high, low, close } = value
-  const { volume, buyVolume, sellVolume, tradeCount } = value
+  const { epoch, projectionRevision, processedBatches, completedBars } = value
   if (
-    typeof intervalStartNs !== "string" ||
-    typeof firstTsEventNs !== "string" ||
-    typeof lastTsEventNs !== "string"
-  ) {
-    return null
-  }
-  if (
-    !isNumber(open) ||
-    !isNumber(high) ||
-    !isNumber(low) ||
-    !isNumber(close) ||
-    !isNumber(volume) ||
-    !isNumber(buyVolume) ||
-    !isNumber(sellVolume) ||
-    !isNumber(tradeCount)
-  ) {
-    return null
-  }
-  return {
-    intervalStartNs,
-    open,
-    high,
-    low,
-    close,
-    volume,
-    buyVolume,
-    sellVolume,
-    tradeCount,
-    firstTsEventNs,
-    lastTsEventNs,
-  }
-}
-
-function parseBarsStatus(value: unknown): BarsStatus | null {
-  if (!isRecord(value)) return null
-  const { spec, epoch, processedBatches, completedBars, lastTsEventNs } = value
-  if (
-    typeof spec !== "string" ||
     !isNumber(epoch) ||
+    !isNumber(projectionRevision) ||
     !isNumber(processedBatches) ||
     !isNumber(completedBars)
   ) {
     return null
   }
-  if (!isNullableString(lastTsEventNs)) return null
-  return { spec, epoch, processedBatches, completedBars, lastTsEventNs }
+  return { epoch, projectionRevision, processedBatches, completedBars }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

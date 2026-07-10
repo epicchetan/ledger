@@ -1,6 +1,6 @@
 use std::{ops::Range, sync::Mutex};
 
-use cache::{ArrayKey, Cache, CellOwner, Key, ValueKey, WriteEffects};
+use cache::{ArrayKey, Cache, CacheReader, CellOwner, Key, ValueKey, WriteEffects};
 
 use crate::{
     runtime::{dependency::DependencyIndex, task_queue::TaskQueue},
@@ -9,14 +9,14 @@ use crate::{
 
 pub struct ComponentWriteContext<'a> {
     component_id: ComponentId,
-    cache: Cache,
+    cache: CacheReader,
     submitter: ComponentWriteSubmitter<'a>,
 }
 
 impl<'a> ComponentWriteContext<'a> {
     pub(crate) fn external(
         component_id: ComponentId,
-        cache: Cache,
+        cache: CacheReader,
         writes: ExternalWriteSink,
     ) -> Self {
         Self {
@@ -26,7 +26,7 @@ impl<'a> ComponentWriteContext<'a> {
         }
     }
 
-    pub(crate) fn unavailable(component_id: ComponentId, cache: Cache) -> Self {
+    pub(crate) fn unavailable(component_id: ComponentId, cache: CacheReader) -> Self {
         Self {
             component_id,
             cache,
@@ -36,7 +36,7 @@ impl<'a> ComponentWriteContext<'a> {
 
     pub(crate) fn local(
         component_id: ComponentId,
-        cache: Cache,
+        cache: CacheReader,
         submitter: LocalComponentWriteSubmitter<'a>,
     ) -> Self {
         Self {
@@ -54,7 +54,7 @@ impl<'a> ComponentWriteContext<'a> {
         self.component_id.owner()
     }
 
-    pub fn cache(&self) -> &Cache {
+    pub fn cache(&self) -> &CacheReader {
         &self.cache
     }
 

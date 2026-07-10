@@ -1,4 +1,8 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    panic::{catch_unwind, AssertUnwindSafe},
+    time::Instant,
+};
 
 use cache::Cache;
 use tokio::{
@@ -11,6 +15,7 @@ use crate::{
     process::{
         ensure_process_descriptor, ProcessContext, ProcessPrepareContext, ShutdownController,
     },
+    snapshot::{SnapshotMetrics, SnapshotRequest},
     ComponentError, ComponentId, ComponentKind, ComponentStatus, ExternalWriteReceiver,
     ExternalWriteSink, RunStats, Runtime, RuntimeError, RuntimeProcess, RuntimeTask,
 };
@@ -18,6 +23,9 @@ use crate::{
 const DEFAULT_EXTERNAL_WRITE_BUFFER: usize = 1024;
 const DEFAULT_COMMAND_BUFFER: usize = 128;
 const DEFAULT_EVENT_BUFFER: usize = 128;
+const DEFAULT_SNAPSHOT_BUFFER: usize = 128;
+const SNAPSHOT_BUDGET_PER_BOUNDARY: usize = 8;
+const SNAPSHOT_BUDGET_WHILE_IDLE: usize = 64;
 #[allow(dead_code)]
 const DEFAULT_RUN_STEP_BUDGET: usize = 1024;
 
@@ -25,6 +33,8 @@ pub struct RuntimeWorker {
     runtime: Runtime,
     handle: RuntimeHandle,
     commands: mpsc::Receiver<RuntimeCommand>,
+    snapshots: mpsc::Receiver<SnapshotRequest>,
+    snapshot_metrics: SnapshotMetrics,
     writes: ExternalWriteReceiver,
     events_tx: mpsc::Sender<RuntimeEvent>,
     events_rx: mpsc::Receiver<RuntimeEvent>,
@@ -36,13 +46,23 @@ impl RuntimeWorker {
     pub fn new(cache: Cache) -> (Self, RuntimeHandle) {
         let (writes, write_rx) = ExternalWriteSink::channel(DEFAULT_EXTERNAL_WRITE_BUFFER);
         let (commands_tx, commands_rx) = mpsc::channel(DEFAULT_COMMAND_BUFFER);
+        let (snapshots_tx, snapshots_rx) = mpsc::channel(DEFAULT_SNAPSHOT_BUFFER);
         let (events_tx, events_rx) = mpsc::channel(DEFAULT_EVENT_BUFFER);
-        let handle = RuntimeHandle::new(cache.clone(), writes.clone(), commands_tx);
+        let snapshot_metrics = SnapshotMetrics::default();
+        let handle = RuntimeHandle::new(
+            cache.reader(),
+            writes.clone(),
+            commands_tx,
+            snapshots_tx,
+            snapshot_metrics.clone(),
+        );
         let runtime = Runtime::new_with_prepare_writes(cache, Some(writes));
         let worker = Self {
             runtime,
             handle: handle.clone(),
             commands: commands_rx,
+            snapshots: snapshots_rx,
+            snapshot_metrics,
             writes: write_rx,
             events_tx,
             events_rx,
@@ -61,6 +81,9 @@ impl RuntimeWorker {
                 Some(batch) = self.writes.recv() => {
                     self.runtime.submit_external_writes(batch);
                     self.step_until_idle().await?;
+                }
+                Some(snapshot) = self.snapshots.recv() => {
+                    self.serve_snapshot(snapshot);
                 }
                 Some(event) = self.events_rx.recv() => {
                     self.handle_event(event);
@@ -107,7 +130,7 @@ impl RuntimeWorker {
                 let _ = reply.send(Ok(self.list_components()));
             }
             RuntimeCommand::Drain { max_steps, reply } => {
-                let result = self.runtime.run_until_idle(max_steps).await;
+                let result = self.drain_runtime(max_steps).await;
                 let _ = reply.send(result);
             }
             RuntimeCommand::Shutdown { reply } => {
@@ -131,7 +154,7 @@ impl RuntimeWorker {
         let (shutdown, shutdown_rx) = ShutdownController::new();
         let ctx = ProcessPrepareContext::new(
             id.clone(),
-            self.runtime.cache().clone(),
+            self.runtime.cache(),
             self.handle.external_write_sink(),
             shutdown_rx.clone(),
         );
@@ -275,7 +298,7 @@ impl RuntimeWorker {
 
         let ctx = ProcessContext::new(
             id.clone(),
-            self.runtime.cache().clone(),
+            self.runtime.cache(),
             self.handle.external_write_sink(),
             record.shutdown_rx.clone(),
         );
@@ -315,6 +338,9 @@ impl RuntimeWorker {
             let _ = reply.send(Err(RuntimeError::RuntimeStopped));
             return;
         }
+
+        self.snapshots.close();
+        self.reject_pending_snapshots();
 
         for record in self.processes.values_mut() {
             match record.status {
@@ -361,12 +387,89 @@ impl RuntimeWorker {
             while let Ok(batch) = self.writes.try_recv() {
                 self.runtime.submit_external_writes(batch);
             }
+            self.serve_snapshot_budget(SNAPSHOT_BUDGET_PER_BOUNDARY);
             self.runtime.run_once().await?;
             // One task step can be CPU-heavy; same-thread async work must
             // still observe cache notifications between steps.
             tokio::task::yield_now().await;
         }
+        self.serve_snapshot_budget(SNAPSHOT_BUDGET_WHILE_IDLE);
         Ok(())
+    }
+
+    async fn drain_runtime(&mut self, max_steps: usize) -> Result<RunStats, RuntimeError> {
+        let mut stats = RunStats {
+            steps: 0,
+            external_write_batches_applied: 0,
+            tasks_run: 0,
+            changed_keys: Vec::new(),
+        };
+
+        while !self.runtime.is_idle() {
+            if stats.steps == max_steps {
+                return Err(RuntimeError::RunLimitExceeded { max_steps });
+            }
+            while let Ok(batch) = self.writes.try_recv() {
+                self.runtime.submit_external_writes(batch);
+            }
+            self.serve_snapshot_budget(SNAPSHOT_BUDGET_PER_BOUNDARY);
+            let step = self.runtime.run_once().await?;
+            stats.steps += 1;
+            stats.external_write_batches_applied += step.external_write_batches_applied;
+            if step.task_run.is_some() {
+                stats.tasks_run += 1;
+            }
+            for key in step.changed_keys {
+                if !stats.changed_keys.contains(&key) {
+                    stats.changed_keys.push(key);
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+        self.serve_snapshot_budget(SNAPSHOT_BUDGET_WHILE_IDLE);
+        Ok(stats)
+    }
+
+    fn serve_snapshot_budget(&mut self, budget: usize) {
+        for _ in 0..budget {
+            let Ok(request) = self.snapshots.try_recv() else {
+                break;
+            };
+            self.serve_snapshot(request);
+        }
+    }
+
+    fn serve_snapshot(&self, request: SnapshotRequest) {
+        if request.reply.is_closed() {
+            self.snapshot_metrics.cancelled();
+            return;
+        }
+
+        let started = Instant::now();
+        self.snapshot_metrics
+            .record_queue_wait(started, request.queued_at);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            (request.read)(&self.runtime.read_view()).map_err(RuntimeError::Cache)
+        }))
+        .unwrap_or_else(|_| {
+            self.snapshot_metrics.panicked();
+            Err(RuntimeError::SnapshotPanicked)
+        });
+        self.snapshot_metrics
+            .record_execution(Instant::now(), started);
+        if result.is_ok() {
+            self.snapshot_metrics.completed();
+        }
+        if request.reply.send(result).is_err() {
+            self.snapshot_metrics.cancelled();
+        }
+    }
+
+    fn reject_pending_snapshots(&mut self) {
+        while let Ok(request) = self.snapshots.try_recv() {
+            self.snapshot_metrics.rejected();
+            let _ = request.reply.send(Err(RuntimeError::RuntimeStopped));
+        }
     }
 
     fn has_active_processes(&self) -> bool {
@@ -409,9 +512,7 @@ pub(crate) enum RuntimeCommand {
         reply: oneshot::Sender<Result<ComponentStatus, RuntimeError>>,
     },
     ListComponents {
-        reply: oneshot::Sender<
-            Result<Vec<(ComponentId, ComponentKind, ComponentStatus)>, RuntimeError>,
-        >,
+        reply: oneshot::Sender<Result<ComponentListing, RuntimeError>>,
     },
     Drain {
         max_steps: usize,
@@ -421,6 +522,8 @@ pub(crate) enum RuntimeCommand {
         reply: oneshot::Sender<Result<(), RuntimeError>>,
     },
 }
+
+type ComponentListing = Vec<(ComponentId, ComponentKind, ComponentStatus)>;
 
 enum RuntimeEvent {
     ProcessPrepared {

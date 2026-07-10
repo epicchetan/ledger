@@ -2,14 +2,11 @@ import {
   useCallback,
   useEffect,
   useMemo,
-  useState,
-  useSyncExternalStore,
 } from "react"
 import { updateHostTab } from "@remux/viewer-kit/host"
 import { toast } from "sonner"
 
 import { Button } from "@/components/ui/button"
-import type { BarsAccumulator } from "@/features/replay/accumulator"
 import {
   ChartSurface,
   useRemuxTheme,
@@ -21,7 +18,7 @@ import { etOffsetSeconds, nsToSeconds } from "@/features/replay/chart/time"
 import { ChartUi } from "@/features/replay/chart/ui-state"
 import { ReplayActionBar } from "@/features/replay/replay-action-bar"
 import { REPLAY_RESOURCE_KIND, replayResourceId } from "@/features/replay/route"
-import type { Cursor, SessionClosedReason } from "@/features/replay/types"
+import type { SessionClosedReason } from "@/features/replay/types"
 import { useReplaySession } from "@/features/replay/use-replay-session"
 import { cn } from "@/lib/utils"
 
@@ -32,12 +29,6 @@ interface ReplayProps {
   symbol: string
   onExit: () => void
 }
-
-// The lag term must be continuously true this long before it may surface as
-// "syncing", and clears the instant it goes false — this kills flicker from the
-// status and cursor notifications briefly disagreeing during normal playback.
-// `catchingUp` bypasses it entirely (authoritative, both edges immediate).
-const SYNC_SUSTAIN_MS = 250
 
 // Snapshotted once at module load for the degenerate no-bounds offset fallback
 // (see the offset memo); keeps that memo render-pure — the value only picks
@@ -60,8 +51,16 @@ export function Replay({
   onExit,
 }: ReplayProps) {
   const session = useReplaySession(rawId, resumeSessionId)
-  const { phase, open, error, endedReason, clock, clockReceivedAt, cursor } =
-    session
+  const {
+    phase,
+    open,
+    error,
+    endedReason,
+    clock,
+    clockReceivedAt,
+    cursor,
+    deliveryState,
+  } = session
   const { projections, controls } = session
   const openSessionId = open?.sessionId ?? null
   const routedMarketDay = open?.marketDay ?? marketDay
@@ -136,8 +135,6 @@ export function Replay({
     [colors, offsetSeconds, projections, ui]
   )
 
-  const syncing = useAnyProjectionSyncing(projections, cursor)
-
   // Open failure (object gone, feed build error): toast and fall back to days.
   useEffect(() => {
     if (phase !== "error") return
@@ -184,7 +181,7 @@ export function Replay({
         endNs={open?.sessionEndNs ?? null}
         marketDay={open?.marketDay ?? marketDay}
         symbol={symbol}
-        syncing={syncing}
+        deliveryState={deliveryState}
         disabled={phase !== "live"}
         onExit={onExit}
         onPlay={controls.play}
@@ -228,62 +225,4 @@ function EndedBanner({
       </div>
     </div>
   )
-}
-
-// Syncing = `cursor.catchingUp` (authoritative, undebounced) OR any projection
-// lagging the feed cursor sustained past SYNC_SUSTAIN_MS. Lag is aggregated
-// across accumulators through a single external-store subscription whose
-// snapshot is the boolean itself, so frame churn only re-renders the page when
-// the lag state actually flips — not on every frame.
-function useAnyProjectionSyncing(
-  projections: BarsAccumulator[],
-  cursor: Cursor | null
-): boolean {
-  const rawLag = useProjectionLag(projections, cursor)
-  const sustainedLag = useSustained(rawLag)
-  return (cursor?.catchingUp ?? false) || sustainedLag
-}
-
-function useProjectionLag(
-  projections: BarsAccumulator[],
-  cursor: Cursor | null
-): boolean {
-  const subscribe = useCallback(
-    (onChange: () => void) => {
-      const unsubscribes = projections.map((accumulator) =>
-        accumulator.subscribe(onChange)
-      )
-      return () => {
-        for (const unsubscribe of unsubscribes) unsubscribe()
-      }
-    },
-    [projections]
-  )
-  const getSnapshot = useCallback(() => {
-    if (!cursor) return false
-    return projections.some((accumulator) => {
-      const processed = accumulator.getSnapshot().status?.processedBatches
-      return processed != null && processed !== cursor.batchIdx
-    })
-  }, [projections, cursor])
-  return useSyncExternalStore(subscribe, getSnapshot)
-}
-
-// True only after `active` has held continuously for SYNC_SUSTAIN_MS; false the
-// instant it clears. The false edge resets during render (React's adjust-state-
-// during-render pattern) so it never waits a commit and a re-activation always
-// re-waits the full delay; the effect only schedules the true edge.
-function useSustained(active: boolean): boolean {
-  const [elapsed, setElapsed] = useState(false)
-  const [tracked, setTracked] = useState(active)
-  if (active !== tracked) {
-    setTracked(active)
-    if (!active) setElapsed(false)
-  }
-  useEffect(() => {
-    if (!active) return
-    const id = window.setTimeout(() => setElapsed(true), SYNC_SUSTAIN_MS)
-    return () => window.clearTimeout(id)
-  }, [active])
-  return active && elapsed
 }

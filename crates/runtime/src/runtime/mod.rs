@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use cache::{Cache, Key, WriteEffects};
+use cache::{Cache, CacheReadView, CacheReader, Key, WriteEffects};
 
 pub(crate) mod dependency;
 mod external_write;
@@ -44,8 +44,12 @@ impl Runtime {
         }
     }
 
-    pub fn cache(&self) -> &Cache {
-        &self.cache
+    pub fn cache(&self) -> CacheReader {
+        self.cache.reader()
+    }
+
+    pub(crate) fn read_view(&self) -> CacheReadView<'_> {
+        self.cache.read_view()
     }
 
     pub async fn register_task<T>(&mut self, task: T) -> Result<(), RuntimeError>
@@ -73,7 +77,7 @@ impl Runtime {
         }
 
         let ctx =
-            TaskPrepareContext::new(id.clone(), self.cache.clone(), self.prepare_writes.clone());
+            TaskPrepareContext::new(id.clone(), self.cache.reader(), self.prepare_writes.clone());
         task.prepare(ctx)
             .await
             .map_err(|source| RuntimeError::Component {
@@ -166,7 +170,7 @@ impl Runtime {
                     &mut step.changed_keys,
                     &mut step.scheduled_tasks,
                 );
-                let ctx = TaskContext::new(task_id.clone(), self.cache.clone(), wake, writes);
+                let ctx = TaskContext::new(task_id.clone(), self.cache.reader(), wake, writes);
                 task.run_once(ctx).await
             };
             self.tasks.put(task_id.clone(), task);

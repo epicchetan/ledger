@@ -18,6 +18,20 @@ pub struct Cache {
     inner: Arc<CacheInner>,
 }
 
+/// A cloneable, read-only capability for a cache owned by a runtime.
+#[derive(Clone)]
+pub struct CacheReader {
+    inner: Arc<CacheInner>,
+}
+
+/// An immutable view used by owner-executed runtime snapshots.
+///
+/// Atomicity comes from the runtime invoking the reader between committed
+/// steps; the view deliberately exposes no mutation or watch registration.
+pub struct CacheReadView<'a> {
+    cache: &'a Cache,
+}
+
 struct CacheInner {
     cells: RwLock<HashMap<Key, Arc<Cell>>>,
 }
@@ -36,6 +50,16 @@ impl Cache {
                 cells: RwLock::new(HashMap::new()),
             }),
         }
+    }
+
+    pub fn reader(&self) -> CacheReader {
+        CacheReader {
+            inner: self.inner.clone(),
+        }
+    }
+
+    pub fn read_view(&self) -> CacheReadView<'_> {
+        CacheReadView { cache: self }
     }
 
     pub fn register_value<T>(
@@ -436,6 +460,78 @@ impl Cache {
         // woken watcher can never read pre-write state.
         cell.generation.send_modify(|generation| *generation += 1);
         Ok(result)
+    }
+}
+
+impl CacheReader {
+    pub fn describe(&self, key: &Key) -> Result<CellDescriptor, CacheError> {
+        self.as_cache().describe(key)
+    }
+
+    pub fn watch_key(&self, key: &Key) -> Result<CellWatch, CacheError> {
+        self.as_cache().watch_key(key)
+    }
+
+    pub fn read_value<T>(&self, key: &ValueKey<T>) -> Result<Option<T>, CacheError>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        self.as_cache().read_value(key)
+    }
+
+    pub fn read_array<T>(&self, key: &ArrayKey<T>) -> Result<Vec<T>, CacheError>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        self.as_cache().read_array(key)
+    }
+
+    pub fn read_array_range<T>(
+        &self,
+        key: &ArrayKey<T>,
+        range: Range<usize>,
+    ) -> Result<Vec<T>, CacheError>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        self.as_cache().read_array_range(key, range)
+    }
+
+    fn as_cache(&self) -> Cache {
+        Cache {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl CacheReadView<'_> {
+    pub fn describe(&self, key: &Key) -> Result<CellDescriptor, CacheError> {
+        self.cache.describe(key)
+    }
+
+    pub fn read_value<T>(&self, key: &ValueKey<T>) -> Result<Option<T>, CacheError>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        self.cache.read_value(key)
+    }
+
+    pub fn read_array<T>(&self, key: &ArrayKey<T>) -> Result<Vec<T>, CacheError>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        self.cache.read_array(key)
+    }
+
+    pub fn read_array_range<T>(
+        &self,
+        key: &ArrayKey<T>,
+        range: Range<usize>,
+    ) -> Result<Vec<T>, CacheError>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        self.cache.read_array_range(key, range)
     }
 }
 

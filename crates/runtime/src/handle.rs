@@ -1,33 +1,73 @@
-use cache::Cache;
+use std::{any::Any, time::Instant};
+
+use cache::{CacheReadView, CacheReader};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    worker::RuntimeCommand, ComponentId, ComponentKind, ComponentStatus, ExternalWriteBatch,
-    ExternalWriteSink, RunStats, RuntimeError, RuntimeProcess, RuntimeTask,
+    snapshot::{SnapshotMetrics, SnapshotRequest},
+    worker::RuntimeCommand,
+    ComponentId, ComponentKind, ComponentStatus, ExternalWriteBatch, ExternalWriteSink, RunStats,
+    RuntimeError, RuntimeProcess, RuntimeTask, SnapshotMetricsSnapshot,
 };
 
 #[derive(Clone)]
 pub struct RuntimeHandle {
-    cache: Cache,
+    cache: CacheReader,
     writes: ExternalWriteSink,
     commands: mpsc::Sender<RuntimeCommand>,
+    snapshots: mpsc::Sender<SnapshotRequest>,
+    snapshot_metrics: SnapshotMetrics,
 }
 
 impl RuntimeHandle {
     pub(crate) fn new(
-        cache: Cache,
+        cache: CacheReader,
         writes: ExternalWriteSink,
         commands: mpsc::Sender<RuntimeCommand>,
+        snapshots: mpsc::Sender<SnapshotRequest>,
+        snapshot_metrics: SnapshotMetrics,
     ) -> Self {
         Self {
             cache,
             writes,
             commands,
+            snapshots,
+            snapshot_metrics,
         }
     }
 
-    pub fn cache(&self) -> &Cache {
+    pub fn cache(&self) -> &CacheReader {
         &self.cache
+    }
+
+    pub async fn snapshot<R, F>(&self, read: F) -> Result<R, RuntimeError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&CacheReadView<'_>) -> Result<R, cache::CacheError> + Send + 'static,
+    {
+        self.snapshot_metrics.requested();
+        let (reply, rx) = oneshot::channel();
+        let read = Box::new(move |view: &CacheReadView<'_>| {
+            read(view).map(|value| Box::new(value) as Box<dyn Any + Send>)
+        });
+        let request = SnapshotRequest {
+            queued_at: Instant::now(),
+            read,
+            reply,
+        };
+        if self.snapshots.send(request).await.is_err() {
+            self.snapshot_metrics.rejected();
+            return Err(RuntimeError::SnapshotIngressClosed);
+        }
+        let value = rx.await.map_err(|_| RuntimeError::RuntimeStopped)??;
+        value
+            .downcast::<R>()
+            .map(|value| *value)
+            .map_err(|_| RuntimeError::SnapshotTypeMismatch)
+    }
+
+    pub fn snapshot_metrics(&self) -> SnapshotMetricsSnapshot {
+        self.snapshot_metrics.snapshot()
     }
 
     pub fn external_write_sink(&self) -> ExternalWriteSink {

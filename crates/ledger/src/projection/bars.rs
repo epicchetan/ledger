@@ -46,6 +46,8 @@ pub struct BarsStatus {
     /// Feed batches folded in; equals cursor.batch_idx when caught up.
     pub processed_batches: usize,
     pub completed_bars: usize,
+    /// Monotonic projection commit revision, including live-bar-only changes.
+    pub revision: u64,
     /// Timestamp of the last folded print (not batch).
     pub last_ts_event_ns: Option<UnixNanos>,
 }
@@ -101,6 +103,7 @@ pub struct BarsTask {
     epoch: u64,
     processed_batches: usize,
     completed_bars: usize,
+    revision: u64,
     live: Option<Bar>,
     last_print_ts: Option<UnixNanos>,
     fold: Fold,
@@ -130,6 +133,7 @@ impl BarsTask {
             epoch: 0,
             processed_batches: 0,
             completed_bars: 0,
+            revision: 0,
             live: None,
             last_print_ts: None,
             fold: Fold::Incremental,
@@ -142,6 +146,7 @@ impl BarsTask {
             epoch: self.epoch,
             processed_batches: self.processed_batches,
             completed_bars: self.completed_bars,
+            revision: self.revision,
             last_ts_event_ns: self.last_print_ts,
         }
     }
@@ -202,6 +207,7 @@ impl BarsTask {
         self.fold_batches(&batches, &mut completed);
         self.processed_batches = chunk_end;
         self.completed_bars += completed.len();
+        self.revision = self.revision.saturating_add(1);
 
         let mut batch = ctx.batch();
         if first_chunk {
@@ -230,6 +236,21 @@ impl BarsTask {
             Ok(TaskOutcome::Idle)
         }
     }
+}
+
+pub fn install_bars_projection(
+    feed: EsReplayCells,
+    params: BarsParams,
+    cells: BarsCells,
+) -> Result<super::InstalledProjection, LedgerError> {
+    let task = BarsTask::new(feed, params, cells.clone())?;
+    let spec = super::ProjectionSpec::Bars(params);
+    let delivery = super::BarsDeliverySource::new(spec.canonical(), cells);
+    Ok(super::InstalledProjection {
+        spec,
+        task: Box::new(task),
+        delivery: Box::new(delivery),
+    })
 }
 
 #[async_trait]
@@ -274,6 +295,7 @@ impl RuntimeTask for BarsTask {
             self.fold_batches(&new_batches, &mut completed);
             self.processed_batches = cursor.batch_idx;
             self.completed_bars += completed.len();
+            self.revision = self.revision.saturating_add(1);
 
             let mut batch = ctx.batch();
             if !completed.is_empty() {

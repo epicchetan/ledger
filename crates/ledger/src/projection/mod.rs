@@ -1,8 +1,10 @@
 pub mod bars;
+mod delivery;
 
 use crate::LedgerError;
 
 pub use bars::*;
+pub use delivery::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectionSpec {

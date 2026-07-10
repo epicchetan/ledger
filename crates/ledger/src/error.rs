@@ -27,6 +27,9 @@ pub enum LedgerError {
     #[error(transparent)]
     Runtime(#[from] runtime::RuntimeError),
 
+    #[error(transparent)]
+    ProjectionDelivery(#[from] crate::projection::ProjectionDeliveryError),
+
     #[error("invalid clock speed `{0}`")]
     InvalidClockSpeed(f64),
 }

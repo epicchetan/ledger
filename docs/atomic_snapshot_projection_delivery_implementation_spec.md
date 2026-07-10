@@ -1,6 +1,6 @@
 # Atomic Runtime Snapshots and Projection Delivery — Implementation Spec
 
-Status: proposed next Ledger implementation
+Status: implemented and host-validated; final on-device feel-check pending
 
 Date: 2026-07-10
 
@@ -783,6 +783,8 @@ The barrier completes only after an atomic snapshot shows:
 
 ```text
 clock.revision >= expected_clock_revision
+feed.status.clock.revision >= expected_clock_revision
+feed.status.cursor == feed.cursor
 feed.cursor.catchingUp == false
 for every required projection:
   projection.epoch == feed.cursor.epoch
@@ -790,6 +792,13 @@ for every required projection:
 ```
 
 Projection kinds may add stronger convergence rules.
+
+The feed clock revision is a causal acknowledgment, not presentation
+metadata. A clock write and the feed's reaction are concurrent tasks; the new
+clock can therefore become visible while the old cursor/projection pair still
+looks converged. The feed publishes its unchanged cursor/status after it has
+observed a clock revision even when a seek lands between batches, and the
+barrier requires that acknowledgment before accepting convergence.
 
 ### 10.4 Barrier Presentation
 
@@ -1625,3 +1634,350 @@ The intended end state is deliberately simple: one deterministic runtime/cache
 owner, one concurrent read-only delivery executor, projection-defined typed
 delivery, and viewers that can prove exactly which server-issued state they
 have applied.
+
+## 24. Implementation Record
+
+Implementation date: 2026-07-10
+
+Ledger baseline before this implementation:
+
+```text
+98fcd7c Document atomic snapshots and projection delivery
+```
+
+Remux baseline before the client-scoping implementation:
+
+```text
+89d1226 Fix Codex transcript tables and message replay
+```
+
+All changes remain uncommitted pending review.
+
+### 24.1 Phase 1 — Cache Ownership Capability
+
+Implemented:
+
+- `CacheReader` is the cloneable active-session read/watch capability.
+- `CacheReadView` is the immutable owner-snapshot capability and exposes no
+  watch registration or mutation.
+- `RuntimeHandle`, task/process contexts, `LedgerSessionHandle`, CLI helpers,
+  and Remux now expose `CacheReader`, not `Cache`.
+- `LedgerSessionBuilder::cache()` is explicitly setup-only and exists so cells
+  for generic tasks can be registered before runtime ownership begins.
+- Runtime-local and external write batches remain the only active production
+  mutation paths.
+
+Primary files:
+
+```text
+crates/cache/src/cache.rs
+crates/runtime/src/{handle,process,task,write,runtime/mod}.rs
+crates/ledger/src/session.rs
+```
+
+Wire changes: none.
+
+Remaining intentional behavior: `Cache` remains cloneable for standalone cache
+tests and setup code. Active production handles do not retain or return it.
+
+### 24.2 Phase 2 — Atomic Snapshot Command
+
+Implemented:
+
+- a dedicated bounded snapshot request channel, separate from runtime commands
+  and external writes;
+- typed `RuntimeHandle::snapshot` with internal type erasure/downcast;
+- snapshot execution only between external write batches/task steps;
+- bounded servicing during `WakeAgain` chains and idle operation;
+- cancellation detection, deterministic shutdown rejection, panic containment,
+  and queue/execution metrics;
+- atomic attach clock/cursor, session status, and bars pull reads in Remux.
+- CLI convergence checks and final multi-projection summaries also execute as
+  owner snapshots; the final summary reads only the first/last feed batches
+  instead of cloning the full feed history.
+
+Tests prove:
+
+- two cells written in one external batch are never observed mismatched;
+- a snapshot cannot run between multiple local submits in one task step;
+- snapshots are served before a long rebuild chain converges;
+- a panicking reader does not kill the runtime;
+- snapshot ingress rejects after shutdown.
+
+Primary files:
+
+```text
+crates/runtime/src/snapshot.rs
+crates/runtime/src/{handle,worker,error}.rs
+crates/runtime/tests/worker.rs
+crates/remux/src/session.rs
+```
+
+Wire changes: none.
+
+### 24.3 Phase 3 — Projection-Owned Delivery
+
+Implemented:
+
+- `InstalledProjection { spec, task, delivery }` installation;
+- projection-owned descriptors, semantics, schema versions, useful/default
+  FPS, seek policy, typed positions, typed frames, and typed payloads;
+- `BarsTask + BarsDeliverySource` installed together from one builder call;
+- one session-owned delivery executor with bounded command/change/output
+  channels;
+- cache watches that only mark consumer state dirty;
+- atomic bars reads only at subscribe/resync, a due wall-clock deadline, or
+  seek completion;
+- seek convergence is sampled at the delivery tick rather than once per cache
+  notification, and the tick is prioritized ahead of dirty-change draining so
+  sustained compute cannot starve presentation cadence;
+- reconstructable append suffixes plus replace-latest live bars;
+- bounded `try_send` admission and sent-head advancement only after admission;
+- capacity is checked before an owner snapshot so a known-full output queue
+  does not repeatedly clone projection history, and retry preserves the exact
+  initial/resync/seek-final reason;
+- delivery metrics for dirty/coalesced changes, atomic collects, frame kinds,
+  seek barriers, backpressure, leases, subscriptions, resyncs, and schema
+  rejection.
+
+The executor is an isolated Tokio task on the multithreaded runtime rather than
+an explicitly pinned OS thread. This is one of the allowed implementation
+shapes in Section 9.1: it owns no cache mutation, never serializes inside a
+snapshot closure, and cannot pace runtime computation.
+
+Primary files:
+
+```text
+crates/ledger/src/projection/delivery.rs
+crates/ledger/src/projection/{mod,bars}.rs
+crates/ledger/src/session.rs
+crates/ledger/tests/projection_delivery.rs
+```
+
+Wire changes: none during the internal phase.
+
+### 24.4 Phase 4 — Seek Barrier
+
+Implemented:
+
+- every explicit seek allocates its expected clock revision and installs the
+  delivery barrier before submitting the clock write;
+- session controls are serialized and wait until their exact clock revision is
+  committed, preventing rapid controls from deriving duplicate revisions;
+- `FinalSnapshotOnly` projection frames are suppressed during convergence;
+- the completion snapshot validates clock revision, feed `catching_up`, feed
+  clock acknowledgment, feed epoch/cursor, and every required projection
+  processed cursor;
+- completion emits one immediate `seekFinal` suffix or reset snapshot;
+- backward seek/new epoch resets; forward seek uses a validated suffix.
+
+Test coverage verifies that the first projection frame observed after seek is
+the final converged frame and that delivery atomic collects do not scale with
+rebuild chunks.
+
+The implementation also closes the clock/feed observation race explicitly:
+`EsReplayStatus.clock.revision` must acknowledge the seek revision (with its
+status cursor equal to the cursor cell) before the old converged state can
+satisfy the barrier. Inactive consumers remain dirty across the barrier and
+receive no seek-final frame until demand becomes active again.
+
+Subscription tests additionally cover idempotent/latest acknowledgments,
+rejected regressing acknowledgments, invalid-hint snapshot resync, inactive
+seek suppression/resume, and lease expiration without session shutdown.
+
+### 24.5 Phase 5 — Ledger Subscription Protocol
+
+Implemented RPCs:
+
+```text
+remux/ledger/session/projections/subscribe
+remux/ledger/session/projections/ack
+remux/ledger/session/projections/demand
+remux/ledger/session/projections/resync
+```
+
+Implemented notifications:
+
+```text
+remux/ledger/session/projections/frame
+remux/ledger/session/projections/watermark
+```
+
+Implemented protocol state:
+
+- random consumer instance supplied by Lens;
+- opaque subscription capability;
+- session generation;
+- schema negotiation and effective FPS;
+- exact base/head positions;
+- monotonic frame sequence;
+- sent, acknowledged, and available heads;
+- a bounded issued-head log used to reject acknowledgments that were not
+  issued;
+- activity/demand and renewable 30-second lease;
+- lease cleanup propagated to Remux origin bookkeeping, with expiration events
+  retained across a temporarily full frame queue;
+- authoritative snapshot fallback for invalid generation/epoch/extent;
+- distinct feed/projection watermarks.
+
+The existing `session/bars` pull remains as a diagnostic/fallback. The direct
+`barsFrame` status-cell watcher and its legacy push notification were removed.
+Projection-backed sessions also stop the legacy chunk-rate feed notification;
+their feed cursor is carried by the one-second delivery watermark. The direct
+feed stream remains only for headless/legacy sessions without a delivery
+executor.
+
+### 24.6 Phase 6 — Lens Projection Clients
+
+Implemented:
+
+- schema-versioned projection client registry;
+- defensive common-envelope and bars payload parser;
+- atomic accumulator base/head application;
+- no mutation on base mismatch or malformed frames;
+- idempotent duplicate handling;
+- acknowledgment after accumulator commit, coalesced to 750 ms in steady
+  playback and immediate after snapshot/resync/seek-final;
+- demand renewal and document visibility updates;
+- host-resume resync with resubscribe fallback when a lease expired;
+- a new WebView subscribing with `have: null`;
+- retained same-context state reporting only its actual applied position;
+- watermark-derived `current`, `projection_catching_up`, `delivery_pending`,
+  `viewer_lagging`, `resyncing`, and `disconnected_unknown` states;
+- the action bar consumes those protocol states directly with distinct labels;
+  the removed legacy `processedBatches != cursor.batchIdx` heuristic could
+  misclassify a projection ahead of a one-second watermark as lagging;
+- viewer-only lag is shown only after 500 ms, while authoritative projection
+  catch-up, resync, initial delivery, and connection uncertainty are immediate;
+- Lens ignores the legacy chunk-rate feed notification during replay and uses
+  the delivery watermark cursor instead, so seek progress cannot drive React
+  at projection-compute cadence;
+- last-mile chart application coalesced with `requestAnimationFrame`.
+
+Primary files:
+
+```text
+lens/src/features/replay/projection-client.ts
+lens/src/features/replay/accumulator.ts
+lens/src/features/replay/{api,types,use-replay-session}.ts
+lens/src/features/replay/chart/bars-layer.ts
+```
+
+The reload path now attaches the exact session and lets the delivery protocol
+hydrate one server snapshot. It no longer pulls and re-applies every historical
+bar as an independent UI update.
+
+### 24.7 Phase 7 — Remux Targeted Extension Streams
+
+Implemented in `/home/ubuntu/remux`:
+
+- Remux identifies requests that actually route to an extension;
+- the WS layer binds a stable opaque origin to the connected socket plus its
+  top-level `remuxContext`;
+- `_remuxOrigin` is injected only into extension object params;
+- Ledger stores the origin against the opaque projection subscription;
+- later ack/demand/resync calls must present the same Remux-injected origin,
+  preventing another socket/context from controlling a guessed subscription;
+- Ledger emits top-level `remuxTarget { origin }` on projection frames and
+  watermarks;
+- the extension supervisor strips `remuxTarget` and calls a targeted runtime
+  delivery hook instead of broadcast;
+- `WsServer::send_to_origin` sends only to the owning downstream context;
+- socket teardown destroys all origin capabilities.
+
+Tests cover stable same-context origins, isolation from a second socket,
+extension routing metadata stripping, and Ledger preservation of the origin on
+projection output.
+
+Direct in-process Ledger tests have no Remux origin and intentionally exercise
+the compatibility broadcast fallback. Production viewer subscriptions are
+targeted.
+
+### 24.8 Phase 8 — Profiling and Policy Validation
+
+Host/data:
+
+```text
+market day       2026-03-10
+feed batches     18,858,570
+one-minute bars  1,379 completed + one live
+build profile    Rust debug (comparison only, not a release benchmark)
+requested FPS    20
+```
+
+No delivery subscriber:
+
+```text
+elapsed          47.56 s
+user             48.46 s
+system           3.33 s
+maximum RSS      6,989,496 KiB
+```
+
+20 FPS delivery subscriber:
+
+```text
+elapsed                       44.76 s
+user                          44.17 s
+system                        2.46 s
+maximum RSS                   6,956,124 KiB
+dirty notifications           1,102
+coalesced dirty notifications 1,101
+atomic projection collects    2
+frames admitted/received      2 / 2
+snapshot / suffix frames      1 / 1
+frames suppressed during seek 47
+outbound backpressure         0
+seek barriers completed       1
+measured convergence duration 2,542,118,217 ns
+```
+
+Both runs produced the same authoritative result:
+
+```text
+feed sequence     18,858,570
+completed bars    1,379
+volume            1,811,043
+trade count       704,860
+first bar         1773093600000000000
+last/live bar     1773176340000000000
+```
+
+Conclusion: on this host, delivery did not materially pace projection compute.
+1,102 dirty notifications became two presentation reads/frames: the initial
+empty snapshot and the single final state after high-speed convergence. This
+validates dirty coalescing, tick-sampled seek convergence, and
+`FinalSnapshotOnly`; delivery performed no per-rebuild-chunk bars reads. The
+initial 10 FPS/default and 20 FPS maximum remain appropriate pending on-device
+paint/wire measurements.
+
+The CLI supports repeatable profiling with:
+
+```text
+ledger session run-es-replay \
+  --raw-id sha256-2f935d7277b7210f7a5f93f240b04f1b37a4db55064bfa3af380a7fca4f4dbac \
+  --realtime --speed 1000000000 \
+  --projection bars:1m --delivery-fps 20
+```
+
+Use `--realtime` for this comparison. The CLI's default step mode deliberately
+issues one explicit seek per next feed timestamp and is a control-path stress
+test, not a throughput benchmark.
+
+### 24.9 Remaining Validation, Not Remaining Architecture
+
+Before calling the UX final, perform the original device feel-check:
+
+1. play at 5x, seek mid-session, reload the native viewer;
+2. verify route attach preserves clock mode/speed/time and bars hydrate in one
+   authoritative snapshot;
+3. leave it playing while the screen is closed, return/reload, and verify feed
+   and bars progressed server-side;
+4. seek across a large range and verify only progress metadata moves before one
+   final chart snap;
+5. back to days and re-enter the same day, verifying intentional fresh start.
+
+No architectural phase is deferred by that check. Binary transport, durable
+viewer caches, async heavy projection compute, chunked immutable arrays, and
+multiple active sessions remain the explicit non-goals/deferred extensions in
+Sections 21–22.

@@ -16,18 +16,23 @@ import {
   Play,
   RefreshCw,
 } from "lucide-react"
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 
 import {
   AutoScaleAction,
   JumpToLiveAction,
 } from "@/features/replay/chart/overlays"
 import type { ChartUi } from "@/features/replay/chart/ui-state"
-import type { Clock, Cursor } from "@/features/replay/types"
+import type {
+  Clock,
+  Cursor,
+  ProjectionDeliveryState,
+} from "@/features/replay/types"
 import { nsToMs, useSessionNowMs } from "@/features/replay/use-session-clock"
 
 // The wire takes any positive float; these are the surfaced presets.
 const SPEED_PRESETS = [1, 2, 5, 10, 25, 100]
+const VIEWER_LAG_SUSTAIN_MS = 500
 
 interface ReplayActionBarProps {
   ui: ChartUi
@@ -38,7 +43,7 @@ interface ReplayActionBarProps {
   endNs: string | null
   marketDay: string
   symbol: string
-  syncing: boolean
+  deliveryState: ProjectionDeliveryState
   disabled: boolean
   onExit: () => void
   onPlay: () => void
@@ -54,9 +59,9 @@ interface ReplayActionBarProps {
 // price re-fit — their own components with narrow store snapshots, so the bar
 // itself never re-renders on frame churn); play/pause sits rightmost (right
 // thumb) with the speed menu beside it. The session clock lives on the chart
-// now, not here. Feed progress, market day/symbol, and the syncing state ride
-// the bar's native status caption — the page content above carries no nav of
-// its own.
+// now, not here. Feed progress, market day/symbol, and the server-issued
+// delivery state ride the bar's native status caption — the page content above
+// carries no nav of its own.
 export function ReplayActionBar({
   ui,
   clock,
@@ -66,7 +71,7 @@ export function ReplayActionBar({
   endNs,
   marketDay,
   symbol,
-  syncing,
+  deliveryState,
   disabled,
   onExit,
   onPlay,
@@ -77,6 +82,7 @@ export function ReplayActionBar({
 }: ReplayActionBarProps) {
   const running = clock?.mode === "running"
   const sessionNowMs = useSessionNowMs(clock, clockReceivedAt)
+  const deliveryActivity = useDeliveryActivity(deliveryState)
 
   // While dragging, the thumb follows the pointer; on release we seek and hand
   // the position back to the (extrapolated) clock stream.
@@ -113,7 +119,7 @@ export function ReplayActionBar({
           marketDay={marketDay}
           symbol={symbol}
           cursor={cursor}
-          syncing={syncing}
+          deliveryActivity={deliveryActivity}
         />
       }
       left={
@@ -225,18 +231,19 @@ export function ReplayActionBar({
 }
 
 // The bar's native status caption: market day + symbol, feed progress, the
-// syncing indicator, and the ended marker — one nowrap line, no floating footer
-// in content.
+// delivery activity, and the ended marker — one nowrap line, no floating footer
+// in content. Labels intentionally preserve the protocol distinction between
+// server compute, viewer delivery, resync, and connection uncertainty.
 function TransportStatus({
   marketDay,
   symbol,
   cursor,
-  syncing,
+  deliveryActivity,
 }: {
   marketDay: string
   symbol: string
   cursor: Cursor | null
-  syncing: boolean
+  deliveryActivity: string | null
 }) {
   return (
     <span className="inline-flex items-center justify-center gap-1.5">
@@ -252,11 +259,11 @@ function TransportStatus({
       ) : (
         <span>feed idle</span>
       )}
-      {syncing ? (
+      {deliveryActivity ? (
         <span className="inline-flex items-center gap-1">
           <span aria-hidden="true">·</span>
           <Loader2 className="size-2 animate-spin" aria-hidden="true" />
-          syncing
+          {deliveryActivity}
         </span>
       ) : null}
       {cursor?.ended ? (
@@ -267,6 +274,45 @@ function TransportStatus({
       ) : null}
     </span>
   )
+}
+
+function useDeliveryActivity(state: ProjectionDeliveryState): string | null {
+  const sustainedViewerLag = useSustained(
+    state === "viewer_lagging",
+    VIEWER_LAG_SUSTAIN_MS
+  )
+  switch (state) {
+    case "current":
+      return null
+    case "projection_catching_up":
+      return "processing"
+    case "delivery_pending":
+      return "loading chart"
+    case "viewer_lagging":
+      return sustainedViewerLag ? "catching up" : null
+    case "resyncing":
+      return "resyncing"
+    case "disconnected_unknown":
+      return "reconnecting"
+  }
+}
+
+// Viewer delivery can trail a sampled server head briefly even during healthy
+// bounded-FPS playback. Surface it only when sustained; authoritative server
+// catch-up, resync, and connection states remain immediate.
+function useSustained(active: boolean, durationMs: number): boolean {
+  const [elapsed, setElapsed] = useState(false)
+  const [tracked, setTracked] = useState(active)
+  if (active !== tracked) {
+    setTracked(active)
+    if (!active) setElapsed(false)
+  }
+  useEffect(() => {
+    if (!active) return
+    const id = window.setTimeout(() => setElapsed(true), durationMs)
+    return () => window.clearTimeout(id)
+  }, [active, durationMs])
+  return active && elapsed
 }
 
 function formatSpeed(speed: number): string {
