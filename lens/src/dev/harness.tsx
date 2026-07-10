@@ -12,13 +12,19 @@ import {
 } from "@/features/replay/chart/chart-surface"
 import { CHART_LAYERS, kindOf } from "@/features/replay/chart/layers"
 import {
-  AutoScaleAction,
-  ChartLegend,
-  JumpToLiveAction,
+  ChartReadout,
+  JumpToLatestAction,
 } from "@/features/replay/chart/overlays"
 import { chartColors } from "@/features/replay/chart/theme"
 import { etOffsetSeconds } from "@/features/replay/chart/time"
-import { ChartUi } from "@/features/replay/chart/ui-state"
+import {
+  createReplayChartUiStore,
+  type ReplayChartUiStore,
+} from "@/features/replay/chart/ui-store"
+import {
+  createReplayViewportStore,
+  type ReplayViewportStore,
+} from "@/features/replay/chart/viewport-store"
 import type { Bar, BarsProjectionFrame, Clock } from "@/features/replay/types"
 
 import "../index.css"
@@ -110,14 +116,17 @@ function synthFrame(
 
 const accumulator = new BarsAccumulator(SPEC)
 accumulator.beginSubscription("harness", 1, false)
-const ui = new ChartUi()
+const ui = createReplayChartUiStore()
+const viewport = createReplayViewportStore("harness", null)
 let frameSequence = 0
 
 declare global {
   interface Window {
     harness: {
       accumulator: BarsAccumulator
-      ui: ChartUi
+      ui: ReplayChartUiStore
+      viewport: ReplayViewportStore
+      resetViewport: () => void
       seed: (count: number, withLive?: boolean) => void
       append: (count: number) => void
       reseek: (epoch: number, count: number) => void
@@ -129,6 +138,11 @@ let appended = 0
 window.harness = {
   accumulator,
   ui,
+  viewport,
+  resetViewport: () => {
+    viewport.getState().reset()
+    void viewport.persist.clearStorage()
+  },
   seed: (count, withLive = true) => {
     appended = count
     accumulator.apply(synthFrame(1, 0, count, withLive))
@@ -164,6 +178,7 @@ function Harness() {
             offsetSeconds,
             colors,
             ui,
+            viewport,
           })
         ),
     [colors, offsetSeconds]
@@ -178,7 +193,7 @@ function Harness() {
             colors={colors}
             className="h-full"
           />
-          <ChartLegend
+          <ChartReadout
             ui={ui}
             title={`${SYMBOL} · ${INTERVAL}`}
             clock={FAKE_CLOCK}
@@ -192,8 +207,7 @@ function Harness() {
         style={{ height: 88 }}
         className="flex shrink-0 items-start gap-1.5 border-t border-border bg-card px-3 py-2"
       >
-        <JumpToLiveAction ui={ui} />
-        <AutoScaleAction ui={ui} />
+        <JumpToLatestAction ui={ui} viewport={viewport} />
       </div>
     </div>
   )

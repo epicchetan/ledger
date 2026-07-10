@@ -18,24 +18,27 @@ import {
 } from "lucide-react"
 import { useEffect, useMemo, useState } from "react"
 
-import {
-  AutoScaleAction,
-  JumpToLiveAction,
-} from "@/features/replay/chart/overlays"
-import type { ChartUi } from "@/features/replay/chart/ui-state"
+import { JumpToLatestAction } from "@/features/replay/chart/overlays"
+import type { ReplayChartUiStore } from "@/features/replay/chart/ui-store"
+import type { ReplayViewportStore } from "@/features/replay/chart/viewport-store"
 import type {
   Clock,
   Cursor,
   ProjectionDeliveryState,
 } from "@/features/replay/types"
-import { nsToMs, useSessionNowMs } from "@/features/replay/use-session-clock"
+import {
+  formatEtTime,
+  nsToMs,
+  useSessionNowMs,
+} from "@/features/replay/use-session-clock"
 
 // The wire takes any positive float; these are the surfaced presets.
 const SPEED_PRESETS = [1, 2, 5, 10, 25, 100]
 const VIEWER_LAG_SUSTAIN_MS = 500
 
 interface ReplayActionBarProps {
-  ui: ChartUi
+  ui: ReplayChartUiStore
+  viewport: ReplayViewportStore
   clock: Clock | null
   clockReceivedAt: number | null
   cursor: Cursor | null
@@ -55,15 +58,16 @@ interface ReplayActionBarProps {
 
 // The bar carries the whole transport (reference: day-action-bar): a
 // full-width seek slider rides its own row above the pinned buttons. Left group
-// is tab-out, reload, back, then the conditional chart actions (jump-to-live,
-// price re-fit — their own components with narrow store snapshots, so the bar
-// itself never re-renders on frame churn); play/pause sits rightmost (right
+// is tab-out, reload, back, then the conditional center-latest action (its own
+// component with a narrow store snapshot, so the bar itself never re-renders
+// on frame churn); play/pause sits rightmost (right
 // thumb) with the speed menu beside it. The session clock lives on the chart
 // now, not here. Feed progress, market day/symbol, and the server-issued
 // delivery state ride the bar's native status caption — the page content above
 // carries no nav of its own.
 export function ReplayActionBar({
   ui,
+  viewport,
   clock,
   clockReceivedAt,
   cursor,
@@ -98,17 +102,25 @@ export function ReplayActionBar({
   }, [sessionNowMs, startNs, endNs])
 
   const sliderFraction = drag ?? positionFraction ?? 0
+  const sliderMs =
+    drag !== null && startNs !== null && endNs !== null
+      ? fractionToMs(drag, startNs, endNs)
+      : sessionNowMs
+  const sliderValueText = sliderMs === null ? undefined : timeLabel(sliderMs)
+
+  const cancelScrub = () => {
+    setDrag(null)
+    onScrub(null)
+  }
 
   const commitSeek = () => {
     if (drag === null || startNs === null || endNs === null) {
-      setDrag(null)
-      onScrub(null)
+      cancelScrub()
       return
     }
     // Seek never changes mode: scrubbing while playing keeps playing.
     onSeek(fractionToNs(drag, startNs, endNs))
-    setDrag(null)
-    onScrub(null)
+    cancelScrub()
   }
 
   return (
@@ -133,6 +145,7 @@ export function ReplayActionBar({
               value={Math.round(sliderFraction * 1000)}
               disabled={disabled}
               aria-label="Seek session time"
+              aria-valuetext={sliderValueText}
               className="h-7 w-full cursor-pointer accent-primary disabled:cursor-default disabled:opacity-50"
               onChange={(event) => {
                 const fraction = Number(event.target.value) / 1000
@@ -142,11 +155,9 @@ export function ReplayActionBar({
                 }
               }}
               onPointerUp={commitSeek}
+              onPointerCancel={cancelScrub}
               onKeyUp={commitSeek}
-              onBlur={() => {
-                setDrag(null)
-                onScrub(null)
-              }}
+              onBlur={cancelScrub}
             />
           ) : null}
 
@@ -176,8 +187,7 @@ export function ReplayActionBar({
                 onSelect={onExit}
               />
             </ActionMenu>
-            <JumpToLiveAction ui={ui} />
-            <AutoScaleAction ui={ui} />
+            <JumpToLatestAction ui={ui} viewport={viewport} />
             {/* Speed panel: the default 232px width dwarfs the short preset
             labels; !important because viewer-kit's stylesheet is unlayered
             and would otherwise win over the utility. */}
@@ -345,4 +355,9 @@ function fractionToNs(
 
 function clamp01(value: number): number {
   return Math.min(1, Math.max(0, value))
+}
+
+function timeLabel(ms: number): string {
+  const { time, suffix } = formatEtTime(ms)
+  return `${time} ${suffix}`
 }

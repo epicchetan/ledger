@@ -1,13 +1,19 @@
 import { parseRemuxViewerRoute } from "@remux/viewer-kit/route"
 
+import {
+  parseReplayViewport,
+  type ReplayViewportSnapshot,
+} from "@/features/replay/chart/viewport-store"
+
 export const REPLAY_RESOURCE_KIND = "ledgerReplay"
 
-interface ReplayResourceV1 {
-  v: 1
+interface ReplayResourceV2 {
+  v: 2
   sessionId: string
   rawId: string
   marketDay: string
   symbol: string
+  viewport: ReplayViewportSnapshot
 }
 
 export interface ReplayRoute {
@@ -15,6 +21,7 @@ export interface ReplayRoute {
   rawId: string
   marketDay: string
   symbol: string
+  viewport: ReplayViewportSnapshot | null
 }
 
 // Remux reloads a newly-created native WebView from the host tab's persisted
@@ -35,7 +42,11 @@ export function readReplayRoute(url: string): ReplayRoute | null {
       typeof value !== "object" ||
       value === null ||
       !("v" in value) ||
-      value.v !== 1 ||
+      (value.v !== 1 && value.v !== 2)
+    ) {
+      return null
+    }
+    if (
       !("sessionId" in value) ||
       typeof value.sessionId !== "string" ||
       !("rawId" in value) ||
@@ -47,11 +58,17 @@ export function readReplayRoute(url: string): ReplayRoute | null {
     ) {
       return null
     }
+    const viewport =
+      value.v === 2 && "viewport" in value
+        ? parseReplayViewport(value.viewport)
+        : null
+    if (value.v === 2 && !viewport) return null
     return {
       sessionId: value.sessionId,
       rawId: value.rawId,
       marketDay: value.marketDay,
       symbol: value.symbol,
+      viewport,
     }
   } catch {
     return null
@@ -59,6 +76,15 @@ export function readReplayRoute(url: string): ReplayRoute | null {
 }
 
 export function replayResourceId(route: ReplayRoute): string {
-  const resource: ReplayResourceV1 = { v: 1, ...route }
+  const resource: ReplayResourceV2 = {
+    v: 2,
+    sessionId: route.sessionId,
+    rawId: route.rawId,
+    marketDay: route.marketDay,
+    symbol: route.symbol,
+    viewport:
+      route.viewport ??
+      ({ version: 1, time: null, price: { mode: "auto" } } as const),
+  }
   return JSON.stringify(resource)
 }

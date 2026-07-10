@@ -1,8 +1,4 @@
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-} from "react"
+import { useCallback, useEffect, useMemo } from "react"
 import { updateHostTab } from "@remux/viewer-kit/host"
 import { toast } from "sonner"
 
@@ -12,10 +8,14 @@ import {
   useRemuxTheme,
 } from "@/features/replay/chart/chart-surface"
 import { CHART_LAYERS, kindOf } from "@/features/replay/chart/layers"
-import { ChartLegend } from "@/features/replay/chart/overlays"
+import { ChartReadout } from "@/features/replay/chart/overlays"
 import { chartColors } from "@/features/replay/chart/theme"
 import { etOffsetSeconds, nsToSeconds } from "@/features/replay/chart/time"
-import { ChartUi } from "@/features/replay/chart/ui-state"
+import { createReplayChartUiStore } from "@/features/replay/chart/ui-store"
+import {
+  createReplayViewportStore,
+  type ReplayViewportSnapshot,
+} from "@/features/replay/chart/viewport-store"
 import { ReplayActionBar } from "@/features/replay/replay-action-bar"
 import { REPLAY_RESOURCE_KIND, replayResourceId } from "@/features/replay/route"
 import type { SessionClosedReason } from "@/features/replay/types"
@@ -27,6 +27,7 @@ interface ReplayProps {
   rawId: string
   marketDay: string
   symbol: string
+  initialViewport: ReplayViewportSnapshot | null
   onExit: () => void
 }
 
@@ -40,7 +41,7 @@ const MODULE_LOAD_MS = Date.now()
 // hydration transfer an entire day of headless bars through the mobile bridge.
 const ACTIVE_BAR_SPEC = "bars:1m"
 
-// The interval suffix shown in the legend title (e.g. "1m").
+// The interval suffix shown beside the chart clock (e.g. "1m").
 const INTERVAL_LABEL = ACTIVE_BAR_SPEC.slice(ACTIVE_BAR_SPEC.indexOf(":") + 1)
 
 export function Replay({
@@ -48,6 +49,7 @@ export function Replay({
   rawId,
   marketDay,
   symbol,
+  initialViewport,
   onExit,
 }: ReplayProps) {
   const session = useReplaySession(rawId, resumeSessionId)
@@ -64,33 +66,73 @@ export function Replay({
   const { projections, controls } = session
   const openSessionId = open?.sessionId ?? null
   const routedMarketDay = open?.marketDay ?? marketDay
+  const viewport = useMemo(
+    () => createReplayViewportStore(rawId, initialViewport),
+    [initialViewport, rawId]
+  )
 
   // Host tab resource metadata is the reloadable viewer route. Remux rebuilds
   // the native WebView from this URL, so persist the exact resume handle and
-  // enough display identity to mount Replay before any client storage exists.
+  // the Zustand-owned viewport after every user policy change.
   useEffect(() => {
     if (!openSessionId) return
-    void updateHostTab({
-      resourceKind: REPLAY_RESOURCE_KIND,
-      resourceId: replayResourceId({
-        sessionId: openSessionId,
-        rawId,
-        marketDay: routedMarketDay,
-        symbol,
-      }),
-      status: "Replay",
-      title: `${symbol} · ${routedMarketDay}`,
-    }).catch((error) => {
-      console.warn("[replay] failed to persist host replay route", error)
-    })
-  }, [openSessionId, rawId, routedMarketDay, symbol])
+    // A stale native route may fall back to a newly opened server session. Its
+    // old camera is no longer a resume capability and must not leak into the
+    // fresh replay.
+    if (resumeSessionId && openSessionId !== resumeSessionId) {
+      viewport.getState().reset()
+    }
+    let disposed = false
+    let writing = false
+    let pending = false
+    const flushRoute = async () => {
+      if (writing) return
+      writing = true
+      while (!disposed && pending) {
+        pending = false
+        try {
+          await updateHostTab({
+            resourceKind: REPLAY_RESOURCE_KIND,
+            resourceId: replayResourceId({
+              sessionId: openSessionId,
+              rawId,
+              marketDay: routedMarketDay,
+              symbol,
+              viewport: viewport.getState().viewport,
+            }),
+            status: "Replay",
+            title: `${symbol} · ${routedMarketDay}`,
+          })
+        } catch (error) {
+          console.warn("[replay] failed to persist host replay route", error)
+        }
+      }
+      writing = false
+    }
+    const persistRoute = () => {
+      pending = true
+      void flushRoute()
+    }
+    persistRoute()
+    const unsubscribe = viewport.subscribe(persistRoute)
+    return () => {
+      disposed = true
+      unsubscribe()
+    }
+  }, [openSessionId, rawId, resumeSessionId, routedMarketDay, symbol, viewport])
 
-  // One overlay store per page, fed by the attached bars layer and read by the
-  // chart overlays (legend, clock, jump-to-live, auto-scale).
-  const ui = useMemo(() => new ChartUi(), [])
+  const exitReplay = useCallback(() => {
+    viewport.getState().reset()
+    void viewport.persist.clearStorage()
+    onExit()
+  }, [onExit, viewport])
+
+  // Ephemeral chart-control state; durable viewport state has its own persisted
+  // Zustand store so scrub churn never writes storage or the host route.
+  const ui = useMemo(() => createReplayChartUiStore(), [])
   // Report the slider's mid-drag position to the clock overlay's scrub preview.
   const handleScrub = useCallback(
-    (ms: number | null) => ui.setScrubMs(ms),
+    (ms: number | null) => ui.getState().setScrubMs(ms),
     [ui]
   )
 
@@ -130,9 +172,10 @@ export function Replay({
             offsetSeconds,
             colors,
             ui,
+            viewport,
           })
         ),
-    [colors, offsetSeconds, projections, ui]
+    [colors, offsetSeconds, projections, ui, viewport]
   )
 
   // Open failure (object gone, feed build error): toast and fall back to days.
@@ -141,8 +184,8 @@ export function Replay({
     toast.error("Replay session failed", {
       description: error ?? "The ledger session could not be opened.",
     })
-    onExit()
-  }, [phase, error, onExit])
+    exitReplay()
+  }, [phase, error, exitReplay])
 
   return (
     <div className="flex h-full flex-col bg-background text-foreground">
@@ -156,7 +199,7 @@ export function Replay({
             colors={colors}
             className="h-full"
           />
-          <ChartLegend
+          <ChartReadout
             ui={ui}
             title={`${symbol} · ${INTERVAL_LABEL}`}
             clock={clock}
@@ -165,7 +208,7 @@ export function Replay({
           {phase === "ended" ? (
             <EndedBanner
               reason={endedReason}
-              onExit={onExit}
+              onExit={exitReplay}
               className="absolute inset-x-0 top-0 z-10 m-2"
             />
           ) : null}
@@ -174,6 +217,7 @@ export function Replay({
 
       <ReplayActionBar
         ui={ui}
+        viewport={viewport}
         clock={clock}
         clockReceivedAt={clockReceivedAt}
         cursor={cursor}
@@ -183,7 +227,7 @@ export function Replay({
         symbol={symbol}
         deliveryState={deliveryState}
         disabled={phase !== "live"}
-        onExit={onExit}
+        onExit={exitReplay}
         onPlay={controls.play}
         onPause={controls.pause}
         onSpeed={controls.setSpeed}

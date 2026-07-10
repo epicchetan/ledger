@@ -1,13 +1,16 @@
+import { openHostOverview, reloadHostView } from "@remux/viewer-kit/host"
 import {
-  openHostOverview,
-  reloadHostView,
-} from "@remux/viewer-kit/host"
-import { ActionBar, ActionButton } from "@remux/viewer-kit/ui"
+  ActionBar,
+  ActionButton,
+  ActionMenu,
+  ActionMenuItem,
+} from "@remux/viewer-kit/ui"
 import {
   ArrowLeft,
   ChevronDown,
   CloudUpload,
   Loader2,
+  MoreHorizontal,
   PanelRightOpen,
   Play,
   RefreshCw,
@@ -82,7 +85,7 @@ export function DayActionBar({
         <div className="flex w-full min-w-0 flex-col">
           <div
             className={cn(
-              "grid -mx-[18px] transition-[grid-template-rows] duration-200 ease-out",
+              "-mx-[18px] grid transition-[grid-template-rows] duration-200 ease-out",
               open ? "grid-rows-[1fr]" : "grid-rows-[0fr]"
             )}
           >
@@ -120,20 +123,40 @@ export function DayActionBar({
               <div className="ml-auto flex items-center gap-1.5">
                 {openObject ? (
                   <>
-                    <ActionButton
-                      icon={<Trash2 aria-hidden="true" />}
-                      label="Delete object"
-                      onClick={() => onDeleteObject(openObject)}
-                    />
-                    <ActionButton
-                      icon={<ArrowLeft aria-hidden="true" />}
-                      label="Back to feed"
-                      onClick={() => setObjectId(null)}
-                    />
-                    <span
-                      className="mx-0.5 h-5 w-px shrink-0 bg-border"
-                      aria-hidden="true"
-                    />
+                    <ActionMenu
+                      align="end"
+                      className="min-[360px]:hidden"
+                      icon={<MoreHorizontal aria-hidden="true" />}
+                      label="Object actions"
+                    >
+                      <ActionMenuItem
+                        icon={<ArrowLeft aria-hidden="true" />}
+                        label="Back to feed"
+                        onSelect={() => setObjectId(null)}
+                      />
+                      <ActionMenuItem
+                        icon={<Trash2 aria-hidden="true" />}
+                        label="Delete object"
+                        tone="danger"
+                        onSelect={() => onDeleteObject(openObject)}
+                      />
+                    </ActionMenu>
+                    <div className="hidden items-center gap-1.5 min-[360px]:flex">
+                      <ActionButton
+                        icon={<Trash2 aria-hidden="true" />}
+                        label="Delete object"
+                        onClick={() => onDeleteObject(openObject)}
+                      />
+                      <ActionButton
+                        icon={<ArrowLeft aria-hidden="true" />}
+                        label="Back to feed"
+                        onClick={() => setObjectId(null)}
+                      />
+                      <span
+                        className="mx-0.5 h-5 w-px shrink-0 bg-border"
+                        aria-hidden="true"
+                      />
+                    </div>
                   </>
                 ) : null}
                 <ActionButton
@@ -154,9 +177,7 @@ export function DayActionBar({
                   }
                   label="Offload day"
                   busy={offloading}
-                  disabled={
-                    offloading || !shown || shown.state !== "ready"
-                  }
+                  disabled={offloading || !shown || shown.state !== "ready"}
                   onClick={() => {
                     if (shown) onOffload(shown)
                   }}

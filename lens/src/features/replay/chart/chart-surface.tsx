@@ -64,7 +64,7 @@ export function ChartSurface({ layers, colors, className }: ChartSurfaceProps) {
       },
       rightPriceScale: {
         borderVisible: false,
-        scaleMargins: { top: 0.08, bottom: 0.24 },
+        scaleMargins: { top: 0.08, bottom: 0.08 },
       },
       timeScale: {
         borderVisible: false,

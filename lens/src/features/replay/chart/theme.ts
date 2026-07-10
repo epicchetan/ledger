@@ -59,7 +59,6 @@ export interface ChartColors {
   grid: string // border, faded
   up: string // var(--success)
   down: string // var(--destructive)
-  volume: string // foreground, faded — neutral (buy/sell coloring is a non-goal)
   crosshair: string // foreground, faded — the dashed crosshair lines
   crosshairLabel: string // var(--muted) — solid chip behind axis labels
   priceLine: string // foreground, faded — the dashed last-price line
@@ -75,9 +74,6 @@ export function chartColors(): ChartColors {
     ),
     up: resolveCssColor("var(--success)"),
     down: resolveCssColor("var(--destructive)"),
-    volume: resolveCssColor(
-      "color-mix(in oklab, var(--foreground) 22%, transparent)"
-    ),
     crosshair: resolveCssColor(
       "color-mix(in oklab, var(--foreground) 20%, transparent)"
     ),

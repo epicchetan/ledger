@@ -4,6 +4,7 @@ import { updateHostTab } from "@remux/viewer-kit/host"
 import { Toaster } from "@/components/ui/sonner"
 import { Days } from "@/features/days/days"
 import type { DayReadiness } from "@/features/days/readiness"
+import type { ReplayViewportSnapshot } from "@/features/replay/chart/viewport-store"
 import { Replay } from "@/features/replay/replay"
 import { readReplayRoute } from "@/features/replay/route"
 
@@ -17,6 +18,7 @@ type LensView =
       rawId: string
       marketDay: string
       symbol: string
+      viewport: ReplayViewportSnapshot | null
     }
 
 // Remux's hamburger reload creates a fresh native WebView from the host tab
@@ -50,6 +52,7 @@ function loadStoredView(): LensView {
         rawId: parsed.rawId,
         marketDay: parsed.marketDay,
         symbol: parsed.symbol,
+        viewport: null,
       }
     }
   } catch {
@@ -76,6 +79,7 @@ export function App() {
       rawId: day.primary.raw.raw.id,
       marketDay: day.marketDay,
       symbol: day.primary.symbol,
+      viewport: null,
     })
   }, [])
 
@@ -106,6 +110,7 @@ export function App() {
           rawId={view.rawId}
           marketDay={view.marketDay}
           symbol={view.symbol}
+          initialViewport={view.viewport}
           onExit={handleExit}
         />
       )}

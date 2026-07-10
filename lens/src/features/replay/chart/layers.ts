@@ -3,7 +3,8 @@ import type { IChartApi } from "lightweight-charts"
 import type { BarsAccumulator } from "@/features/replay/accumulator"
 import { barsLayer } from "@/features/replay/chart/bars-layer"
 import type { ChartColors } from "@/features/replay/chart/theme"
-import type { ChartUi } from "@/features/replay/chart/ui-state"
+import type { ReplayChartUiStore } from "@/features/replay/chart/ui-store"
+import type { ReplayViewportStore } from "@/features/replay/chart/viewport-store"
 
 // A projection kind's presence on the chart. attach() creates series /
 // primitives and subscribes to the data source; detach() must remove every
@@ -21,8 +22,10 @@ export interface LayerContext {
   accumulator: BarsAccumulator
   offsetSeconds: number
   colors: ChartColors
-  // Overlay store the layer feeds (legend, at-edge, jump-to-live); see R5.
-  ui: ChartUi
+  // Ephemeral chart-control state. Bars and transport never enter this store.
+  ui: ReplayChartUiStore
+  // Durable, viewer-local time/price viewport policy.
+  viewport: ReplayViewportStore
 }
 
 export type LayerFactory = (ctx: LayerContext) => ChartLayer

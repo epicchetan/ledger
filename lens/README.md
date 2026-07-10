@@ -4,11 +4,16 @@ Lens is the Ledger Remux viewer. It builds to static assets under `dist/` and
 talks to `ledger-remux` through Remux IPC. Its permanent operating surface is
 the Remux phone app, so the layout is phone-first.
 
-The default screen is the Data Center object explorer:
+The default screen is the market-day catalog:
 
 ```text
-store objects -> metadata -> hydrate/delete -> local status
+market days -> feed readiness/store objects -> install/offload/replay
 ```
+
+Replay attaches to Ledger's server-owned session and projection delivery. The
+viewer draws a candles-only `bars:1m` chart; clock/transport truth stays on the
+server while viewer-local time and price viewport state lives in scoped
+Zustand stores and the durable Remux tab route.
 
 There is no `VITE_LEDGER_API_URL` path in this viewer. Data requests use
 `requestIpc('remux/ledger/...')`, and hydrate completion arrives through
@@ -55,16 +60,16 @@ viewport meta   width=device-width ... viewport-fit=cover (required for
                 env(safe-area-inset-*) to resolve on iOS)
 base reset      html/body/#root height:100%, overflow:hidden; the app shell
                 is h-full flex flex-col
-top safe area   the filter block pads with max(12px, env(safe-area-inset-top));
+top safe area   page content pads with max(12px, env(safe-area-inset-top));
                 there is no header bar
-bottom row      viewer-kit ActionBar owns the bottom safe area: Open tabs
-                (explicit { section: "tabs" }), Reload viewer, Refresh data,
-                Close tab, plus a live status line
-host tab        updateHostTab({ title, status }) mirrors the load state into
-                the tab overview; the .catch(() => undefined) is load-bearing
-object list     single-column rows (file/size, role/kind/presence glyphs,
-                quick hydrate action); tapping a row opens the detail dialog
-                with full metadata and Hydrate/Delete actions
+bottom row      viewer-kit ActionBar owns the bottom safe area and morphs
+                between day/feed actions and replay transport
+host tab        updateHostTab persists title/status plus the exact replay
+                session identity and versioned viewport route
+day list        single-column month-grouped market days; selection expands a
+                bounded feed/object tray above the action row
+replay chart    full-bleed candles between safe top and action bar; chart
+                gestures own the time/price viewport without page scrolling
 ```
 
 ## Development
@@ -82,6 +87,7 @@ Run frontend commands from this directory:
 
 ```bash
 npm install
+npm test
 npm run build
 npm run lint
 ```
@@ -104,6 +110,6 @@ entries are parent directories scanned for children containing
 `"extensions"` must stay listed. `REMUX_EXTENSION_ROOTS` remains available
 as an environment override.
 
-Data Center does not prepare data, open sessions, manage charts, or run replay
-workflows in this phase. Those surfaces will return when the Ledger session
-layer exists.
+The chart diagnostic harness is available at `/harness.html` during `vite dev`.
+Its `window.harness` object can seed/append/reseek synthetic bars and inspect or
+reset the scoped Zustand viewport store.

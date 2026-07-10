@@ -1,14 +1,10 @@
 import {
   CandlestickSeries,
-  HistogramSeries,
   LineStyle,
   type CandlestickData,
-  type HistogramData,
   type IChartApi,
   type ISeriesApi,
   type LogicalRange,
-  type MouseEventParams,
-  type Time,
   type UTCTimestamp,
 } from "lightweight-charts"
 
@@ -19,33 +15,29 @@ import type {
   LayerFactory,
 } from "@/features/replay/chart/layers"
 import { intervalSecondsOf, nsToSeconds } from "@/features/replay/chart/time"
-import type { LegendData } from "@/features/replay/chart/ui-state"
+import {
+  centeredTimeViewport,
+  defaultTimeViewport,
+  INITIAL_VISIBLE_BARS,
+  logicalRangeEqual,
+  timeRangeForViewport,
+} from "@/features/replay/chart/viewport-policy"
+import type { TimeViewport } from "@/features/replay/chart/viewport-store"
 import { TICK_SIZE, type Bar } from "@/features/replay/types"
 
 // Above this many appended bars in one publish, a single setData of the caches
 // beats a per-bar update() loop (a big catch-up frame).
 const APPEND_UPDATE_MAX = 4
 
-// Epoch-reset viewport: up to this many bars visible, plus right-hand
-// whitespace matching the time scale's rightOffset so the epoch-reset recenter
-// and the live-edge resting position agree. The window clamps down toward the
-// actual bar count (never below MIN_VISIBLE_BARS) so a sparse epoch — a seek
-// landing minutes after the open on a coarse interval — draws readable candles
-// instead of stretching a 120-bar window around five bars.
-const INITIAL_VISIBLE_BARS = 120
-const MIN_VISIBLE_BARS = 30
-const RIGHT_PAD = 8
-
-// The bars base layer: candlestick + volume histogram. Owns two series and a
-// mapped-data cache parallel to the accumulator's bars array, classifies each
-// publish as append-or-reset by reference identity (see apply), and feeds the
-// overlay store (legend, at-edge, jump-to-live) since it holds the chart, both
-// series, and the data — the surface stays layer-agnostic.
+// The bars base layer: one candlestick series. Owns a mapped-data cache
+// parallel to the accumulator's bars array, classifies each publish as
+// append-or-reset by reference identity (see apply), and feeds the
+// viewport/follow stores since it holds the chart and the data — the surface
+// stays layer-agnostic.
 class BarsLayer implements ChartLayer {
   private readonly ctx: LayerContext
   private chart: IChartApi | null = null
   private candles: ISeriesApi<"Candlestick"> | null = null
-  private volume: ISeriesApi<"Histogram"> | null = null
   private unsubscribe: (() => void) | null = null
   private paintFrame: number | null = null
 
@@ -54,18 +46,13 @@ class BarsLayer implements ChartLayer {
   // is never written into these (each frame re-carries it).
   private sourceBars: Bar[] = []
   private candleData: CandlestickData[] = []
-  private volumeData: HistogramData[] = []
   private epoch: number | null = null
-
-  // Overlay bookkeeping: the current live bar, whether the crosshair maps to a
-  // bar, and the latest bar's legend (live if forming, else last completed) —
-  // the fallback shown when the crosshair leaves and the value tracked per
-  // frame while not hovering.
   private live: Bar | null = null
-  private hovering = false
-  private latest: LegendData | null = null
-  // The chart's DOM element, kept so the pointerup probe can be unbound.
   private chartEl: HTMLElement | null = null
+  private readonly activePointers = new Set<number>()
+  private gestureStartRange: LogicalRange | null = null
+  private interactionSettleTimer: ReturnType<typeof setTimeout> | null = null
+  private timeInteractionPending = false
 
   constructor(ctx: LayerContext) {
     this.ctx = ctx
@@ -87,35 +74,19 @@ class BarsLayer implements ChartLayer {
       priceLineStyle: LineStyle.Dashed,
       priceLineColor: colors.priceLine,
     })
-    // Classic under-candle overlay on its own scale, no extra pane.
-    this.volume = chart.addSeries(HistogramSeries, {
-      priceScaleId: "volume",
-      priceFormat: { type: "volume" },
-      color: colors.volume,
-      lastValueVisible: false,
-      priceLineVisible: false,
-    })
-    chart.priceScale("volume").applyOptions({
-      scaleMargins: { top: 0.82, bottom: 0 },
-    })
     // The 1s tab shows seconds on the axis; 1m and coarser don't.
     chart.timeScale().applyOptions({
       timeVisible: true,
       secondsVisible: (intervalSecondsOf(spec) ?? 60) < 60,
     })
-
-    chart.subscribeCrosshairMove(this.onCrosshairMove)
     chart.timeScale().subscribeVisibleLogicalRangeChange(this.onRangeChange)
-    this.ctx.ui.jumpToLive = () => chart.timeScale().scrollToRealTime()
-    this.ctx.ui.resetPriceScale = () => {
-      chart.priceScale("right").applyOptions({ autoScale: true })
-      this.ctx.ui.setAutoScale(true)
-    }
-    // lightweight-charts fires no price-scale mode event, so autoScale is read
-    // from two probes: each publish (covers playback) and this pointerup (covers
-    // a paused user dragging the axis; the double-tap reset lands here too).
+
+    this.ctx.ui.getState().setJumpToLatest(this.centerLatest)
     this.chartEl = chart.chartElement()
-    this.chartEl.addEventListener("pointerup", this.onPointerUp)
+    this.chartEl.addEventListener("pointerdown", this.onPointerDown)
+    this.chartEl.addEventListener("pointerup", this.onPointerEnd)
+    this.chartEl.addEventListener("pointercancel", this.onPointerEnd)
+    this.chartEl.addEventListener("wheel", this.onWheel, { passive: true })
 
     this.unsubscribe = this.ctx.accumulator.subscribe(this.onPublish)
     // Render existing data without waiting for the next frame.
@@ -123,6 +94,7 @@ class BarsLayer implements ChartLayer {
   }
 
   detach(): void {
+    this.capturePriceViewport()
     this.unsubscribe?.()
     this.unsubscribe = null
     if (this.paintFrame !== null) {
@@ -130,32 +102,30 @@ class BarsLayer implements ChartLayer {
       this.paintFrame = null
     }
     if (this.chart) {
-      this.chart.unsubscribeCrosshairMove(this.onCrosshairMove)
       this.chart
         .timeScale()
         .unsubscribeVisibleLogicalRangeChange(this.onRangeChange)
       if (this.candles) this.chart.removeSeries(this.candles)
-      if (this.volume) this.chart.removeSeries(this.volume)
     }
     if (this.chartEl) {
-      this.chartEl.removeEventListener("pointerup", this.onPointerUp)
+      this.chartEl.removeEventListener("pointerdown", this.onPointerDown)
+      this.chartEl.removeEventListener("pointerup", this.onPointerEnd)
+      this.chartEl.removeEventListener("pointercancel", this.onPointerEnd)
+      this.chartEl.removeEventListener("wheel", this.onWheel)
       this.chartEl = null
     }
-    this.ctx.ui.jumpToLive = null
-    this.ctx.ui.resetPriceScale = null
-    this.ctx.ui.setLegend(null)
-    this.ctx.ui.setAtEdge(true)
-    this.ctx.ui.setAutoScale(true)
+    if (this.interactionSettleTimer) clearTimeout(this.interactionSettleTimer)
+    this.interactionSettleTimer = null
+    this.activePointers.clear()
+    this.gestureStartRange = null
+    this.timeInteractionPending = false
+    this.ctx.ui.getState().setJumpToLatest(null)
     this.chart = null
     this.candles = null
-    this.volume = null
     this.sourceBars = []
     this.candleData = []
-    this.volumeData = []
     this.epoch = null
     this.live = null
-    this.hovering = false
-    this.latest = null
   }
 
   // A rendering bug must degrade to a stale chart, never a white screen.
@@ -172,7 +142,7 @@ class BarsLayer implements ChartLayer {
   }
 
   private apply(snap: BarsSnapshot): void {
-    if (!this.candles || !this.volume) return
+    if (!this.candles) return
     this.live = snap.live
 
     // Append iff same epoch, no shrink, and the old tail element is the same
@@ -197,139 +167,175 @@ class BarsLayer implements ChartLayer {
     // repaired within this same publish.
     if (snap.live) {
       this.candles.update(this.toCandle(snap.live))
-      this.volume.update(this.toVolume(snap.live))
     }
-
-    // Track the forming candle in the legend (the one behavior upgrade over the
-    // old chart); store equality keeps the per-frame write cheap.
-    this.latest = this.computeLatest(snap)
-    if (!this.hovering) this.ctx.ui.setLegend(this.latest)
-
-    // Probe the price scale each publish (covers a running chart re-fitting);
-    // the store's equality gate makes the repeated write free.
-    this.syncAutoScale()
   }
 
   // Full reset: epoch change, first data, or an overlap rewrite. Recenters the
   // viewport only when the epoch changed (seek, first fill).
   private reset(snap: BarsSnapshot, recenter: boolean): void {
-    if (!this.candles || !this.volume || !this.chart) return
+    if (!this.candles || !this.chart) return
+    const previousEpoch = this.epoch
     this.epoch = snap.epoch
     this.sourceBars = snap.bars
     this.candleData = snap.bars.map((bar) => this.toCandle(bar))
-    this.volumeData = snap.bars.map((bar) => this.toVolume(bar))
     this.candles.setData(this.candleData)
-    this.volume.setData(this.volumeData)
     if (recenter) {
       const n = snap.bars.length + (snap.live ? 1 : 0)
-      const window = Math.min(
-        INITIAL_VISIBLE_BARS,
-        Math.max(n, MIN_VISIBLE_BARS)
-      )
-      this.chart.timeScale().setVisibleLogicalRange({
-        from: n - window,
-        to: n + RIGHT_PAD,
-      })
+      const storedTime = this.ctx.viewport.getState().viewport.time
+      const viewport =
+        previousEpoch === null
+          ? (storedTime ?? defaultTimeViewport(n))
+          : centeredTimeViewport(storedTime, n)
+      this.ctx.viewport.getState().setTime(viewport)
+      this.applyTimeViewport(viewport, n)
     }
-    this.writeAtEdge(this.chart.timeScale().getVisibleLogicalRange())
+    this.applyPriceViewport()
   }
 
   private append(snap: BarsSnapshot): void {
-    if (!this.candles || !this.volume || !this.chart) return
+    if (!this.candles || !this.chart) return
     const prevCount = this.sourceBars.length
     const k = snap.bars.length - prevCount
-
-    // Follow the right edge only if the user was already there; a catch-up
-    // flood must not yank a user who panned back to inspect.
-    const range = this.chart.timeScale().getVisibleLogicalRange()
-    const atEdge = range === null || range.to >= prevCount - 1
 
     const perBar = k <= APPEND_UPDATE_MAX
     for (let i = prevCount; i < snap.bars.length; i++) {
       const candle = this.toCandle(snap.bars[i])
-      const vol = this.toVolume(snap.bars[i])
       this.candleData.push(candle)
-      this.volumeData.push(vol)
       if (perBar) {
         this.candles.update(candle)
-        this.volume.update(vol)
       }
     }
     this.sourceBars = snap.bars
     // One setData beats thousands of updates on a big catch-up frame.
     if (!perBar) {
       this.candles.setData(this.candleData)
-      this.volume.setData(this.volumeData)
     }
 
-    if (atEdge) this.chart.timeScale().scrollToRealTime()
-    this.writeAtEdge(this.chart.timeScale().getVisibleLogicalRange())
-  }
-
-  // Legend and jump-to-live wiring. The crosshair handler narrows the union
-  // series data with an `"open" in` guard (as the reference chart did); the
-  // range handler drives the at-edge display state (a lagging mirror of the
-  // append follow decision — display-only, may trail it by one event).
-  private onCrosshairMove = (param: MouseEventParams<Time>): void => {
-    if (!this.candles || !this.volume) return
-    const candle = param.seriesData.get(this.candles) as
-      | CandlestickData
-      | undefined
-    if (candle && "open" in candle) {
-      const vol = param.seriesData.get(this.volume) as HistogramData | undefined
-      this.hovering = true
-      this.ctx.ui.setLegend({
-        open: candle.open,
-        high: candle.high,
-        low: candle.low,
-        close: candle.close,
-        volume: vol?.value ?? 0,
-        up: candle.close >= candle.open,
-      })
-    } else {
-      // Crosshair left a bar: fall back to the latest bar rather than blanking.
-      this.hovering = false
-      this.ctx.ui.setLegend(this.latest)
+    const timeViewport = this.ctx.viewport.getState().viewport.time
+    if (
+      timeViewport?.mode === "follow" &&
+      this.activePointers.size === 0 &&
+      !this.timeInteractionPending
+    ) {
+      this.applyTimeViewport(
+        timeViewport,
+        snap.bars.length + (snap.live ? 1 : 0)
+      )
     }
   }
 
-  private onRangeChange = (range: LogicalRange | null): void => {
-    this.writeAtEdge(range)
+  private onPointerDown = (event: PointerEvent): void => {
+    if (this.activePointers.size === 0) {
+      if (this.interactionSettleTimer) {
+        clearTimeout(this.interactionSettleTimer)
+        this.interactionSettleTimer = null
+      }
+      this.gestureStartRange =
+        this.chart?.timeScale().getVisibleLogicalRange() ?? null
+      this.timeInteractionPending = true
+    }
+    this.activePointers.add(event.pointerId)
   }
 
-  // Reflects the right price scale's auto-fit mode into the store so the "Auto"
-  // pill appears once the user drags the axis into manual mode.
-  private onPointerUp = (): void => {
-    this.syncAutoScale()
+  private onPointerEnd = (event: PointerEvent): void => {
+    this.activePointers.delete(event.pointerId)
+    if (this.activePointers.size > 0) return
+    this.scheduleInteractionCapture()
   }
 
-  private syncAutoScale(): void {
+  private onWheel = (): void => {
+    if (!this.timeInteractionPending) {
+      this.gestureStartRange =
+        this.chart?.timeScale().getVisibleLogicalRange() ?? null
+      this.timeInteractionPending = true
+    }
+    this.scheduleInteractionCapture()
+  }
+
+  private onRangeChange = (): void => {
+    if (this.timeInteractionPending && this.activePointers.size === 0) {
+      this.scheduleInteractionCapture()
+    }
+  }
+
+  private scheduleInteractionCapture(): void {
+    if (this.interactionSettleTimer) clearTimeout(this.interactionSettleTimer)
+    this.interactionSettleTimer = setTimeout(() => {
+      this.interactionSettleTimer = null
+      this.captureTimeViewport(this.gestureStartRange)
+      this.capturePriceViewport()
+      this.gestureStartRange = null
+      this.timeInteractionPending = false
+      const timeViewport = this.ctx.viewport.getState().viewport.time
+      if (timeViewport?.mode === "follow") {
+        this.applyTimeViewport(
+          timeViewport,
+          this.candleData.length + (this.live ? 1 : 0)
+        )
+      }
+    }, 160)
+  }
+
+  // Keep the user's current zoom while placing the newest candle at the
+  // viewport midpoint. Follow mode is explicit: later appends move the range
+  // only while this policy remains active.
+  private centerLatest = (): void => {
     if (!this.chart) return
-    this.ctx.ui.setAutoScale(this.chart.priceScale("right").options().autoScale)
-  }
-
-  private writeAtEdge(range: LogicalRange | null): void {
-    const barCount = this.candleData.length + (this.live ? 1 : 0)
-    this.ctx.ui.setAtEdge(range === null || range.to >= barCount - 1)
-  }
-
-  // The latest bar for the legend: the forming live bar if present, else the
-  // last completed bar; null on an empty epoch.
-  private computeLatest(snap: BarsSnapshot): LegendData | null {
-    if (snap.live) return this.legendOf(snap.live)
-    if (snap.bars.length === 0) return null
-    return this.legendOf(snap.bars[snap.bars.length - 1])
-  }
-
-  private legendOf(bar: Bar): LegendData {
-    return {
-      open: bar.open * TICK_SIZE,
-      high: bar.high * TICK_SIZE,
-      low: bar.low * TICK_SIZE,
-      close: bar.close * TICK_SIZE,
-      volume: bar.volume,
-      up: bar.close >= bar.open,
+    const range = this.chart.timeScale().getVisibleLogicalRange()
+    const visibleBars = range ? range.to - range.from : INITIAL_VISIBLE_BARS
+    const viewport: TimeViewport = {
+      mode: "follow",
+      visibleBars,
+      latestFraction: 0.5,
     }
+    this.ctx.viewport.getState().setTime(viewport)
+    this.applyTimeViewport(
+      viewport,
+      this.candleData.length + (this.live ? 1 : 0)
+    )
+  }
+
+  private applyTimeViewport(viewport: TimeViewport, barCount: number): void {
+    if (!this.chart) return
+    this.chart
+      .timeScale()
+      .setVisibleLogicalRange(timeRangeForViewport(viewport, barCount))
+  }
+
+  private applyPriceViewport(): void {
+    if (!this.chart) return
+    const priceScale = this.chart.priceScale("right")
+    const viewport = this.ctx.viewport.getState().viewport.price
+    if (viewport.mode === "auto") {
+      priceScale.setAutoScale(true)
+    } else {
+      priceScale.setVisibleRange(viewport.range)
+    }
+  }
+
+  private captureTimeViewport(start: LogicalRange | null): void {
+    if (!this.chart) return
+    const range = this.chart.timeScale().getVisibleLogicalRange()
+    if (!range || (start && logicalRangeEqual(start, range))) return
+    this.ctx.viewport.getState().setTime({
+      mode: "fixed",
+      range: { from: range.from, to: range.to },
+    })
+  }
+
+  private capturePriceViewport(): void {
+    if (!this.chart) return
+    const priceScale = this.chart.priceScale("right")
+    if (priceScale.options().autoScale) {
+      this.ctx.viewport.getState().setPrice({ mode: "auto" })
+      return
+    }
+    const range = priceScale.getVisibleRange()
+    if (!range || range.to <= range.from) return
+    this.ctx.viewport.getState().setPrice({
+      mode: "manual",
+      range: { from: range.from, to: range.to },
+    })
   }
 
   private timeOf(bar: Bar): UTCTimestamp {
@@ -344,14 +350,6 @@ class BarsLayer implements ChartLayer {
       high: bar.high * TICK_SIZE,
       low: bar.low * TICK_SIZE,
       close: bar.close * TICK_SIZE,
-    }
-  }
-
-  private toVolume(bar: Bar): HistogramData {
-    return {
-      time: this.timeOf(bar),
-      value: bar.volume,
-      color: this.ctx.colors.volume,
     }
   }
 }

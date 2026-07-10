@@ -868,3 +868,29 @@ paused and running snapshots; `attach_requires_matching_active_session`
 covers no active session, wrong id/raw/specs, success, and closed-session
 typed misses. The open validation test also proves an immediate bars pull
 is available for hydration.
+
+---
+
+# Revision 6 — Zustand viewport ownership and candles-only cleanup
+
+The implementation in
+`docs/lens_frontend_cleanup_implementation_spec.md` supersedes the chart UI
+behavior described by earlier revisions without rewriting their historical
+record.
+
+- Viewer-local time/price viewport policy moves into a scoped vanilla Zustand
+  store and persists through the version-2 Remux replay route.
+- Follow mode is explicit. User pan/zoom produces a fixed range that appends
+  never move; center-latest opts back into following at the current zoom.
+- Manual price ranges survive projection snapshots, theme remounts, and native
+  reloads. Fixed manual range is the chosen vertical policy.
+- Seeks preserve zoom and center the new destination; fresh sessions retain
+  the original right-biased default.
+- The base `bars:1m` view is candles-only: no volume histogram, volume scale,
+  OHLCV row, or Auto button. Native double-tap resets scales.
+- Ephemeral scrub/jump state also uses a scoped Zustand store but is never
+  persisted; replay transport and projection frames remain outside Zustand.
+- Narrow object actions collapse below 360 CSS pixels, and the seek slider
+  gains ET `aria-valuetext` plus pointer-cancel cleanup.
+- Vitest covers viewport policy, route compatibility/validation, fallback
+  persistence, and route precedence.
