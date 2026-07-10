@@ -341,8 +341,10 @@ Detailed planning:
 
 ```text
 docs/vision.md
-docs/study_graph_vision.md
-docs/study_graph_phased_implementation.md
+docs/atomic_snapshot_projection_delivery_implementation_spec.md
+docs/ledger_projection_system_implementation_spec.md
+docs/ledger_session_transport_implementation_spec.md
+docs/lens_replay_chart_implementation_spec.md
 ```
 
 ## Current Repository Layout
