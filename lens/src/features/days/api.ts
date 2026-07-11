@@ -1,5 +1,5 @@
 import {
-  requestIpc,
+  rpc,
   subscribeIpcEvents,
   type JsonRpcMessage,
 } from "@remux/viewer-kit/ipc"
@@ -14,23 +14,29 @@ import type {
 } from "@/features/days/types"
 
 export async function fetchEsDays(): Promise<EsDayCatalog> {
-  return requestIpc<EsDayCatalog>("remux/ledger/es/days", {})
+  return rpc.query<EsDayCatalog>("remux/ledger/es/days", {}, {
+    resourceKey: "ledger:es-days",
+  })
 }
 
 export async function fetchJobs(): Promise<JobsListResult> {
-  return requestIpc<JobsListResult>("remux/ledger/jobs/list", {})
+  return rpc.query<JobsListResult>("remux/ledger/jobs/list", {}, {
+    resourceKey: "ledger:jobs",
+  })
 }
 
 // Install: make the feed's artifact local, whatever that takes. The backend
 // hydrates an existing artifact or rebuilds a missing/invalid one from the
 // R2 raw — one verb, no prepare/hydrate split on this side.
 export async function startInstallJob(rawId: string): Promise<JobStartResult> {
-  return requestIpc<JobStartResult>("remux/ledger/es/install", { rawId })
+  // Ledger owns this job's admission, progress, and terminal events. Keep it
+  // a command instead of nesting it inside Remux's generic job registry.
+  return rpc.command<JobStartResult>("remux/ledger/es/install", { rawId })
 }
 
 // Offload: drop the day's local copies while R2 keeps every byte. Synchronous.
 export async function offloadDay(marketDay: string): Promise<EsOffloadReport> {
-  return requestIpc<EsOffloadReport>("remux/ledger/es/offload", { marketDay })
+  return rpc.command<EsOffloadReport>("remux/ledger/es/offload", { marketDay })
 }
 
 export function subscribeLedgerJobs(subscriber: {

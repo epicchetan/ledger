@@ -1,4 +1,4 @@
-import { requestIpc } from "@remux/viewer-kit/ipc"
+import { rpc } from "@remux/viewer-kit/ipc"
 
 import type {
   DeleteStoreObjectReport,
@@ -48,7 +48,7 @@ interface RemuxLocalStoreObject {
 export async function deleteStoreObject(
   id: string
 ): Promise<DeleteStoreObjectReport> {
-  return requestIpc<DeleteStoreObjectReport>("remux/ledger/store/delete", {
+  return rpc.command<DeleteStoreObjectReport>("remux/ledger/store/delete", {
     id,
   })
 }

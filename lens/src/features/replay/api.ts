@@ -1,5 +1,5 @@
 import {
-  requestIpc,
+  rpc,
   subscribeIpcEvents,
   type JsonRpcMessage,
 } from "@remux/viewer-kit/ipc"
@@ -29,7 +29,7 @@ export async function openSession(
   rawId: string,
   projections: string[]
 ): Promise<SessionOpenResult> {
-  return requestIpc<SessionOpenResult>("remux/ledger/session/open", {
+  return rpc.command<SessionOpenResult>("remux/ledger/session/open", {
     rawId,
     projections,
   })
@@ -43,17 +43,17 @@ export async function attachSession(
   rawId: string,
   projections: string[]
 ): Promise<SessionAttachResult> {
-  return requestIpc<SessionAttachResult>("remux/ledger/session/attach", {
-    sessionId,
-    rawId,
-    projections,
-  })
+  return rpc.subscribe<SessionAttachResult>(
+    "remux/ledger/session/attach",
+    { sessionId, rawId, projections },
+    { resourceKey: `ledger:session:${sessionId}` }
+  )
 }
 
 export async function closeSession(
   sessionId: string
 ): Promise<SessionCloseResult> {
-  return requestIpc<SessionCloseResult>("remux/ledger/session/close", {
+  return rpc.command<SessionCloseResult>("remux/ledger/session/close", {
     sessionId,
   })
 }
@@ -61,17 +61,21 @@ export async function closeSession(
 export async function fetchSessionStatus(
   sessionId: string
 ): Promise<SessionStatus> {
-  return requestIpc<SessionStatus>("remux/ledger/session/status", { sessionId })
+  return rpc.query<SessionStatus>(
+    "remux/ledger/session/status",
+    { sessionId },
+    { resourceKey: `ledger:session-status:${sessionId}` }
+  )
 }
 
 export async function playSession(sessionId: string): Promise<SessionOkResult> {
-  return requestIpc<SessionOkResult>("remux/ledger/session/play", { sessionId })
+  return rpc.command<SessionOkResult>("remux/ledger/session/play", { sessionId })
 }
 
 export async function pauseSession(
   sessionId: string
 ): Promise<SessionOkResult> {
-  return requestIpc<SessionOkResult>("remux/ledger/session/pause", {
+  return rpc.command<SessionOkResult>("remux/ledger/session/pause", {
     sessionId,
   })
 }
@@ -80,7 +84,7 @@ export async function setSessionSpeed(
   sessionId: string,
   speed: number
 ): Promise<SessionOkResult> {
-  return requestIpc<SessionOkResult>("remux/ledger/session/speed", {
+  return rpc.command<SessionOkResult>("remux/ledger/session/speed", {
     sessionId,
     speed,
   })
@@ -90,7 +94,7 @@ export async function seekSession(
   sessionId: string,
   sessionNs: string
 ): Promise<SessionOkResult> {
-  return requestIpc<SessionOkResult>("remux/ledger/session/seek", {
+  return rpc.command<SessionOkResult>("remux/ledger/session/seek", {
     sessionId,
     sessionNs,
   })
@@ -103,11 +107,15 @@ export async function fetchSessionBars(
   spec: string,
   from?: number
 ): Promise<BarsFrame> {
-  return requestIpc<BarsFrame>("remux/ledger/session/bars", {
-    sessionId,
-    spec,
-    ...(from === undefined ? {} : { from }),
-  })
+  return rpc.query<BarsFrame>(
+    "remux/ledger/session/bars",
+    {
+      sessionId,
+      spec,
+      ...(from === undefined ? {} : { from }),
+    },
+    { resourceKey: `ledger:bars:${sessionId}:${spec}:${from ?? "latest"}` }
+  )
 }
 
 export async function subscribeSessionProjections(
@@ -115,9 +123,10 @@ export async function subscribeSessionProjections(
   consumerInstanceId: string,
   projections: ProjectionSubscribeRequest[]
 ): Promise<ProjectionSubscribeResult> {
-  return requestIpc<ProjectionSubscribeResult>(
+  return rpc.subscribe<ProjectionSubscribeResult>(
     "remux/ledger/session/projections/subscribe",
-    { sessionId, consumerInstanceId, projections }
+    { sessionId, consumerInstanceId, projections },
+    { resourceKey: `ledger:projections:${sessionId}:${consumerInstanceId}` }
   )
 }
 
@@ -125,7 +134,7 @@ export async function acknowledgeSessionProjections(
   subscriptionId: string,
   applied: Array<{ spec: string; head: BarsPosition }>
 ): Promise<SessionOkResult> {
-  return requestIpc<SessionOkResult>("remux/ledger/session/projections/ack", {
+  return rpc.command<SessionOkResult>("remux/ledger/session/projections/ack", {
     subscriptionId,
     applied,
   })
@@ -136,7 +145,7 @@ export async function demandSessionProjections(
   active: boolean,
   requestedMaxFps = 15
 ): Promise<SessionOkResult> {
-  return requestIpc<SessionOkResult>(
+  return rpc.command<SessionOkResult>(
     "remux/ledger/session/projections/demand",
     { subscriptionId, active, requestedMaxFps }
   )
@@ -147,7 +156,7 @@ export async function resyncSessionProjections(
   applied: Array<{ spec: string; head: BarsPosition }>,
   reason: string
 ): Promise<SessionOkResult> {
-  return requestIpc<SessionOkResult>(
+  return rpc.command<SessionOkResult>(
     "remux/ledger/session/projections/resync",
     { subscriptionId, applied, reason }
   )
