@@ -29,6 +29,7 @@
     "main": {
       "route": "/viewers/ledger",
       "entry": "lens/dist/index.html",
+      "cache": "immutable",
       "build": {
         "command": "npm",
         "args": [
