@@ -307,6 +307,7 @@ impl FeedState {
         self.catching_up = catching_up;
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn emit_chunk(
         &self,
         feed_batches: Vec<EsMboFeedBatch>,

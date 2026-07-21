@@ -28,7 +28,7 @@ pub fn decode_mbo_events(
     {
         records += 1;
         events.push(normalize_mbo(msg)?);
-        if records % PROGRESS_EVERY_RECORDS == 0 {
+        if records.is_multiple_of(PROGRESS_EVERY_RECORDS) {
             if let Some(progress) = &progress {
                 let _ = progress.send(PrepareProgress::Decoding { records });
             }

@@ -139,14 +139,14 @@ impl JobRegistry {
             .filter(|record| matches!(record.state, JobState::Running { .. }))
             .cloned()
             .collect::<Vec<_>>();
-        running.sort_by(|left, right| left.started_at_ns.cmp(&right.started_at_ns));
+        running.sort_by_key(|record| record.started_at_ns);
         let mut terminal = table
             .records
             .iter()
             .filter(|record| !matches!(record.state, JobState::Running { .. }))
             .cloned()
             .collect::<Vec<_>>();
-        terminal.sort_by(|left, right| right.finished_at_ns.cmp(&left.finished_at_ns));
+        terminal.sort_by_key(|record| std::cmp::Reverse(record.finished_at_ns));
         running.extend(terminal);
         Ok(running)
     }
@@ -200,7 +200,7 @@ fn prune_terminal(table: &mut JobTable) {
     if terminal.len() <= 50 {
         return;
     }
-    terminal.sort_by(|left, right| right.1.cmp(&left.1));
+    terminal.sort_by_key(|record| std::cmp::Reverse(record.1));
     let keep = terminal
         .into_iter()
         .take(50)

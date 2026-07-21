@@ -248,7 +248,7 @@ pub fn find_es_replay_artifact_descriptor(
         })
         .cloned()
         .collect::<Vec<_>>();
-    matches.sort_by(|left, right| right.updated_at_ns.cmp(&left.updated_at_ns));
+    matches.sort_by_key(|descriptor| std::cmp::Reverse(descriptor.updated_at_ns));
     ArtifactLookup {
         matching_count: matches.len(),
         descriptor: matches.into_iter().next(),

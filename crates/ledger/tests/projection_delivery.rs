@@ -1,11 +1,13 @@
 mod support;
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use ledger::projection::{
     AppliedProjectionPosition, BarsDeliveryPosition, BarsParams, ProjectionDeliveryEvent,
-    ProjectionDemand, ProjectionFrameOperation, ProjectionFramePayload, ProjectionFrameReason,
-    ProjectionPosition, ProjectionSubscriptionProjectionRequest, ProjectionSubscriptionRequest,
+    ProjectionDeliveryFrame, ProjectionDemand, ProjectionFrameOperation, ProjectionFramePayload,
+    ProjectionFrameReason, ProjectionPosition, ProjectionSpec,
+    ProjectionSubscriptionProjectionRequest, ProjectionSubscriptionRequest,
 };
 use ledger::session::{LedgerSessionBuilder, LedgerSessionHandle};
 use tokio::sync::mpsc;
@@ -95,6 +97,84 @@ async fn bars_delivery_snapshots_seeks_once_and_resumes_from_validated_head() {
     assert_eq!(bars_len(&suffix.payload), 0);
 
     running.session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn one_and_five_minute_sources_deliver_independent_frames_from_one_session() {
+    let fixture = store_fixture();
+    let events = vec![
+        trade(100, 1, 100, 1, None),
+        trade(61_000_000_000, 2, 101, 2, None),
+        trade(301_000_000_000, 3, 102, 3, None),
+    ];
+    let (raw_id, _) = fabricate_prepared_day(&fixture.store, events).await;
+    let mut builder = LedgerSessionBuilder::new(fixture.store.clone()).unwrap();
+    let feed = builder.es_replay(raw_id).unwrap();
+    let outputs = builder
+        .projections(
+            &feed,
+            &[
+                ProjectionSpec::Bars(BarsParams {
+                    interval_ns: 60_000_000_000,
+                }),
+                ProjectionSpec::Bars(BarsParams {
+                    interval_ns: 5 * 60_000_000_000,
+                }),
+            ],
+        )
+        .unwrap();
+    assert_eq!(outputs[0].canonical_spec(), "bars:1m");
+    assert_eq!(outputs[1].canonical_spec(), "bars:5m");
+
+    let session = builder.start().await.unwrap();
+    let mut events = session.take_projection_events().unwrap();
+    let delivery = session.projection_delivery().unwrap().clone();
+    let subscribed = delivery
+        .subscribe(ProjectionSubscriptionRequest {
+            consumer_instance_id: "consumer-multi".to_string(),
+            projections: vec![
+                ProjectionSubscriptionProjectionRequest {
+                    spec: "bars:1m".to_string(),
+                    schema_versions: vec![1],
+                    requested_max_fps: Some(20),
+                    have: None,
+                },
+                ProjectionSubscriptionProjectionRequest {
+                    spec: "bars:5m".to_string(),
+                    schema_versions: vec![1],
+                    requested_max_fps: Some(20),
+                    have: None,
+                },
+            ],
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        subscribed
+            .projections
+            .iter()
+            .map(|projection| projection.spec.as_str())
+            .collect::<Vec<_>>(),
+        vec!["bars:1m", "bars:5m"]
+    );
+    let initial = next_frames(&mut events, &subscribed.subscription_id, 2).await;
+    assert_eq!(initial["bars:1m"].reason, ProjectionFrameReason::Initial);
+    assert_eq!(initial["bars:5m"].reason, ProjectionFrameReason::Initial);
+
+    session.seek_to(301_000_000_000).await.unwrap();
+    let final_frames = next_frames(&mut events, &subscribed.subscription_id, 2).await;
+    assert_eq!(
+        final_frames["bars:1m"].reason,
+        ProjectionFrameReason::SeekFinal
+    );
+    assert_eq!(
+        final_frames["bars:5m"].reason,
+        ProjectionFrameReason::SeekFinal
+    );
+    assert_eq!(bars_len(&final_frames["bars:1m"].payload), 2);
+    assert_eq!(bars_len(&final_frames["bars:5m"].payload), 1);
+
+    session.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -304,7 +384,10 @@ async fn start_session() -> RunningDeliverySession {
     let mut builder = LedgerSessionBuilder::new(fixture.store.clone()).unwrap();
     let feed = builder.es_replay(raw_id).unwrap();
     builder
-        .bars(&feed, BarsParams { interval_ns: 100 })
+        .projections(
+            &feed,
+            &[ProjectionSpec::Bars(BarsParams { interval_ns: 100 })],
+        )
         .unwrap();
     let session = builder.start().await.unwrap();
     let events = session
@@ -354,6 +437,31 @@ async fn next_frame(
     })
     .await
     .expect("projection frame should arrive")
+}
+
+async fn next_frames(
+    events: &mut mpsc::Receiver<ProjectionDeliveryEvent>,
+    subscription_id: &str,
+    count: usize,
+) -> HashMap<String, ProjectionDeliveryFrame> {
+    tokio::time::timeout(WAKE, async {
+        let mut frames = HashMap::new();
+        while frames.len() < count {
+            match events.recv().await.expect("delivery stream open") {
+                ProjectionDeliveryEvent::Frame(frame)
+                    if frame.subscription_id == subscription_id =>
+                {
+                    frames.insert(frame.spec.clone(), *frame);
+                }
+                ProjectionDeliveryEvent::Frame(_)
+                | ProjectionDeliveryEvent::Watermark(_)
+                | ProjectionDeliveryEvent::SubscriptionExpired { .. } => {}
+            }
+        }
+        frames
+    })
+    .await
+    .expect("projection frames should arrive")
 }
 
 async fn assert_no_frame(

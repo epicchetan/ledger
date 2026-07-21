@@ -274,12 +274,6 @@ pub enum ProjectionDeliveryError {
     Cache(#[from] cache::CacheError),
 }
 
-pub struct InstalledProjection {
-    pub spec: super::ProjectionSpec,
-    pub task: Box<dyn runtime::RuntimeTask>,
-    pub delivery: Box<dyn ProjectionDeliverySource>,
-}
-
 #[derive(Debug, Clone)]
 pub enum ProjectionConvergenceKey {
     Bars(ValueKey<BarsStatus>),

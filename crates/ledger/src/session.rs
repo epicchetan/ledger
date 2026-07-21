@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use cache::{Cache, CacheReader, CellDescriptor, CellKind, CellOwner, Key, ValueKey};
@@ -11,8 +12,9 @@ use tokio::task::JoinHandle;
 use crate::clock::{ClockSnapshot, ClockState};
 use crate::feed::es_replay::{EsReplayCells, EsReplayFeed};
 use crate::projection::{
-    install_bars_projection, next_session_generation, start_projection_delivery, BarsCells,
-    BarsParams, ProjectionDeliveryEvent, ProjectionDeliveryHandle, ProjectionDeliverySource,
+    install_projection_node, next_session_generation, public_projection_outputs,
+    start_projection_delivery, ProjectionDeliveryEvent, ProjectionDeliveryHandle,
+    ProjectionDeliverySource, ProjectionPlan, ProjectionSpec, SessionProjectionOutput,
 };
 use crate::LedgerError;
 
@@ -28,6 +30,7 @@ where
     delivery_sources: Vec<Box<dyn ProjectionDeliverySource>>,
     delivery_feed: Option<EsReplayCells>,
     projection_specs: Vec<String>,
+    projections_installed: bool,
 }
 
 impl<S> LedgerSessionBuilder<S>
@@ -55,6 +58,7 @@ where
             delivery_sources: Vec::new(),
             delivery_feed: None,
             projection_specs: Vec::new(),
+            projections_installed: false,
         })
     }
 
@@ -80,18 +84,44 @@ where
         Ok(cells)
     }
 
-    /// Register a time-bars projection over an es_replay feed's cells.
-    pub fn bars(
+    /// Resolve and install the complete immutable projection graph for this
+    /// session. Public outputs are returned in request order; internal
+    /// dependencies remain private to Ledger.
+    pub fn projections(
         &mut self,
         feed: &EsReplayCells,
-        params: BarsParams,
-    ) -> Result<BarsCells, LedgerError> {
-        let cells = BarsCells::register(&self.cache, params)?;
-        let installed = install_bars_projection(feed.clone(), params, cells.clone())?;
-        self.projection_specs.push(installed.spec.canonical());
-        self.tasks.push(installed.task);
-        self.delivery_sources.push(installed.delivery);
-        Ok(cells)
+        requested: &[ProjectionSpec],
+    ) -> Result<Vec<SessionProjectionOutput>, LedgerError> {
+        if self.projections_installed {
+            return Err(LedgerError::ProjectionPlan(
+                "session projections have already been installed".to_string(),
+            ));
+        }
+
+        let plan = ProjectionPlan::resolve(requested)?;
+        let mut outputs = HashMap::new();
+        for node in plan.nodes() {
+            let installed = install_projection_node(&self.cache, feed, node, &outputs)?;
+            let prior = outputs.insert(installed.node.clone(), installed.output);
+            if prior.is_some() {
+                return Err(LedgerError::ProjectionPlan(format!(
+                    "projection node `{}` was installed twice",
+                    node.canonical_key()
+                )));
+            }
+            self.tasks.push(installed.task);
+            if let Some(delivery) = installed.delivery {
+                self.delivery_sources.push(delivery);
+            }
+        }
+
+        let public = public_projection_outputs(&plan, &outputs)?;
+        self.projection_specs = public
+            .iter()
+            .map(|output| output.canonical_spec().to_string())
+            .collect();
+        self.projections_installed = true;
+        Ok(public)
     }
 
     pub async fn start(self) -> Result<LedgerSessionHandle, LedgerError> {

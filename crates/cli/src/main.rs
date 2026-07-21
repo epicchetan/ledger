@@ -265,15 +265,15 @@ async fn run_session_es_replay_command(
     let store = Arc::new(ledger_store);
     let mut builder = LedgerSessionBuilder::new(store)?;
     let cells = builder.es_replay(raw_id.clone())?;
-    let mut projection_cells = Vec::new();
-    for (canonical, spec) in &projection_specs {
-        match spec {
-            ProjectionSpec::Bars(params) => {
-                let bars = builder.bars(&cells, *params)?;
-                projection_cells.push((canonical.clone(), bars));
-            }
-        }
-    }
+    let requested = projection_specs
+        .iter()
+        .map(|(_, spec)| spec.clone())
+        .collect::<Vec<_>>();
+    let projection_cells = builder
+        .projections(&cells, &requested)?
+        .into_iter()
+        .map(|output| output.into_bars())
+        .collect::<Vec<_>>();
     let session = builder.start().await?;
     let mut cursor_watch = session.cache().watch_key(cells.cursor.key())?;
 

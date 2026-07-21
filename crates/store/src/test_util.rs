@@ -6,10 +6,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 
+type MemoryObjects = HashMap<String, (Vec<u8>, ObjectMetadata)>;
+
 #[derive(Clone, Default)]
 pub struct MemoryRemote {
     bucket: String,
-    objects: Arc<Mutex<HashMap<String, (Vec<u8>, ObjectMetadata)>>>,
+    objects: Arc<Mutex<MemoryObjects>>,
 }
 
 impl MemoryRemote {

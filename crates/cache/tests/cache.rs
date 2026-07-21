@@ -413,7 +413,10 @@ fn read_array_range_returns_slice() {
 fn read_array_range_rejects_out_of_bounds_range() {
     let (cache, _owner, batches_key) = batches_cache();
 
-    let err = cache.read_array_range(&batches_key, 1..0).unwrap_err();
+    let invalid_range = std::ops::Range { start: 1, end: 0 };
+    let err = cache
+        .read_array_range(&batches_key, invalid_range)
+        .unwrap_err();
 
     assert_eq!(
         err,

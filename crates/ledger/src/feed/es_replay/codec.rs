@@ -246,8 +246,7 @@ fn u8_to_side(value: u8) -> Result<Option<BookSide>, LedgerError> {
 }
 
 pub fn read_event_store_file(path: &std::path::Path) -> Result<EsMboEventStore, LedgerError> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("reading artifact {}", path.display()))
-        .map_err(anyhow::Error::from)?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("reading artifact {}", path.display()))?;
     decode_event_store(&bytes)
 }

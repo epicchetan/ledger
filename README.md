@@ -350,6 +350,7 @@ Detailed planning:
 docs/vision.md
 docs/atomic_snapshot_projection_delivery_implementation_spec.md
 docs/ledger_projection_system_implementation_spec.md
+docs/ledger_projection_graph_implementation_spec.md
 docs/ledger_session_transport_implementation_spec.md
 docs/lens_replay_chart_implementation_spec.md
 ```

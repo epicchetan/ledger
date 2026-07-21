@@ -3,16 +3,15 @@ use cache::{ArrayKey, Cache, CellDescriptor, CellKind, CellOwner, Key, ValueKey}
 use runtime::{ComponentError, ComponentId, RuntimeTask, TaskContext, TaskDescriptor, TaskOutcome};
 use serde::{Deserialize, Serialize};
 
-use crate::feed::es_replay::{EsMboFeedBatch, EsReplayCells};
-use crate::market::{canonical_trade_print, BookSide, PriceTicks, TradePrint, UnixNanos};
+use crate::market::{BookSide, PriceTicks, TradePrint, UnixNanos};
 use crate::LedgerError;
 
 pub const SECOND_NS: u64 = 1_000_000_000;
 pub const MINUTE_NS: u64 = 60 * SECOND_NS;
 pub const HOUR_NS: u64 = 60 * MINUTE_NS;
-const REBUILD_CHUNK_BATCHES: usize = 4096;
+const REBUILD_CHUNK_PRINTS: usize = 4096;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BarsParams {
     /// Bar interval in nanoseconds. Always > 0.
     pub interval_ns: u64,
@@ -98,9 +97,10 @@ pub struct BarsTask {
     descriptor: TaskDescriptor,
     params: BarsParams,
     spec: String,
-    feed: EsReplayCells,
+    source: super::trade_prints::TradePrintCells,
     cells: BarsCells,
     epoch: u64,
+    processed_prints: usize,
     processed_batches: usize,
     completed_bars: usize,
     revision: u64,
@@ -115,22 +115,23 @@ enum Fold {
 }
 
 impl BarsTask {
-    pub fn new(
-        feed: EsReplayCells,
+    pub(crate) fn new(
+        source: super::trade_prints::TradePrintCells,
         params: BarsParams,
         cells: BarsCells,
     ) -> Result<Self, LedgerError> {
         validate_params(params)?;
         let spec = canonical_spec(params);
         let component_id = projection_component_id(&spec)?;
-        let descriptor = TaskDescriptor::new(component_id, vec![feed.batches.key().clone()]);
+        let descriptor = TaskDescriptor::new(component_id, vec![source.status.key().clone()]);
         Ok(Self {
             descriptor,
             params,
             spec,
-            feed,
+            source,
             cells,
             epoch: 0,
+            processed_prints: 0,
             processed_batches: 0,
             completed_bars: 0,
             revision: 0,
@@ -153,20 +154,16 @@ impl BarsTask {
 
     fn reset_fold(&mut self, epoch: u64) {
         self.epoch = epoch;
+        self.processed_prints = 0;
         self.processed_batches = 0;
         self.completed_bars = 0;
         self.live = None;
         self.last_print_ts = None;
     }
 
-    fn fold_batches(&mut self, batches: &[EsMboFeedBatch], completed: &mut Vec<Bar>) {
-        for batch in batches {
-            for event in &batch.events {
-                let Some(print) = canonical_trade_print(event) else {
-                    continue;
-                };
-                self.fold_print(print, completed);
-            }
+    fn fold_prints(&mut self, prints: &[TradePrint], completed: &mut Vec<Bar>) {
+        for print in prints {
+            self.fold_print(*print, completed);
         }
     }
 
@@ -197,15 +194,19 @@ impl BarsTask {
         ctx: TaskContext<'_>,
         target_epoch: u64,
         fold_idx: usize,
-        target_batch_idx: usize,
+        target_print_count: usize,
+        target_processed_batches: usize,
     ) -> Result<TaskOutcome, ComponentError> {
         let first_chunk = fold_idx == 0;
-        let chunk_end = target_batch_idx.min(fold_idx + REBUILD_CHUNK_BATCHES);
-        let batches = ctx.read_array_range(&self.feed.batches, fold_idx..chunk_end)?;
+        let chunk_end = target_print_count.min(fold_idx + REBUILD_CHUNK_PRINTS);
+        let prints = ctx.read_array_range(&self.source.prints, fold_idx..chunk_end)?;
         let previous_live = self.live.clone();
         let mut completed = Vec::new();
-        self.fold_batches(&batches, &mut completed);
-        self.processed_batches = chunk_end;
+        self.fold_prints(&prints, &mut completed);
+        self.processed_prints = chunk_end;
+        if chunk_end == target_print_count {
+            self.processed_batches = target_processed_batches;
+        }
         self.completed_bars += completed.len();
         self.revision = self.revision.saturating_add(1);
 
@@ -225,7 +226,7 @@ impl BarsTask {
         batch.set_value(&self.cells.status, self.status_snapshot());
         ctx.submit(batch).await?;
 
-        if chunk_end < target_batch_idx {
+        if chunk_end < target_print_count {
             self.fold = Fold::Rebuilding {
                 epoch: target_epoch,
                 fold_idx: chunk_end,
@@ -238,18 +239,20 @@ impl BarsTask {
     }
 }
 
-pub fn install_bars_projection(
-    feed: EsReplayCells,
+pub(crate) fn install_bars_projection(
+    cache: &Cache,
+    source: super::trade_prints::TradePrintCells,
     params: BarsParams,
-    cells: BarsCells,
-) -> Result<super::InstalledProjection, LedgerError> {
-    let task = BarsTask::new(feed, params, cells.clone())?;
-    let spec = super::ProjectionSpec::Bars(params);
-    let delivery = super::BarsDeliverySource::new(spec.canonical(), cells);
-    Ok(super::InstalledProjection {
-        spec,
+) -> Result<super::InstalledProjectionNode, LedgerError> {
+    let cells = BarsCells::register(cache, params)?;
+    let task = BarsTask::new(source, params, cells.clone())?;
+    let spec = super::ProjectionSpec::Bars(params).canonical();
+    let delivery = super::BarsDeliverySource::new(spec, cells.clone());
+    Ok(super::InstalledProjectionNode {
+        node: super::ProjectionNodeSpec::Bars(params),
+        output: super::ProjectionOutput::Bars(cells),
         task: Box::new(task),
-        delivery: Box::new(delivery),
+        delivery: Some(Box::new(delivery)),
     })
 }
 
@@ -266,34 +269,45 @@ impl RuntimeTask for BarsTask {
     }
 
     async fn run_once(&mut self, ctx: TaskContext<'_>) -> Result<TaskOutcome, ComponentError> {
-        let Some(cursor) = ctx.read_value(&self.feed.cursor)? else {
+        let Some(source_status) = ctx.read_value(&self.source.status)? else {
             return Ok(TaskOutcome::Idle);
         };
 
         let mut rebuild_from = match self.fold {
             Fold::Incremental => None,
-            Fold::Rebuilding { epoch, fold_idx } if epoch == cursor.epoch => Some(fold_idx),
+            Fold::Rebuilding { epoch, fold_idx } if epoch == source_status.epoch => Some(fold_idx),
             Fold::Rebuilding { .. } => Some(0),
         };
-        if cursor.epoch != self.epoch || cursor.batch_idx < self.processed_batches {
+        if source_status.epoch != self.epoch || source_status.print_count < self.processed_prints {
             rebuild_from = Some(0);
         }
         if let Some(fold_idx) = rebuild_from {
             if fold_idx == 0 {
-                self.reset_fold(cursor.epoch);
+                self.reset_fold(source_status.epoch);
             }
             return self
-                .run_rebuild_step(ctx, cursor.epoch, fold_idx, cursor.batch_idx)
+                .run_rebuild_step(
+                    ctx,
+                    source_status.epoch,
+                    fold_idx,
+                    source_status.print_count,
+                    source_status.processed_batches,
+                )
                 .await;
         }
 
-        if cursor.batch_idx > self.processed_batches {
-            let new_batches =
-                ctx.read_array_range(&self.feed.batches, self.processed_batches..cursor.batch_idx)?;
+        if source_status.print_count > self.processed_prints
+            || source_status.processed_batches > self.processed_batches
+        {
+            let new_prints = ctx.read_array_range(
+                &self.source.prints,
+                self.processed_prints..source_status.print_count,
+            )?;
             let previous_live = self.live.clone();
             let mut completed = Vec::new();
-            self.fold_batches(&new_batches, &mut completed);
-            self.processed_batches = cursor.batch_idx;
+            self.fold_prints(&new_prints, &mut completed);
+            self.processed_prints = source_status.print_count;
+            self.processed_batches = source_status.processed_batches;
             self.completed_bars += completed.len();
             self.revision = self.revision.saturating_add(1);
 
@@ -318,11 +332,11 @@ impl RuntimeTask for BarsTask {
 }
 
 pub fn canonical_spec(params: BarsParams) -> String {
-    if params.interval_ns % HOUR_NS == 0 {
+    if params.interval_ns.is_multiple_of(HOUR_NS) {
         format!("bars:{}h", params.interval_ns / HOUR_NS)
-    } else if params.interval_ns % MINUTE_NS == 0 {
+    } else if params.interval_ns.is_multiple_of(MINUTE_NS) {
         format!("bars:{}m", params.interval_ns / MINUTE_NS)
-    } else if params.interval_ns % SECOND_NS == 0 {
+    } else if params.interval_ns.is_multiple_of(SECOND_NS) {
         format!("bars:{}s", params.interval_ns / SECOND_NS)
     } else {
         format!("bars:{}ns", params.interval_ns)

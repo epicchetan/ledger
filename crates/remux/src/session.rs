@@ -134,20 +134,19 @@ impl SessionRegistry {
         let feed = builder
             .es_replay(raw_id.clone())
             .map_err(|err| RpcError::domain(err.to_string()))?;
-        let mut active_projections = Vec::new();
-        for (canonical, spec) in &projections {
-            match spec {
-                ProjectionSpec::Bars(params) => {
-                    let cells = builder
-                        .bars(&feed, *params)
-                        .map_err(|err| RpcError::domain(err.to_string()))?;
-                    active_projections.push(ActiveProjection {
-                        spec: canonical.clone(),
-                        cells,
-                    });
-                }
-            }
-        }
+        let requested = projections
+            .iter()
+            .map(|(_, spec)| spec.clone())
+            .collect::<Vec<_>>();
+        let active_projections = builder
+            .projections(&feed, &requested)
+            .map_err(|err| RpcError::domain(err.to_string()))?
+            .into_iter()
+            .map(|output| {
+                let (spec, cells) = output.into_bars();
+                ActiveProjection { spec, cells }
+            })
+            .collect::<Vec<_>>();
 
         let handle = builder
             .start()
@@ -1550,10 +1549,12 @@ mod tests {
     const WAKE: Duration = Duration::from_secs(3);
     const TEST_CATCHUP_CHUNK_BATCHES: usize = 1024;
 
+    type TestObjects = HashMap<String, (Vec<u8>, ObjectMetadata)>;
+
     #[derive(Clone, Default)]
     struct TestRemote {
         bucket: String,
-        objects: Arc<StdMutex<HashMap<String, (Vec<u8>, ObjectMetadata)>>>,
+        objects: Arc<StdMutex<TestObjects>>,
     }
 
     impl TestRemote {

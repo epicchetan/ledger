@@ -1,12 +1,18 @@
 pub mod bars;
 mod delivery;
+mod trade_prints;
 
+use std::collections::{HashMap, HashSet};
+
+use runtime::RuntimeTask;
+
+use crate::feed::es_replay::EsReplayCells;
 use crate::LedgerError;
 
 pub use bars::*;
 pub use delivery::*;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ProjectionSpec {
     Bars(BarsParams),
 }
@@ -75,5 +81,261 @@ fn invalid_spec(spec: &str, reason: impl Into<String>) -> LedgerError {
     LedgerError::InvalidProjectionSpec {
         spec: spec.to_string(),
         reason: reason.into(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ProjectionNodeSpec {
+    CanonicalTradePrints,
+    Bars(BarsParams),
+}
+
+impl ProjectionNodeSpec {
+    fn from_public(spec: &ProjectionSpec) -> Self {
+        match spec {
+            ProjectionSpec::Bars(params) => Self::Bars(*params),
+        }
+    }
+
+    pub(crate) fn canonical_key(&self) -> String {
+        match self {
+            Self::CanonicalTradePrints => trade_prints::COMPONENT_ID.to_string(),
+            Self::Bars(params) => format!(
+                "projection.{}",
+                bars::canonical_spec(*params).replace(':', ".")
+            ),
+        }
+    }
+
+    fn dependencies(&self) -> Vec<Self> {
+        match self {
+            Self::CanonicalTradePrints => Vec::new(),
+            Self::Bars(_) => vec![Self::CanonicalTradePrints],
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProjectionPlan {
+    requested: Vec<ProjectionSpec>,
+    nodes: Vec<ProjectionNodeSpec>,
+}
+
+impl ProjectionPlan {
+    pub(crate) fn resolve(requested: &[ProjectionSpec]) -> Result<Self, LedgerError> {
+        let mut public_specs = HashSet::new();
+        for spec in requested {
+            let canonical = spec.canonical();
+            if !public_specs.insert(canonical.clone()) {
+                return Err(invalid_spec(
+                    &canonical,
+                    format!("duplicate canonical projection spec `{canonical}`"),
+                ));
+            }
+        }
+
+        let mut nodes = Vec::new();
+        let mut visiting = HashSet::new();
+        let mut installed = HashSet::new();
+        for spec in requested {
+            visit_node(
+                ProjectionNodeSpec::from_public(spec),
+                &mut visiting,
+                &mut installed,
+                &mut nodes,
+            )?;
+        }
+
+        Ok(Self {
+            requested: requested.to_vec(),
+            nodes,
+        })
+    }
+
+    pub(crate) fn requested(&self) -> &[ProjectionSpec] {
+        &self.requested
+    }
+
+    pub(crate) fn nodes(&self) -> &[ProjectionNodeSpec] {
+        &self.nodes
+    }
+}
+
+fn visit_node(
+    node: ProjectionNodeSpec,
+    visiting: &mut HashSet<ProjectionNodeSpec>,
+    installed: &mut HashSet<ProjectionNodeSpec>,
+    nodes: &mut Vec<ProjectionNodeSpec>,
+) -> Result<(), LedgerError> {
+    if installed.contains(&node) {
+        return Ok(());
+    }
+    if !visiting.insert(node.clone()) {
+        return Err(LedgerError::ProjectionPlan(format!(
+            "dependency cycle at `{}`",
+            node.canonical_key()
+        )));
+    }
+    for dependency in node.dependencies() {
+        visit_node(dependency, visiting, installed, nodes)?;
+    }
+    visiting.remove(&node);
+    installed.insert(node.clone());
+    nodes.push(node);
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ProjectionOutput {
+    TradePrints(trade_prints::TradePrintCells),
+    Bars(BarsCells),
+}
+
+impl ProjectionOutput {
+    fn trade_prints(
+        &self,
+        node: &ProjectionNodeSpec,
+    ) -> Result<&trade_prints::TradePrintCells, LedgerError> {
+        match self {
+            Self::TradePrints(cells) => Ok(cells),
+            Self::Bars(_) => Err(LedgerError::ProjectionDependency {
+                node: node.canonical_key(),
+                expected: "canonical trade-print",
+            }),
+        }
+    }
+
+    fn bars(&self, node: &ProjectionNodeSpec) -> Result<&BarsCells, LedgerError> {
+        match self {
+            Self::Bars(cells) => Ok(cells),
+            Self::TradePrints(_) => Err(LedgerError::ProjectionDependency {
+                node: node.canonical_key(),
+                expected: "bars",
+            }),
+        }
+    }
+}
+
+pub(crate) struct InstalledProjectionNode {
+    pub(crate) node: ProjectionNodeSpec,
+    pub(crate) output: ProjectionOutput,
+    pub(crate) task: Box<dyn RuntimeTask>,
+    pub(crate) delivery: Option<Box<dyn ProjectionDeliverySource>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum SessionProjectionOutput {
+    Bars {
+        canonical_spec: String,
+        cells: BarsCells,
+    },
+}
+
+impl SessionProjectionOutput {
+    pub fn canonical_spec(&self) -> &str {
+        match self {
+            Self::Bars { canonical_spec, .. } => canonical_spec,
+        }
+    }
+
+    pub fn bars_cells(&self) -> &BarsCells {
+        match self {
+            Self::Bars { cells, .. } => cells,
+        }
+    }
+
+    pub fn into_bars(self) -> (String, BarsCells) {
+        match self {
+            Self::Bars {
+                canonical_spec,
+                cells,
+            } => (canonical_spec, cells),
+        }
+    }
+}
+
+pub(crate) fn install_projection_node(
+    cache: &cache::Cache,
+    feed: &EsReplayCells,
+    node: &ProjectionNodeSpec,
+    outputs: &HashMap<ProjectionNodeSpec, ProjectionOutput>,
+) -> Result<InstalledProjectionNode, LedgerError> {
+    match node {
+        ProjectionNodeSpec::CanonicalTradePrints => {
+            trade_prints::install_trade_prints_projection(cache, feed.clone())
+        }
+        ProjectionNodeSpec::Bars(params) => {
+            let dependency_node = ProjectionNodeSpec::CanonicalTradePrints;
+            let dependency =
+                outputs
+                    .get(&dependency_node)
+                    .ok_or_else(|| LedgerError::ProjectionDependency {
+                        node: node.canonical_key(),
+                        expected: "canonical trade-print",
+                    })?;
+            bars::install_bars_projection(cache, dependency.trade_prints(node)?.clone(), *params)
+        }
+    }
+}
+
+pub(crate) fn public_projection_outputs(
+    plan: &ProjectionPlan,
+    outputs: &HashMap<ProjectionNodeSpec, ProjectionOutput>,
+) -> Result<Vec<SessionProjectionOutput>, LedgerError> {
+    plan.requested()
+        .iter()
+        .map(|spec| {
+            let node = ProjectionNodeSpec::from_public(spec);
+            let output = outputs.get(&node).ok_or_else(|| {
+                LedgerError::ProjectionPlan(format!(
+                    "requested projection `{}` was not installed",
+                    spec.canonical()
+                ))
+            })?;
+            match spec {
+                ProjectionSpec::Bars(_) => Ok(SessionProjectionOutput::Bars {
+                    canonical_spec: spec.canonical(),
+                    cells: output.bars(&node)?.clone(),
+                }),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bars(interval_ns: u64) -> ProjectionSpec {
+        ProjectionSpec::Bars(BarsParams { interval_ns })
+    }
+
+    #[test]
+    fn empty_request_resolves_to_empty_plan() {
+        let plan = ProjectionPlan::resolve(&[]).unwrap();
+        assert!(plan.nodes().is_empty());
+    }
+
+    #[test]
+    fn bars_resolve_after_one_shared_trade_print_dependency() {
+        let plan = ProjectionPlan::resolve(&[bars(MINUTE_NS), bars(5 * MINUTE_NS)]).unwrap();
+        assert_eq!(
+            plan.nodes(),
+            &[
+                ProjectionNodeSpec::CanonicalTradePrints,
+                ProjectionNodeSpec::Bars(BarsParams {
+                    interval_ns: MINUTE_NS,
+                }),
+                ProjectionNodeSpec::Bars(BarsParams {
+                    interval_ns: 5 * MINUTE_NS,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_canonical_public_specs_are_rejected_before_installation() {
+        let error = ProjectionPlan::resolve(&[bars(MINUTE_NS), bars(60 * SECOND_NS)]).unwrap_err();
+        assert!(matches!(error, LedgerError::InvalidProjectionSpec { .. }));
     }
 }

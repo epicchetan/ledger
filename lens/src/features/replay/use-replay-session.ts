@@ -1,5 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react"
-import { subscribeHostResume } from "@remux/viewer-kit/host"
+import {
+  subscribeHostResume,
+  subscribeHostStatus,
+} from "@remux/viewer-kit/host"
 
 import { BarsAccumulator } from "@/features/replay/accumulator"
 import {
@@ -17,6 +20,7 @@ import {
   subscribeSessionEvents,
   subscribeSessionProjections,
 } from "@/features/replay/api"
+import { isHostTransportUnavailable } from "@/features/replay/delivery-health"
 import { getBarsProjectionClient } from "@/features/replay/projection-client"
 import type {
   BarsPosition,
@@ -77,7 +81,8 @@ export function useReplaySession(
   }, [])
   const projectionsBySpec = useMemo(() => {
     const map = new Map<string, BarsAccumulator>()
-    for (const accumulator of projections) map.set(accumulator.spec, accumulator)
+    for (const accumulator of projections)
+      map.set(accumulator.spec, accumulator)
     return map
   }, [projections])
 
@@ -110,11 +115,18 @@ export function useReplaySession(
     let demandTimer: ReturnType<typeof setInterval> | null = null
     let ackTimer: ReturnType<typeof setTimeout> | null = null
     let projectionResyncing = false
+    let projectionRecovery: Promise<void> | null = null
     let resyncFrameApplied = false
     let latestWatermark: ProjectionWatermark | null = null
+    let hostTransportUnavailable = false
     const pendingAcks = new Map<string, BarsPosition>()
     const buffer: Array<() => void> = []
     sessionIdRef.current = null
+
+    const publishDeliveryState = (next: ProjectionDeliveryState) => {
+      if (cancelled) return
+      setDeliveryState(hostTransportUnavailable ? "disconnected_unknown" : next)
+    }
 
     const applyClock = (id: string, next: Clock) => {
       if (id !== sessionIdRef.current) return
@@ -141,18 +153,15 @@ export function useReplaySession(
 
     const requestProjectionResync = (reason: string) => {
       if (cancelled || projectionResyncing || !subscriptionId) return
+      const id = subscriptionId
       projectionResyncing = true
       resyncFrameApplied = false
-      setDeliveryState("resyncing")
-      void resyncSessionProjections(
-        subscriptionId,
-        currentApplied(),
-        reason
-      )
+      publishDeliveryState("resyncing")
+      void resyncSessionProjections(id, currentApplied(), reason)
         .then(() => {
           projectionResyncing = false
-          if (!cancelled && resyncFrameApplied) {
-            setDeliveryState(
+          if (!cancelled && subscriptionId === id && resyncFrameApplied) {
+            publishDeliveryState(
               latestWatermark
                 ? deriveDeliveryState(latestWatermark, projectionsBySpec)
                 : "current"
@@ -160,10 +169,9 @@ export function useReplaySession(
           }
         })
         .catch((err) => {
-          if (!cancelled) {
-            console.warn("[replay] projection resync failed", err)
-            setDeliveryState("disconnected_unknown")
-          }
+          if (cancelled || subscriptionId !== id) return
+          console.warn("[replay] projection resync failed", err)
+          return recoverProjectionSubscription(id, `resync_rejected:${reason}`)
         })
         .finally(() => {
           projectionResyncing = false
@@ -177,21 +185,19 @@ export function useReplaySession(
       }
       if (!subscriptionId || pendingAcks.size === 0) return
       const id = subscriptionId
-      const applied = Array.from(pendingAcks, ([spec, head]) => ({ spec, head }))
+      const applied = Array.from(pendingAcks, ([spec, head]) => ({
+        spec,
+        head,
+      }))
       pendingAcks.clear()
       void acknowledgeSessionProjections(id, applied).catch((err) => {
-        if (!cancelled) {
-          console.warn("[replay] projection acknowledgment failed", err)
-          requestProjectionResync("ack_rejected")
-        }
+        if (cancelled || subscriptionId !== id) return
+        console.warn("[replay] projection acknowledgment failed", err)
+        void recoverProjectionSubscription(id, "ack_rejected")
       })
     }
 
-    const queueAck = (
-      spec: string,
-      head: BarsPosition,
-      immediate: boolean
-    ) => {
+    const queueAck = (spec: string, head: BarsPosition, immediate: boolean) => {
       pendingAcks.set(spec, head)
       if (immediate) {
         queueMicrotask(flushAcks)
@@ -218,7 +224,7 @@ export function useReplaySession(
           resyncFrameApplied = true
         }
         if (!projectionResyncing) {
-          setDeliveryState(
+          publishDeliveryState(
             latestWatermark
               ? deriveDeliveryState(latestWatermark, projectionsBySpec)
               : "current"
@@ -239,7 +245,7 @@ export function useReplaySession(
       latestWatermark = watermark
       if (watermark.feed) seedCursor(watermark.feed)
       if (!projectionResyncing) {
-        setDeliveryState(deriveDeliveryState(watermark, projectionsBySpec))
+        publishDeliveryState(deriveDeliveryState(watermark, projectionsBySpec))
       }
     }
 
@@ -317,12 +323,15 @@ export function useReplaySession(
 
     const sendDemand = () => {
       if (!subscriptionId) return
+      const id = subscriptionId
       void demandSessionProjections(
-        subscriptionId,
+        id,
         document.visibilityState !== "hidden",
         REQUESTED_MAX_FPS
-      ).catch(() => {
-        if (!cancelled) setDeliveryState("disconnected_unknown")
+      ).catch((err) => {
+        if (cancelled || subscriptionId !== id) return
+        console.warn("[replay] projection demand renewal failed", err)
+        void recoverProjectionSubscription(id, "demand_rejected")
       })
     }
 
@@ -365,21 +374,52 @@ export function useReplaySession(
         )
       }
       latestWatermark = null
-      setDeliveryState("delivery_pending")
+      publishDeliveryState("delivery_pending")
       installDemandLease(response.leaseMs)
     }
 
+    const recoverProjectionSubscription = (
+      failedSubscriptionId: string,
+      reason: string
+    ): Promise<void> => {
+      if (
+        cancelled ||
+        subscriptionId !== failedSubscriptionId ||
+        !sessionIdRef.current
+      ) {
+        return Promise.resolve()
+      }
+      if (projectionRecovery) return projectionRecovery
+
+      const id = sessionIdRef.current
+      publishDeliveryState("resyncing")
+      const recovery = subscribeProjectionStream(id, true).catch((err) => {
+        if (cancelled || subscriptionId !== failedSubscriptionId) return
+        console.warn(
+          `[replay] projection subscription recovery failed (${reason})`,
+          err
+        )
+        // Keep the stream in an explicit projection recovery state. A demand
+        // renewal or host-resume verification will try again; host status owns
+        // the separate "reconnecting" state.
+        publishDeliveryState("resyncing")
+      })
+      projectionRecovery = recovery
+      void recovery.finally(() => {
+        if (projectionRecovery === recovery) projectionRecovery = null
+      })
+      return recovery
+    }
+
     const resumeProjectionStream = async (id: string) => {
+      if (projectionRecovery) await projectionRecovery
+      if (cancelled || id !== sessionIdRef.current) return
       if (!subscriptionId) {
         await subscribeProjectionStream(id, true)
         return
       }
       try {
-        await demandSessionProjections(
-          subscriptionId,
-          true,
-          REQUESTED_MAX_FPS
-        )
+        await demandSessionProjections(subscriptionId, true, REQUESTED_MAX_FPS)
         await resyncSessionProjections(
           subscriptionId,
           currentApplied(),
@@ -401,7 +441,7 @@ export function useReplaySession(
       hostResyncing = true
       resumeRequested = false
       buffering = true
-      setDeliveryState("disconnected_unknown")
+      publishDeliveryState("resyncing")
       void attachSession(id, rawId, REPLAY_SPECS)
         .then(async (outcome) => {
           if (!outcome.attached) {
@@ -418,6 +458,13 @@ export function useReplaySession(
           if (cancelled) return
           drainBuffer()
           if (closed) return
+          if (hostTransportUnavailable) {
+            // A connected resume event will retry the verification. Do not
+            // turn an expected in-flight disconnect into a terminal replay
+            // error while the authoritative server session keeps running.
+            setDeliveryState("disconnected_unknown")
+            return
+          }
           setError(errorMessage(err))
           setPhase("error")
         })
@@ -430,6 +477,12 @@ export function useReplaySession(
     const onVisibilityChange = () => sendDemand()
     document.addEventListener("visibilitychange", onVisibilityChange)
     const unsubscribeResume = subscribeHostResume(requestHostResync)
+    const unsubscribeHostStatus = subscribeHostStatus(({ status }) => {
+      hostTransportUnavailable = isHostTransportUnavailable(status, established)
+      if (hostTransportUnavailable && established && !cancelled) {
+        setDeliveryState("disconnected_unknown")
+      }
+    })
 
     void establish()
       .then(async ({ result, attached }) => {
@@ -464,7 +517,6 @@ export function useReplaySession(
         drainBuffer()
         if (closed) return
         setError(errorMessage(err))
-        setDeliveryState("disconnected_unknown")
         setPhase("error")
       })
 
@@ -472,6 +524,7 @@ export function useReplaySession(
       cancelled = true
       unsubscribe()
       unsubscribeResume()
+      unsubscribeHostStatus()
       document.removeEventListener("visibilitychange", onVisibilityChange)
       if (demandTimer) clearInterval(demandTimer)
       if (ackTimer) clearTimeout(ackTimer)
@@ -536,7 +589,8 @@ function deriveDeliveryState(
     ) {
       return "projection_catching_up"
     }
-    const applied = accumulators.get(projection.spec)?.getAppliedPosition() ?? null
+    const applied =
+      accumulators.get(projection.spec)?.getAppliedPosition() ?? null
     if (!applied) return "delivery_pending"
     if (
       applied.epoch < projection.head.epoch ||
@@ -558,7 +612,9 @@ function waitForProjectionSnapshots(
   return new Promise((resolve, reject) => {
     const unsubscribers: Array<() => void> = []
     const finish = () => {
-      if (!accumulators.every((accumulator) => accumulator.getAppliedPosition())) {
+      if (
+        !accumulators.every((accumulator) => accumulator.getAppliedPosition())
+      ) {
         return
       }
       clearTimeout(timeout)

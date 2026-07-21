@@ -21,6 +21,15 @@ pub enum LedgerError {
     #[error("invalid projection spec `{spec}`: {reason}")]
     InvalidProjectionSpec { spec: String, reason: String },
 
+    #[error("projection plan failed: {0}")]
+    ProjectionPlan(String),
+
+    #[error("projection `{node}` requires {expected} output")]
+    ProjectionDependency {
+        node: String,
+        expected: &'static str,
+    },
+
     #[error(transparent)]
     Cache(#[from] cache::CacheError),
 

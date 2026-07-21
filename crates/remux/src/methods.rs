@@ -739,10 +739,12 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::sync::mpsc;
 
+    type TestObjects = HashMap<String, (Vec<u8>, ObjectMetadata)>;
+
     #[derive(Clone, Default)]
     struct TestRemote {
         bucket: String,
-        objects: Arc<Mutex<HashMap<String, (Vec<u8>, ObjectMetadata)>>>,
+        objects: Arc<Mutex<TestObjects>>,
     }
 
     impl TestRemote {
