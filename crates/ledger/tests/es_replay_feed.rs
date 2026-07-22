@@ -13,6 +13,7 @@ use cache::{Cache, CellDescriptor, CellKind, CellOwner, Key, ValueKey};
 use ledger::clock::ClockState;
 use ledger::feed::es_replay::{
     es_replay_component_id, EsMboFeedBatch, EsReplayCells, EsReplayCursor, EsReplayFeed,
+    EsReplayFeedHandle,
 };
 use runtime::{ComponentHandle, ComponentStatus, ExternalWriteBatch, RuntimeHandle, RuntimeWorker};
 use store::{
@@ -288,7 +289,7 @@ async fn feed_updates_cursor_and_status_after_each_emission() {
 }
 
 #[tokio::test]
-async fn backward_seek_truncates_batches_resets_index_bumps_epoch_and_clears_ended() {
+async fn backward_seek_replays_from_zero_and_bumps_epoch() {
     let direct = DirectFeed::start(vec![event(100, 1), event(200, 2), event(300, 3)]).await;
     let mut cursor_watch = direct.cursor_watch;
 
@@ -305,7 +306,8 @@ async fn backward_seek_truncates_batches_resets_index_bumps_epoch_and_clears_end
         |cursor| cursor.ended,
     )
     .await;
-    submit_clock(
+    explicit_seek(
+        &direct.feed_control,
         &direct.handle,
         &direct.clock_key,
         ClockState::initial().seek_to(150),
@@ -322,7 +324,7 @@ async fn backward_seek_truncates_batches_resets_index_bumps_epoch_and_clears_end
 
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].ts_event_ns, 100);
-    assert_eq!(cursor.feed_seq, 3);
+    assert_eq!(cursor.feed_seq, 1);
     assert_eq!(cursor.batch_idx, 1);
     assert_eq!(batches.len(), cursor.batch_idx);
     assert_eq!(cursor.next_ts_event_ns, Some(200));
@@ -360,7 +362,8 @@ async fn mid_catch_up_backward_seek_regresses_without_finishing_stale_pass() {
         |cursor| cursor.catching_up && cursor.batch_idx >= TEST_CATCHUP_CHUNK_BATCHES,
     )
     .await;
-    submit_clock(
+    explicit_seek(
+        &direct.feed_control,
         &direct.handle,
         &direct.clock_key,
         ClockState::initial().seek_to(10),
@@ -405,7 +408,8 @@ async fn feed_parks_after_final_batch_and_backward_seek_revives_it() {
     assert!(timeout(PARK, cursor_watch.changed()).await.is_err());
     assert_eq!(component.status().await.unwrap(), ComponentStatus::Running);
 
-    submit_clock(
+    explicit_seek(
+        &direct.feed_control,
         &direct.handle,
         &direct.clock_key,
         ClockState::initial().seek_to(50),
@@ -428,7 +432,7 @@ async fn feed_parks_after_final_batch_and_backward_seek_revives_it() {
         &direct.cache,
         &mut cursor_watch,
         &direct.cells.cursor,
-        |cursor| cursor.feed_seq == 3,
+        |cursor| cursor.feed_seq == 1,
     )
     .await;
 
@@ -490,6 +494,7 @@ struct DirectFeed {
     raw_id: StoreObjectId,
     cursor_watch: cache::CellWatch,
     component: ComponentHandle,
+    feed_control: EsReplayFeedHandle,
 }
 
 impl DirectFeed {
@@ -499,22 +504,28 @@ impl DirectFeed {
         let cache = Cache::new();
         let clock_key = register_clock(&cache, None);
         let cells = EsReplayCells::register(&cache).unwrap();
-        let mut cursor_watch = cache.watch_key(cells.cursor.key()).unwrap();
+        let mut readiness_watch = cache.watch_key(cells.cursor.key()).unwrap();
         let (worker, handle) = RuntimeWorker::new(cache.clone());
         let worker = tokio::spawn(worker.run());
-        let component = install_feed(
-            &handle,
-            fixture.store.clone(),
+        let (feed, feed_control) = EsReplayFeed::with_control(
             raw_id.clone(),
+            fixture.store.clone(),
             clock_key.clone(),
             cells.clone(),
-        )
-        .await;
+        );
+        let component = timeout(WAKE, handle.install_process(feed))
+            .await
+            .unwrap()
+            .unwrap();
 
-        wait_for_cursor(&cache, &mut cursor_watch, &cells.cursor, |cursor| {
+        wait_for_cursor(&cache, &mut readiness_watch, &cells.cursor, |cursor| {
             cursor.feed_seq == 0
         })
         .await;
+        // Start test observations from the initialized generation. Reusing the
+        // readiness receiver can leave its first notification unseen when the
+        // value check wins the race, making the next `changed` return stale.
+        let cursor_watch = cache.watch_key(cells.cursor.key()).unwrap();
 
         Self {
             cache,
@@ -525,6 +536,7 @@ impl DirectFeed {
             raw_id,
             cursor_watch,
             component,
+            feed_control,
         }
     }
 }
@@ -566,6 +578,21 @@ async fn submit_clock(handle: &RuntimeHandle, clock_key: &ValueKey<ClockState>, 
     let mut batch = ExternalWriteBatch::new(session_owner());
     batch.set_value(clock_key, clock);
     timeout(WAKE, handle.submit_external_writes(batch))
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+async fn explicit_seek(
+    feed_control: &EsReplayFeedHandle,
+    handle: &RuntimeHandle,
+    clock_key: &ValueKey<ClockState>,
+    clock: ClockState,
+) {
+    timeout(WAKE, feed_control.hold()).await.unwrap().unwrap();
+    submit_clock(handle, clock_key, clock).await;
+    let epoch = timeout(WAKE, feed_control.reset()).await.unwrap().unwrap();
+    timeout(WAKE, feed_control.release(epoch))
         .await
         .unwrap()
         .unwrap();

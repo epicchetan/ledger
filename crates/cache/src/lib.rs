@@ -11,7 +11,7 @@ mod error;
 mod key;
 mod watch;
 
-pub use cache::{Cache, CacheReadView, CacheReader};
+pub use cache::{Cache, CacheReadView, CacheReader, CacheSchemaBatch};
 pub use cell::{ArrayKey, CellDescriptor, CellKind, CellOwner, ValueKey, WriteEffects};
 pub use error::CacheError;
 pub use key::Key;

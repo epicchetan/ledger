@@ -18,7 +18,6 @@ use tokio::{
 };
 
 use crate::{
-    clock::ClockState,
     feed::es_replay::{EsReplayCells, EsReplayCursor},
     projection::{Bar, BarsCells, BarsStatus},
 };
@@ -41,10 +40,7 @@ pub struct ProjectionDeliveryMetricsSnapshot {
     pub frames_admitted: u64,
     pub snapshot_frames: u64,
     pub suffix_frames: u64,
-    pub frames_suppressed_during_seek: u64,
     pub outbound_backpressure: u64,
-    pub seek_barriers_completed: u64,
-    pub total_seek_barrier_ns: u64,
     pub subscriptions: u64,
     pub resyncs: u64,
     pub lease_expirations: u64,
@@ -64,10 +60,7 @@ struct ProjectionDeliveryMetricsInner {
     frames_admitted: AtomicU64,
     snapshot_frames: AtomicU64,
     suffix_frames: AtomicU64,
-    frames_suppressed_during_seek: AtomicU64,
     outbound_backpressure: AtomicU64,
-    seek_barriers_completed: AtomicU64,
-    total_seek_barrier_ns: AtomicU64,
     subscriptions: AtomicU64,
     resyncs: AtomicU64,
     lease_expirations: AtomicU64,
@@ -84,10 +77,7 @@ impl ProjectionDeliveryMetrics {
             frames_admitted: load(&self.inner.frames_admitted),
             snapshot_frames: load(&self.inner.snapshot_frames),
             suffix_frames: load(&self.inner.suffix_frames),
-            frames_suppressed_during_seek: load(&self.inner.frames_suppressed_during_seek),
             outbound_backpressure: load(&self.inner.outbound_backpressure),
-            seek_barriers_completed: load(&self.inner.seek_barriers_completed),
-            total_seek_barrier_ns: load(&self.inner.total_seek_barrier_ns),
             subscriptions: load(&self.inner.subscriptions),
             resyncs: load(&self.inner.resyncs),
             lease_expirations: load(&self.inner.lease_expirations),
@@ -105,12 +95,6 @@ pub enum ProjectionDeliverySemantics {
     Snapshot,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SeekDeliveryPolicy {
-    EmitIntermediate,
-    FinalSnapshotOnly,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionDeliveryDescriptor {
     pub spec: String,
@@ -119,7 +103,6 @@ pub struct ProjectionDeliveryDescriptor {
     pub semantics: ProjectionDeliverySemantics,
     pub default_max_fps: NonZeroU16,
     pub max_useful_fps: NonZeroU16,
-    pub seek_policy: SeekDeliveryPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,7 +132,6 @@ pub enum ProjectionFrameReason {
     Initial,
     Cadence,
     Resync,
-    SeekFinal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -268,6 +250,10 @@ pub enum ProjectionDeliveryError {
     InvalidAcknowledgment(String),
     #[error("projection `{0}` state is unavailable")]
     ProjectionUnavailable(String),
+    #[error("projection delivery sources are suspended")]
+    SourcesSuspended,
+    #[error("projection delivery sources must be suspended before replacement")]
+    SourceReplacementRequiresSuspension,
     #[error(transparent)]
     Runtime(#[from] runtime::RuntimeError),
     #[error(transparent)]
@@ -309,7 +295,6 @@ impl BarsDeliverySource {
                 semantics: ProjectionDeliverySemantics::AppendOrderedWithLatest,
                 default_max_fps: NonZeroU16::new(10).expect("non-zero bars FPS"),
                 max_useful_fps: NonZeroU16::new(20).expect("non-zero bars FPS"),
-                seek_policy: SeekDeliveryPolicy::FinalSnapshotOnly,
             },
             watch_keys: vec![cells.status.key().clone()],
             cells,
@@ -394,7 +379,6 @@ pub(crate) fn next_session_generation() -> u64 {
 pub(crate) fn start_projection_delivery(
     runtime: RuntimeHandle,
     session_generation: u64,
-    clock_key: ValueKey<ClockState>,
     feed: EsReplayCells,
     sources: Vec<Box<dyn ProjectionDeliverySource>>,
 ) -> (
@@ -422,27 +406,20 @@ pub(crate) fn start_projection_delivery(
         }
         source_records.insert(spec, SourceRecord { source });
     }
-    if let Ok(watch) = runtime.cache().watch_key(clock_key.key()) {
-        watcher_tasks.push(spawn_change_watch(watch, change_tx.clone(), None));
-    }
-    if let Ok(watch) = runtime.cache().watch_key(feed.cursor.key()) {
-        watcher_tasks.push(spawn_change_watch(watch, change_tx, None));
-    }
-
     let executor = ProjectionDeliveryExecutor {
         runtime,
         session_generation,
-        clock_key,
         feed,
         sources: source_records,
         consumers: HashMap::new(),
         command_rx,
+        change_tx,
         change_rx,
         output_tx,
         watcher_tasks,
         pending_expirations: VecDeque::new(),
         next_subscription_id: 1,
-        seek: None,
+        sources_suspended: false,
         last_watermark_at: Instant::now(),
         metrics: metrics.clone(),
     };
@@ -531,33 +508,32 @@ impl ProjectionDeliveryHandle {
         rx.await.map_err(|_| ProjectionDeliveryError::Stopped)?
     }
 
-    pub async fn begin_seek(
+    pub async fn unsubscribe(
         &self,
-        expected_clock_revision: u64,
-        target_session_ns: u64,
-        required_specs: Vec<String>,
-    ) -> Result<(), ProjectionDeliveryError> {
+        subscription_id: String,
+    ) -> Result<bool, ProjectionDeliveryError> {
         let (reply, rx) = oneshot::channel();
-        self.send(DeliveryCommand::BeginSeek {
-            expected_clock_revision,
-            target_session_ns,
-            required_specs,
+        self.send(DeliveryCommand::Unsubscribe {
+            subscription_id,
             reply,
         })
         .await?;
         rx.await.map_err(|_| ProjectionDeliveryError::Stopped)?
     }
 
-    pub async fn cancel_seek(
+    pub async fn suspend_sources(&self) -> Result<(), ProjectionDeliveryError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(DeliveryCommand::SuspendSources { reply }).await?;
+        rx.await.map_err(|_| ProjectionDeliveryError::Stopped)?
+    }
+
+    pub async fn replace_sources(
         &self,
-        expected_clock_revision: u64,
+        sources: Vec<Box<dyn ProjectionDeliverySource>>,
     ) -> Result<(), ProjectionDeliveryError> {
         let (reply, rx) = oneshot::channel();
-        self.send(DeliveryCommand::CancelSeek {
-            expected_clock_revision,
-            reply,
-        })
-        .await?;
+        self.send(DeliveryCommand::ReplaceSources { sources, reply })
+            .await?;
         rx.await.map_err(|_| ProjectionDeliveryError::Stopped)?
     }
 
@@ -596,14 +572,15 @@ enum DeliveryCommand {
         reason: String,
         reply: oneshot::Sender<Result<(), ProjectionDeliveryError>>,
     },
-    BeginSeek {
-        expected_clock_revision: u64,
-        target_session_ns: u64,
-        required_specs: Vec<String>,
+    Unsubscribe {
+        subscription_id: String,
+        reply: oneshot::Sender<Result<bool, ProjectionDeliveryError>>,
+    },
+    SuspendSources {
         reply: oneshot::Sender<Result<(), ProjectionDeliveryError>>,
     },
-    CancelSeek {
-        expected_clock_revision: u64,
+    ReplaceSources {
+        sources: Vec<Box<dyn ProjectionDeliverySource>>,
         reply: oneshot::Sender<Result<(), ProjectionDeliveryError>>,
     },
     Shutdown {
@@ -635,13 +612,6 @@ struct ConsumerProjectionState {
     frame_sequence: u64,
 }
 
-struct SeekBarrier {
-    expected_clock_revision: u64,
-    _target_session_ns: u64,
-    required_specs: Vec<String>,
-    started_at: Instant,
-}
-
 struct DeliveryChange {
     spec: Option<String>,
 }
@@ -656,17 +626,17 @@ pub struct CollectedProjectionFrame {
 struct ProjectionDeliveryExecutor {
     runtime: RuntimeHandle,
     session_generation: u64,
-    clock_key: ValueKey<ClockState>,
     feed: EsReplayCells,
     sources: HashMap<String, SourceRecord>,
     consumers: HashMap<String, ConsumerState>,
     command_rx: mpsc::Receiver<DeliveryCommand>,
+    change_tx: mpsc::Sender<DeliveryChange>,
     change_rx: mpsc::Receiver<DeliveryChange>,
     output_tx: mpsc::Sender<ProjectionDeliveryEvent>,
     watcher_tasks: Vec<JoinHandle<()>>,
     pending_expirations: VecDeque<String>,
     next_subscription_id: u64,
-    seek: Option<SeekBarrier>,
+    sources_suspended: bool,
     last_watermark_at: Instant,
     metrics: ProjectionDeliveryMetrics,
 }
@@ -733,28 +703,25 @@ impl ProjectionDeliveryExecutor {
                 let result = self.resync(&subscription_id, applied, reason).await;
                 let _ = reply.send(result);
             }
-            DeliveryCommand::BeginSeek {
-                expected_clock_revision,
-                target_session_ns,
-                required_specs,
+            DeliveryCommand::Unsubscribe {
+                subscription_id,
                 reply,
             } => {
-                let result =
-                    self.begin_seek(expected_clock_revision, target_session_ns, required_specs);
+                let result = Ok(self.consumers.remove(&subscription_id).is_some());
                 let _ = reply.send(result);
             }
-            DeliveryCommand::CancelSeek {
-                expected_clock_revision,
-                reply,
-            } => {
-                if self
-                    .seek
-                    .as_ref()
-                    .is_some_and(|seek| seek.expected_clock_revision == expected_clock_revision)
-                {
-                    self.seek = None;
+            DeliveryCommand::SuspendSources { reply } => {
+                if !self.sources_suspended {
+                    for task in self.watcher_tasks.drain(..) {
+                        task.abort();
+                    }
+                    self.sources_suspended = true;
                 }
                 let _ = reply.send(Ok(()));
+            }
+            DeliveryCommand::ReplaceSources { sources, reply } => {
+                let result = self.replace_sources(sources);
+                let _ = reply.send(result);
             }
             DeliveryCommand::Shutdown { reply } => {
                 let _ = reply.send(());
@@ -764,10 +731,71 @@ impl ProjectionDeliveryExecutor {
         Ok(false)
     }
 
+    fn replace_sources(
+        &mut self,
+        sources: Vec<Box<dyn ProjectionDeliverySource>>,
+    ) -> Result<(), ProjectionDeliveryError> {
+        if !self.sources_suspended {
+            return Err(ProjectionDeliveryError::SourceReplacementRequiresSuspension);
+        }
+
+        let mut records = HashMap::new();
+        let mut watchers: Vec<JoinHandle<()>> = Vec::new();
+        for source in sources {
+            let spec = source.descriptor().spec.clone();
+            if records.contains_key(&spec) {
+                for watcher in watchers {
+                    watcher.abort();
+                }
+                return Err(ProjectionDeliveryError::DuplicateProjection(spec));
+            }
+            for key in source.watch_keys() {
+                let watch = match self.runtime.cache().watch_key(key) {
+                    Ok(watch) => watch,
+                    Err(error) => {
+                        for watcher in watchers {
+                            watcher.abort();
+                        }
+                        return Err(error.into());
+                    }
+                };
+                watchers.push(spawn_change_watch(
+                    watch,
+                    self.change_tx.clone(),
+                    Some(spec.clone()),
+                ));
+            }
+            records.insert(spec, SourceRecord { source });
+        }
+
+        for consumer in self.consumers.values_mut() {
+            consumer.projections.retain(|spec, projection| {
+                let Some(source) = records.get(spec) else {
+                    return false;
+                };
+                let descriptor = source.source.descriptor();
+                if descriptor.schema_version != projection.schema_version {
+                    return false;
+                }
+                projection.dirty = true;
+                projection.pending_reason = Some(ProjectionFrameReason::Cadence);
+                projection.last_frame_at = None;
+                true
+            });
+        }
+        self.sources = records;
+        self.watcher_tasks = watchers;
+        self.sources_suspended = false;
+        Ok(())
+    }
+
     fn subscribe(
         &mut self,
         request: ProjectionSubscriptionRequest,
     ) -> Result<ProjectionSubscriptionResponse, ProjectionDeliveryError> {
+        if self.sources_suspended {
+            return Err(ProjectionDeliveryError::SourcesSuspended);
+        }
         let mut seen = HashSet::new();
         let mut projection_states = HashMap::new();
         let mut response_projections = Vec::new();
@@ -949,26 +977,6 @@ impl ProjectionDeliveryExecutor {
         Ok(())
     }
 
-    fn begin_seek(
-        &mut self,
-        expected_clock_revision: u64,
-        target_session_ns: u64,
-        required_specs: Vec<String>,
-    ) -> Result<(), ProjectionDeliveryError> {
-        for spec in &required_specs {
-            if !self.sources.contains_key(spec) {
-                return Err(ProjectionDeliveryError::UnknownProjection(spec.clone()));
-            }
-        }
-        self.seek = Some(SeekBarrier {
-            expected_clock_revision,
-            _target_session_ns: target_session_ns,
-            required_specs,
-            started_at: Instant::now(),
-        });
-        Ok(())
-    }
-
     fn handle_change(&mut self, change: DeliveryChange) {
         if let Some(spec) = change.spec {
             self.metrics
@@ -1006,9 +1014,10 @@ impl ProjectionDeliveryExecutor {
             self.pending_expirations.push_back(subscription_id);
         }
         self.flush_expirations();
-        self.complete_seek_if_ready().await?;
+        if self.sources_suspended {
+            return Ok(());
+        }
 
-        let suppress = self.seek.is_some();
         let mut due = Vec::new();
         for (subscription_id, consumer) in &self.consumers {
             if !consumer.active {
@@ -1016,14 +1025,6 @@ impl ProjectionDeliveryExecutor {
             }
             for (spec, projection) in &consumer.projections {
                 if !projection.dirty {
-                    continue;
-                }
-                let descriptor = self.sources[spec].source.descriptor();
-                if suppress && descriptor.seek_policy == SeekDeliveryPolicy::FinalSnapshotOnly {
-                    self.metrics
-                        .inner
-                        .frames_suppressed_during_seek
-                        .fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 let interval =
@@ -1166,12 +1167,11 @@ impl ProjectionDeliveryExecutor {
             payload: collected.payload,
         };
         projection.available_head = Some(collected.head.clone());
-        if matches!(
-            reason,
-            ProjectionFrameReason::Initial | ProjectionFrameReason::Resync
-        ) {
-            projection.acknowledged_head = validated_resume_base;
-        }
+        let resets_receiver_lineage = collected.operation == ProjectionFrameOperation::Snapshot
+            || matches!(
+                reason,
+                ProjectionFrameReason::Initial | ProjectionFrameReason::Resync
+            );
         match self
             .output_tx
             .try_send(ProjectionDeliveryEvent::Frame(Box::new(frame)))
@@ -1197,6 +1197,10 @@ impl ProjectionDeliveryExecutor {
                             .fetch_add(1, Ordering::Relaxed);
                     }
                 }
+                if resets_receiver_lineage {
+                    projection.acknowledged_head = validated_resume_base;
+                    projection.issued_heads.clear();
+                }
                 projection.frame_sequence = frame_sequence;
                 projection.sent_head = Some(collected.head.clone());
                 projection.issued_heads.push_back(collected.head);
@@ -1220,101 +1224,6 @@ impl ProjectionDeliveryExecutor {
                 // Projection truth continues and shutdown remains reachable.
                 projection.dirty = false;
             }
-        }
-        Ok(())
-    }
-
-    async fn complete_seek_if_ready(&mut self) -> Result<(), ProjectionDeliveryError> {
-        let Some(seek) = self.seek.as_ref() else {
-            return Ok(());
-        };
-        let expected_revision = seek.expected_clock_revision;
-        let required_specs = seek.required_specs.clone();
-        let clock_key = self.clock_key.clone();
-        let cursor_key = self.feed.cursor.clone();
-        let feed_status_key = self.feed.status.clone();
-        let convergence = required_specs
-            .iter()
-            .map(|spec| {
-                self.sources
-                    .get(spec)
-                    .expect("seek specs validated")
-                    .source
-                    .convergence_key()
-            })
-            .collect::<Vec<_>>();
-        let ready = self
-            .runtime
-            .snapshot(move |view| {
-                let clock = view.read_value(&clock_key)?;
-                let Some(clock) = clock else {
-                    return Ok(false);
-                };
-                if clock.revision < expected_revision {
-                    return Ok(false);
-                }
-                let feed_status = view.read_value(&feed_status_key)?;
-                let Some(feed_status) = feed_status else {
-                    return Ok(false);
-                };
-                let cursor = view.read_value(&cursor_key)?;
-                let Some(cursor) = cursor else {
-                    return Ok(false);
-                };
-                if feed_status.clock.revision < expected_revision
-                    || feed_status.cursor != cursor
-                    || cursor.catching_up
-                {
-                    return Ok(false);
-                }
-                for key in convergence {
-                    match key {
-                        ProjectionConvergenceKey::Bars(key) => {
-                            let Some(status) = view.read_value(&key)? else {
-                                return Ok(false);
-                            };
-                            if status.epoch != cursor.epoch
-                                || status.processed_batches != cursor.batch_idx
-                            {
-                                return Ok(false);
-                            }
-                        }
-                    }
-                }
-                Ok(true)
-            })
-            .await?;
-        if !ready {
-            return Ok(());
-        }
-
-        let completed_seek = self.seek.take().expect("seek checked above");
-        self.metrics
-            .inner
-            .seek_barriers_completed
-            .fetch_add(1, Ordering::Relaxed);
-        self.metrics.inner.total_seek_barrier_ns.fetch_add(
-            completed_seek
-                .started_at
-                .elapsed()
-                .as_nanos()
-                .min(u64::MAX as u128) as u64,
-            Ordering::Relaxed,
-        );
-        let targets = self
-            .consumers
-            .iter()
-            .filter(|(_, consumer)| consumer.active)
-            .flat_map(|(subscription_id, consumer)| {
-                required_specs
-                    .iter()
-                    .filter(|spec| consumer.projections.contains_key(*spec))
-                    .map(move |spec| (subscription_id.clone(), spec.clone()))
-            })
-            .collect::<Vec<_>>();
-        for (subscription_id, spec) in targets {
-            self.collect_projection(&subscription_id, &spec, ProjectionFrameReason::SeekFinal)
-                .await?;
         }
         Ok(())
     }

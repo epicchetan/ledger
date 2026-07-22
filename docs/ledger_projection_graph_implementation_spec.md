@@ -6,6 +6,11 @@ Date: 2026-07-20
 
 Baseline: `531997e` (`Publish immutable viewer bundle`)
 
+> Superseded behavior (2026-07-21): the session graph is now mutable through
+> zero-origin rebuild, while projection definitions and dependency planning in
+> this document remain the baseline. See
+> `ledger_zero_origin_rebuild_implementation_spec.md`.
+
 ## 1. Purpose
 
 Formalize Ledger projections and their dependencies without introducing a

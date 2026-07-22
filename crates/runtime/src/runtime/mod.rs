@@ -52,6 +52,10 @@ impl Runtime {
         self.cache.read_view()
     }
 
+    pub(crate) fn cache_owner(&self) -> &Cache {
+        &self.cache
+    }
+
     pub async fn register_task<T>(&mut self, task: T) -> Result<(), RuntimeError>
     where
         T: RuntimeTask,
@@ -94,6 +98,15 @@ impl Runtime {
 
     pub fn contains_task(&self, id: &ComponentId) -> bool {
         self.tasks.contains(id)
+    }
+
+    pub fn remove_task(&mut self, id: &ComponentId) -> Result<bool, RuntimeError> {
+        if self.tasks.remove(id).is_none() {
+            return Ok(false);
+        }
+        self.task_queue.remove_task(id);
+        self.dependencies.remove_task(id);
+        Ok(true)
     }
 
     pub fn task_ids(&self) -> Vec<ComponentId> {

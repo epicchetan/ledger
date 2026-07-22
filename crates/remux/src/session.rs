@@ -12,7 +12,7 @@ use ledger::projection::{
     ProjectionResumeMode, ProjectionSubscriptionProjectionRequest, ProjectionSubscriptionRequest,
     ProjectionWatermark,
 };
-use ledger::projection::{Bar, BarsCells, BarsStatus, ProjectionSpec};
+use ledger::projection::{Bar, BarsCells, BarsStatus, ProjectionSpec, SessionProjectionOutput};
 use ledger::session::{LedgerSessionBuilder, LedgerSessionHandle};
 use runtime::RuntimeHandle;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -34,6 +34,9 @@ pub const SESSION_SPEED_METHOD: &str = "remux/ledger/session/speed";
 pub const SESSION_SEEK_METHOD: &str = "remux/ledger/session/seek";
 pub const SESSION_BARS_METHOD: &str = "remux/ledger/session/bars";
 pub const SESSION_PROJECTIONS_SUBSCRIBE_METHOD: &str = "remux/ledger/session/projections/subscribe";
+pub const SESSION_PROJECTIONS_SET_METHOD: &str = "remux/ledger/session/projections/set";
+pub const SESSION_PROJECTIONS_UNSUBSCRIBE_METHOD: &str =
+    "remux/ledger/session/projections/unsubscribe";
 pub const SESSION_PROJECTIONS_ACK_METHOD: &str = "remux/ledger/session/projections/ack";
 pub const SESSION_PROJECTIONS_DEMAND_METHOD: &str = "remux/ledger/session/projections/demand";
 pub const SESSION_PROJECTIONS_RESYNC_METHOD: &str = "remux/ledger/session/projections/resync";
@@ -60,12 +63,20 @@ struct ActiveSession {
     projections: Vec<ActiveProjection>,
     watchers: Vec<JoinHandle<()>>,
     projection_origins: HashMap<String, String>,
+    projection_unsubscribe_origins: HashMap<String, Option<String>>,
 }
 
 #[derive(Debug, Clone)]
 struct ActiveProjection {
     spec: String,
     cells: BarsCells,
+}
+
+impl From<SessionProjectionOutput> for ActiveProjection {
+    fn from(output: SessionProjectionOutput) -> Self {
+        let (spec, cells) = output.into_bars();
+        Self { spec, cells }
+    }
 }
 
 struct SessionCacheStatusSnapshot {
@@ -142,10 +153,7 @@ impl SessionRegistry {
             .projections(&feed, &requested)
             .map_err(|err| RpcError::domain(err.to_string()))?
             .into_iter()
-            .map(|output| {
-                let (spec, cells) = output.into_bars();
-                ActiveProjection { spec, cells }
-            })
+            .map(ActiveProjection::from)
             .collect::<Vec<_>>();
 
         let handle = builder
@@ -164,6 +172,7 @@ impl SessionRegistry {
                 projections: active_projections.clone(),
                 watchers: Vec::new(),
                 projection_origins: HashMap::new(),
+                projection_unsubscribe_origins: HashMap::new(),
             });
         }
 
@@ -205,17 +214,17 @@ impl SessionRegistry {
     // touches the clock, never closes anything. Returns the open-shaped
     // identity plus the current clock and cursor, because the watchers only
     // notify on change and a paused session would otherwise stay silent
-    // forever. The exact server-issued id is the reload capability: matching
-    // only raw/spec would let a fresh navigation or another client steal the
-    // active replay. A stale id or identity mismatch is an expected typed miss;
+    // forever. The exact server-issued id plus raw id is the reload capability;
+    // the current mutable projection set is returned, never matched against a
+    // stale client constant. A stale identity is an expected typed miss, while
     // malformed input and cache/store failures remain real RPC errors.
     pub async fn attach<S>(&self, store: &Store<S>, params: Value) -> Result<Value, RpcError>
     where
         S: RemoteStore + 'static,
     {
         let params = parse_params::<SessionAttachParams>(params)?;
-        let requested = parse_projection_specs(params.projections.unwrap_or_default())?;
         let raw_id = parse_object_id(&params.raw_id)?;
+        let _lifecycle = self.lifecycle.lock().await;
         let active = self.active.lock().await;
         let Some(session) = active
             .as_ref()
@@ -226,21 +235,6 @@ impl SessionRegistry {
                 session: None,
             });
         };
-        let have: HashSet<&str> = session
-            .projections
-            .iter()
-            .map(|projection| projection.spec.as_str())
-            .collect();
-        let want: HashSet<&str> = requested
-            .iter()
-            .map(|(canonical, _)| canonical.as_str())
-            .collect();
-        if have != want {
-            return to_value(SessionAttachResultDto {
-                attached: false,
-                session: None,
-            });
-        }
         let runtime = session.handle.runtime().clone();
         let clock_key = session.handle.clock_key().clone();
         let cursor_key = session.feed.cursor.clone();
@@ -306,6 +300,7 @@ impl SessionRegistry {
 
     pub async fn status(&self, params: Value) -> Result<Value, RpcError> {
         let params = parse_params::<SessionIdParams>(params)?;
+        let _lifecycle = self.lifecycle.lock().await;
         let (runtime, clock_key, feed, projection_cells, session_id, raw_id) = {
             let active = self.active.lock().await;
             let session = matching_session(active.as_ref(), &params.session_id)?;
@@ -430,6 +425,7 @@ impl SessionRegistry {
         let params = parse_params::<SessionBarsParams>(params)?;
         let from = params.from.unwrap_or_default();
         let canonical = parse_projection_spec(&params.spec)?.0;
+        let _lifecycle = self.lifecycle.lock().await;
         let (runtime, session_id, projection) = {
             let active = self.active.lock().await;
             let session = matching_session(active.as_ref(), &params.session_id)?;
@@ -454,6 +450,42 @@ impl SessionRegistry {
         )
         .await?;
         to_value(frame)
+    }
+
+    pub async fn set_projections(&self, params: Value) -> Result<Value, RpcError> {
+        let params = parse_params::<SessionSetProjectionsParams>(params)?;
+        let requested = parse_projection_specs(params.projections)?
+            .into_iter()
+            .map(|(_, projection)| projection)
+            .collect::<Vec<_>>();
+        let _lifecycle = self.lifecycle.lock().await;
+        let mut active = self.active.lock().await;
+        let session = active
+            .as_mut()
+            .filter(|session| session.id == params.session_id)
+            .ok_or_else(|| unknown_session(&params.session_id))?;
+        let result = session
+            .handle
+            .set_projections(requested)
+            .await
+            .map_err(|err| RpcError::domain(err.to_string()))?;
+        let projections = result
+            .projections
+            .into_iter()
+            .map(ActiveProjection::from)
+            .collect::<Vec<_>>();
+        session.projections = projections.clone();
+        to_value(SessionSetProjectionsResultDto {
+            session_id: session.id.clone(),
+            epoch: result.epoch,
+            projections: projections
+                .into_iter()
+                .map(|projection| ProjectionDto {
+                    spec: projection.spec,
+                })
+                .collect(),
+            changed: result.changed,
+        })
     }
 
     pub async fn subscribe_projections(&self, params: Value) -> Result<Value, RpcError> {
@@ -496,6 +528,35 @@ impl SessionRegistry {
                 .insert(response.subscription_id.clone(), origin);
         }
         to_value(ProjectionSubscribeResultDto::from(response))
+    }
+
+    pub async fn unsubscribe_projections(&self, params: Value) -> Result<Value, RpcError> {
+        let params = parse_params::<ProjectionUnsubscribeParams>(params)?;
+        let mut active = self.active.lock().await;
+        let session = active
+            .as_mut()
+            .filter(|session| session.id == params.session_id)
+            .ok_or_else(|| unknown_session(&params.session_id))?;
+        validate_projection_origin(
+            session,
+            &params.subscription_id,
+            params.remux_origin.as_deref(),
+        )?;
+        let delivery = session
+            .handle
+            .projection_delivery()
+            .ok_or_else(|| RpcError::domain("session has no projection delivery executor"))?;
+        let unsubscribed = delivery
+            .unsubscribe(params.subscription_id.clone())
+            .await
+            .map_err(|err| RpcError::domain(err.to_string()))?;
+        if unsubscribed {
+            let origin = session.projection_origins.remove(&params.subscription_id);
+            session
+                .projection_unsubscribe_origins
+                .insert(params.subscription_id, origin);
+        }
+        to_value(ProjectionUnsubscribeResultDto { unsubscribed })
     }
 
     pub async fn acknowledge_projections(&self, params: Value) -> Result<Value, RpcError> {
@@ -910,13 +971,23 @@ fn validate_projection_origin(
     subscription_id: &str,
     request_origin: Option<&str>,
 ) -> Result<(), RpcError> {
-    match (
-        session.projection_origins.get(subscription_id),
-        request_origin,
-    ) {
-        (Some(expected), Some(actual)) if expected == actual => Ok(()),
-        (None, None) => Ok(()),
-        (Some(_), None) | (Some(_), Some(_)) | (None, Some(_)) => Err(RpcError::domain(format!(
+    let expected = session
+        .projection_origins
+        .get(subscription_id)
+        .map(|origin| Some(origin.as_str()))
+        .or_else(|| {
+            session
+                .projection_unsubscribe_origins
+                .get(subscription_id)
+                .map(|origin| origin.as_deref())
+        });
+    match (expected, request_origin) {
+        (Some(Some(expected)), Some(actual)) if expected == actual => Ok(()),
+        (Some(None), None) | (None, None) => Ok(()),
+        (Some(Some(_)), None)
+        | (Some(Some(_)), Some(_))
+        | (Some(None), Some(_))
+        | (None, Some(_)) => Err(RpcError::domain(format!(
             "unknown projection subscription {subscription_id}"
         ))),
     }
@@ -1018,7 +1089,8 @@ struct SessionOpenParams {
 struct SessionAttachParams {
     session_id: String,
     raw_id: String,
-    projections: Option<Vec<String>>,
+    #[serde(rename = "projections")]
+    _projections: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1051,6 +1123,13 @@ struct SessionBarsParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SessionSetProjectionsParams {
+    session_id: String,
+    projections: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ProjectionSubscribeParams {
     session_id: String,
     consumer_instance_id: String,
@@ -1066,6 +1145,15 @@ struct ProjectionSubscribeProjectionParams {
     schema_versions: Vec<u16>,
     requested_max_fps: Option<u16>,
     have: Option<BarsPositionDto>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectionUnsubscribeParams {
+    session_id: String,
+    subscription_id: String,
+    #[serde(rename = "_remuxOrigin")]
+    remux_origin: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1145,6 +1233,15 @@ struct ProjectionDto {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct SessionSetProjectionsResultDto {
+    session_id: String,
+    epoch: u64,
+    projections: Vec<ProjectionDto>,
+    changed: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SessionCloseResultDto {
     closed: bool,
 }
@@ -1153,6 +1250,12 @@ struct SessionCloseResultDto {
 #[serde(rename_all = "camelCase")]
 struct OkDto {
     ok: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectionUnsubscribeResultDto {
+    unsubscribed: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1468,7 +1571,6 @@ fn reason_string(reason: ProjectionFrameReason) -> &'static str {
         ProjectionFrameReason::Initial => "initial",
         ProjectionFrameReason::Cadence => "cadence",
         ProjectionFrameReason::Resync => "resync",
-        ProjectionFrameReason::SeekFinal => "seekFinal",
     }
 }
 
@@ -1876,7 +1978,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_frames_are_contiguous_and_concatenate_to_cache_array() {
+    async fn every_explicit_seek_emits_an_authoritative_new_epoch_snapshot() {
         let mut fixture = remux_fixture();
         let raw_id = fabricate_prepared_day(&fixture.store, sample_events())
             .await
@@ -1884,17 +1986,15 @@ mod tests {
         let session_id = open_session_id(&fixture.methods, &raw_id, vec!["bars:1s"]).await;
 
         seek(&fixture.methods, &session_id, 1_500_000_000).await;
-        let first = wait_bars_total(&mut fixture.output_rx, &session_id, 0, 1).await;
+        let first = wait_bars_total(&mut fixture.output_rx, &session_id, 1, 1).await;
         assert_eq!(first["from"], 0);
 
         seek(&fixture.methods, &session_id, 2_500_000_000).await;
-        let second = wait_bars_total(&mut fixture.output_rx, &session_id, 0, 2).await;
-        assert_eq!(second["from"], first["total"]);
+        let second = wait_bars_total(&mut fixture.output_rx, &session_id, 2, 2).await;
+        assert_eq!(second["from"], 0);
 
-        let mut starts = frame_starts(&first);
-        starts.extend(frame_starts(&second));
         assert_eq!(
-            starts,
+            frame_starts(&second),
             direct_bar_start_strings(&fixture.methods, "bars:1s").await
         );
     }
@@ -1941,7 +2041,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backward_seek_resyncs_from_zero_and_forward_reemits_suffix() {
+    async fn backward_and_forward_seeks_each_rebuild_from_zero() {
         let mut fixture = remux_fixture();
         let raw_id = fabricate_prepared_day(&fixture.store, sample_events())
             .await
@@ -1949,7 +2049,7 @@ mod tests {
         let session_id = open_session_id(&fixture.methods, &raw_id, vec!["bars:1s"]).await;
 
         seek(&fixture.methods, &session_id, 3_500_000_000).await;
-        let full = wait_bars_total(&mut fixture.output_rx, &session_id, 0, 3).await;
+        let full = wait_bars_total(&mut fixture.output_rx, &session_id, 1, 3).await;
         assert_eq!(frame_starts(&full), vec!["0", "1000000000", "2000000000"]);
 
         seek(&fixture.methods, &session_id, 1_750_000_000).await;
@@ -1958,7 +2058,7 @@ mod tests {
                 &mut fixture.output_rx,
                 SESSION_PROJECTION_FRAME_NOTIFICATION,
                 |params| {
-                    params["head"]["epoch"].as_u64() == Some(1)
+                    params["head"]["epoch"].as_u64() == Some(2)
                         && params["base"].is_null()
                         && params["head"]["completedBars"].as_u64() == Some(1)
                 },
@@ -1977,16 +2077,17 @@ mod tests {
                 &mut fixture.output_rx,
                 SESSION_PROJECTION_FRAME_NOTIFICATION,
                 |params| {
-                    params["head"]["epoch"].as_u64() == Some(1)
-                        && params["base"]["completedBars"].as_u64() == Some(1)
+                    params["head"]["epoch"].as_u64() == Some(3)
+                        && params["base"].is_null()
                         && params["head"]["completedBars"].as_u64() == Some(3)
                 },
             )
             .await,
         );
-        let mut starts = frame_starts(&regressed);
-        starts.extend(frame_starts(&reemitted));
-        assert_eq!(starts, vec!["0", "1000000000", "2000000000"]);
+        assert_eq!(
+            frame_starts(&reemitted),
+            vec!["0", "1000000000", "2000000000"]
+        );
     }
 
     #[tokio::test]
@@ -1997,7 +2098,7 @@ mod tests {
             .0;
         let session_id = open_session_id(&fixture.methods, &raw_id, vec!["bars:1s"]).await;
         seek(&fixture.methods, &session_id, 3_500_000_000).await;
-        let pushed = wait_bars_total(&mut fixture.output_rx, &session_id, 0, 3).await;
+        let pushed = wait_bars_total(&mut fixture.output_rx, &session_id, 1, 3).await;
 
         let full = call(
             &fixture.methods,
@@ -2223,8 +2324,7 @@ mod tests {
             SESSION_ATTACH_METHOD,
             json!({
                 "sessionId": session_id,
-                "rawId": raw_id.to_string(),
-                "projections": ["bars:1s"]
+                "rawId": raw_id.to_string()
             }),
         )
         .await
@@ -2343,17 +2443,19 @@ mod tests {
         .unwrap();
         assert_eq!(wrong_raw, json!({ "attached": false }));
 
-        // Right raw, different projection set: must fall back to a rebuild.
-        let wrong_specs = attach(
+        // A legacy projection field is ignored. The active graph returned by
+        // the server is authoritative after a mutable projection change.
+        let legacy_specs = attach(
             session_id.clone(),
             raw_id.to_string(),
             vec!["bars:1s", "bars:1m"],
         )
         .await
         .unwrap();
-        assert_eq!(wrong_specs, json!({ "attached": false }));
+        assert_eq!(legacy_specs["attached"], true);
+        assert_eq!(legacy_specs["session"]["projections"][0]["spec"], "bars:1s");
 
-        // The matching raw + spec set attaches.
+        // The matching identity also attaches for a legacy matching request.
         let matched = attach(session_id.clone(), raw_id.to_string(), vec!["bars:1s"])
             .await
             .unwrap();
@@ -2372,6 +2474,176 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(closed, json!({ "attached": false }));
+    }
+
+    #[tokio::test]
+    async fn projection_set_rebuilds_current_graph_and_unsubscribe_is_idempotent() {
+        let mut fixture = remux_fixture();
+        let raw_id = fabricate_prepared_day(&fixture.store, sample_events())
+            .await
+            .0;
+        let opened = call(
+            &fixture.methods,
+            SESSION_OPEN_METHOD,
+            json!({ "rawId": raw_id.to_string(), "projections": ["bars:1s"] }),
+        )
+        .await
+        .unwrap();
+        let session_id = opened["sessionId"].as_str().unwrap().to_string();
+        seek(&fixture.methods, &session_id, 3_500_000_000).await;
+
+        let old_subscription = call(
+            &fixture.methods,
+            SESSION_PROJECTIONS_SUBSCRIBE_METHOD,
+            json!({
+                "sessionId": session_id,
+                "consumerInstanceId": "projection-change-old",
+                "projections": [{
+                    "spec": "bars:1s",
+                    "schemaVersions": [1],
+                    "requestedMaxFps": 20,
+                    "have": null
+                }],
+                "_remuxOrigin": "projection-change-origin"
+            }),
+        )
+        .await
+        .unwrap();
+        let old_subscription_id = old_subscription["subscriptionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let changed = call(
+            &fixture.methods,
+            SESSION_PROJECTIONS_SET_METHOD,
+            json!({ "sessionId": session_id, "projections": ["bars:2s"] }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(changed["sessionId"], session_id);
+        assert_eq!(changed["changed"], true);
+        assert_eq!(changed["epoch"], 2);
+        assert_eq!(changed["projections"][0]["spec"], "bars:2s");
+
+        let unchanged = call(
+            &fixture.methods,
+            SESSION_PROJECTIONS_SET_METHOD,
+            json!({ "sessionId": session_id, "projections": ["bars:02s"] }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unchanged["changed"], false);
+        assert_eq!(unchanged["epoch"], changed["epoch"]);
+
+        let duplicate = call(
+            &fixture.methods,
+            SESSION_PROJECTIONS_SET_METHOD,
+            json!({
+                "sessionId": session_id,
+                "projections": ["bars:2s", "bars:02s"]
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(duplicate.code, INVALID_PARAMS);
+
+        let attached = call(
+            &fixture.methods,
+            SESSION_ATTACH_METHOD,
+            json!({
+                "sessionId": session_id,
+                "rawId": raw_id.to_string(),
+                "projections": ["bars:1s"]
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(attached["attached"], true);
+        assert_eq!(attached["session"]["projections"][0]["spec"], "bars:2s");
+
+        let old_pull = call(
+            &fixture.methods,
+            SESSION_BARS_METHOD,
+            json!({ "sessionId": session_id, "spec": "bars:1s", "from": 0 }),
+        )
+        .await
+        .unwrap_err();
+        assert!(old_pull.message.contains("unknown projection spec"));
+        let status = status(&fixture.methods, &session_id).await;
+        assert_eq!(status["projections"].as_array().unwrap().len(), 1);
+        assert_eq!(status["projections"][0]["spec"], "bars:2s");
+
+        let unsubscribed = call(
+            &fixture.methods,
+            SESSION_PROJECTIONS_UNSUBSCRIBE_METHOD,
+            json!({
+                "sessionId": session_id,
+                "subscriptionId": old_subscription_id,
+                "_remuxOrigin": "projection-change-origin"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unsubscribed["unsubscribed"], true);
+        let repeated = call(
+            &fixture.methods,
+            SESSION_PROJECTIONS_UNSUBSCRIBE_METHOD,
+            json!({
+                "sessionId": session_id,
+                "subscriptionId": old_subscription_id,
+                "_remuxOrigin": "projection-change-origin"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(repeated["unsubscribed"], false);
+
+        let wrong_origin = call(
+            &fixture.methods,
+            SESSION_PROJECTIONS_UNSUBSCRIBE_METHOD,
+            json!({
+                "sessionId": session_id,
+                "subscriptionId": old_subscription_id,
+                "_remuxOrigin": "wrong-origin"
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(wrong_origin
+            .message
+            .contains("unknown projection subscription"));
+
+        let new_subscription = call(
+            &fixture.methods,
+            SESSION_PROJECTIONS_SUBSCRIBE_METHOD,
+            json!({
+                "sessionId": session_id,
+                "consumerInstanceId": "projection-change-new",
+                "projections": [{
+                    "spec": "bars:2s",
+                    "schemaVersions": [1],
+                    "requestedMaxFps": 20,
+                    "have": null
+                }],
+                "_remuxOrigin": "projection-change-origin"
+            }),
+        )
+        .await
+        .unwrap();
+        let new_subscription_id = new_subscription["subscriptionId"].as_str().unwrap();
+        let frame = wait_notification(
+            &mut fixture.output_rx,
+            SESSION_PROJECTION_FRAME_NOTIFICATION,
+            |params| {
+                params["subscriptionId"].as_str() == Some(new_subscription_id)
+                    && params["spec"].as_str() == Some("bars:2s")
+                    && params["operation"].as_str() == Some("snapshot")
+            },
+        )
+        .await;
+        assert_eq!(frame["head"]["epoch"], changed["epoch"]);
+        assert_eq!(frame["head"]["completedBars"], 1);
     }
 
     #[tokio::test]
@@ -2400,7 +2672,7 @@ mod tests {
         assert_eq!(initial["projections"][0]["liveBar"], false);
 
         seek(&fixture.methods, &session_id, 3_500_000_000).await;
-        wait_bars_total(&mut fixture.output_rx, &session_id, 0, 3).await;
+        wait_bars_total(&mut fixture.output_rx, &session_id, 1, 3).await;
         let ended = status(&fixture.methods, &session_id).await;
         assert_eq!(ended["feed"]["cursor"]["ended"], true);
         assert_eq!(ended["projections"][0]["completedBars"], 3);

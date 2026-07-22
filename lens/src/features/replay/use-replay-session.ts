@@ -16,9 +16,11 @@ import {
   playSession,
   resyncSessionProjections,
   seekSession,
+  setSessionProjections,
   setSessionSpeed,
   subscribeSessionEvents,
   subscribeSessionProjections,
+  unsubscribeSessionProjections,
 } from "@/features/replay/api"
 import { isHostTransportUnavailable } from "@/features/replay/delivery-health"
 import { getBarsProjectionClient } from "@/features/replay/projection-client"
@@ -34,7 +36,7 @@ import type {
   SessionOpenResult,
 } from "@/features/replay/types"
 
-const REPLAY_SPECS = ["bars:1m"]
+const DEFAULT_REPLAY_SPEC = "bars:1m"
 const REQUESTED_MAX_FPS = 15
 const EVENT_BUFFER_CAP = 4096
 const RESUME_STORAGE_KEY = "lens.replay.session.v1"
@@ -49,6 +51,7 @@ export interface ReplayControls {
   pause: () => void
   setSpeed: (speed: number) => void
   seek: (sessionNs: string) => void
+  setProjection: (spec: string) => void
 }
 
 export interface ReplaySession {
@@ -61,13 +64,13 @@ export interface ReplaySession {
   cursor: Cursor | null
   deliveryState: ProjectionDeliveryState
   projections: BarsAccumulator[]
+  selectedProjection: string
   controls: ReplayControls
 }
 
 interface StoredReplaySession {
   sessionId: string
   rawId: string
-  projections: string[]
 }
 
 export function useReplaySession(
@@ -75,16 +78,10 @@ export function useReplaySession(
   routedSessionId: string | null = null
 ): ReplaySession {
   const sessionIdRef = useRef<string | null>(null)
-  const projections = useMemo(() => {
-    const client = getBarsProjectionClient()
-    return REPLAY_SPECS.map((spec) => client.createAccumulator(spec))
-  }, [])
-  const projectionsBySpec = useMemo(() => {
-    const map = new Map<string, BarsAccumulator>()
-    for (const accumulator of projections)
-      map.set(accumulator.spec, accumulator)
-    return map
-  }, [projections])
+  const setProjectionRef = useRef<(spec: string) => void>(() => undefined)
+  const [projections, setProjections] = useState<BarsAccumulator[]>(() => [
+    getBarsProjectionClient().createAccumulator(DEFAULT_REPLAY_SPEC),
+  ])
 
   const [phase, setPhase] = useState<ReplayPhase>("opening")
   const [open, setOpen] = useState<SessionOpenResult | null>(null)
@@ -119,9 +116,26 @@ export function useReplaySession(
     let resyncFrameApplied = false
     let latestWatermark: ProjectionWatermark | null = null
     let hostTransportUnavailable = false
+    let activeProjections = createAccumulators([DEFAULT_REPLAY_SPEC])
+    let projectionsBySpec = indexAccumulators(activeProjections)
+    let selectionRequested: string | null = null
+    let selectionRunning = false
     const pendingAcks = new Map<string, BarsPosition>()
     const buffer: Array<() => void> = []
     sessionIdRef.current = null
+    setPhase("opening")
+    setOpen(null)
+    setError(null)
+    setEndedReason(null)
+    setClockState(null)
+    setCursor(null)
+    setProjections(activeProjections)
+
+    const replaceAccumulators = (specs: string[]) => {
+      activeProjections = createAccumulators(specs)
+      projectionsBySpec = indexAccumulators(activeProjections)
+      setProjections(activeProjections)
+    }
 
     const publishDeliveryState = (next: ProjectionDeliveryState) => {
       if (cancelled) return
@@ -146,7 +160,7 @@ export function useReplaySession(
     }
 
     const currentApplied = () =>
-      projections.flatMap((accumulator) => {
+      activeProjections.flatMap((accumulator) => {
         const head = accumulator.getAppliedPosition()
         return head ? [{ spec: accumulator.spec, head }] : []
       })
@@ -289,11 +303,7 @@ export function useReplaySession(
       attached: SessionAttachSnapshot | null
     }> => {
       if (resumeCandidate) {
-        const outcome = await attachSession(
-          resumeCandidate,
-          rawId,
-          REPLAY_SPECS
-        )
+        const outcome = await attachSession(resumeCandidate, rawId)
         if (outcome.attached) {
           return {
             result: { ...outcome.session, replaced: null },
@@ -305,7 +315,7 @@ export function useReplaySession(
       }
       if (cancelled) throw new Error("Replay session establishment cancelled")
       return {
-        result: await openSession(rawId, REPLAY_SPECS),
+        result: await openSession(rawId, [DEFAULT_REPLAY_SPEC]),
         attached: null,
       }
     }
@@ -349,7 +359,7 @@ export function useReplaySession(
       const response = await subscribeSessionProjections(
         id,
         CONSUMER_INSTANCE_ID,
-        projections.map((accumulator) => ({
+        activeProjections.map((accumulator) => ({
           spec: accumulator.spec,
           schemaVersions: [1],
           requestedMaxFps: REQUESTED_MAX_FPS,
@@ -366,7 +376,7 @@ export function useReplaySession(
       subscriptionId = response.subscriptionId
       sessionGeneration = response.sessionGeneration
       pendingAcks.clear()
-      for (const accumulator of projections) {
+      for (const accumulator of activeProjections) {
         accumulator.beginSubscription(
           response.subscriptionId,
           response.sessionGeneration,
@@ -376,6 +386,39 @@ export function useReplaySession(
       latestWatermark = null
       publishDeliveryState("delivery_pending")
       installDemandLease(response.leaseMs)
+    }
+
+    const detachProjectionStream = () => {
+      const detached = subscriptionId
+      subscriptionId = null
+      sessionGeneration = null
+      projectionResyncing = false
+      resyncFrameApplied = false
+      latestWatermark = null
+      pendingAcks.clear()
+      if (ackTimer) {
+        clearTimeout(ackTimer)
+        ackTimer = null
+      }
+      if (demandTimer) {
+        clearInterval(demandTimer)
+        demandTimer = null
+      }
+      return detached
+    }
+
+    const retireProjectionStream = async (
+      id: string,
+      detached: string | null
+    ) => {
+      if (!detached) return
+      try {
+        await unsubscribeSessionProjections(id, detached)
+      } catch (err) {
+        // Lease expiry remains the server-side disconnect fallback. Failure to
+        // retire an old receiver must not roll back an installed graph.
+        console.warn("[replay] failed to retire projection subscription", err)
+      }
     }
 
     const recoverProjectionSubscription = (
@@ -393,17 +436,19 @@ export function useReplaySession(
 
       const id = sessionIdRef.current
       publishDeliveryState("resyncing")
-      const recovery = subscribeProjectionStream(id, true).catch((err) => {
-        if (cancelled || subscriptionId !== failedSubscriptionId) return
-        console.warn(
-          `[replay] projection subscription recovery failed (${reason})`,
-          err
-        )
-        // Keep the stream in an explicit projection recovery state. A demand
-        // renewal or host-resume verification will try again; host status owns
-        // the separate "reconnecting" state.
-        publishDeliveryState("resyncing")
-      })
+      const recovery = subscribeProjectionStream(id, true)
+        .then(() => retireProjectionStream(id, failedSubscriptionId))
+        .catch((err) => {
+          if (cancelled || subscriptionId !== failedSubscriptionId) return
+          console.warn(
+            `[replay] projection subscription recovery failed (${reason})`,
+            err
+          )
+          // Keep the stream in an explicit projection recovery state. A demand
+          // renewal or host-resume verification will try again; host status owns
+          // the separate "reconnecting" state.
+          publishDeliveryState("resyncing")
+        })
       projectionRecovery = recovery
       void recovery.finally(() => {
         if (projectionRecovery === recovery) projectionRecovery = null
@@ -426,8 +471,63 @@ export function useReplaySession(
           "resume_after_disconnect"
         )
       } catch {
+        const detached = detachProjectionStream()
         await subscribeProjectionStream(id, true)
+        await retireProjectionStream(id, detached)
       }
+    }
+
+    const applyServerProjectionSet = async (
+      id: string,
+      specs: string[],
+      retainAppliedState: boolean
+    ) => {
+      const detached = detachProjectionStream()
+      replaceAccumulators(specs)
+      await retireProjectionStream(id, detached)
+      if (cancelled || id !== sessionIdRef.current) return
+      await subscribeProjectionStream(id, retainAppliedState)
+    }
+
+    const runProjectionSelections = async () => {
+      if (selectionRunning) return
+      selectionRunning = true
+      try {
+        while (!cancelled && selectionRequested) {
+          const spec = selectionRequested
+          selectionRequested = null
+          const id = sessionIdRef.current
+          if (
+            !id ||
+            (activeProjections.length === 1 &&
+              activeProjections[0]?.spec === spec)
+          ) {
+            continue
+          }
+          const result = await setSessionProjections(id, [spec])
+          if (cancelled || id !== sessionIdRef.current) return
+          const specs = projectionSpecs(result.projections)
+          setOpen((current) =>
+            current && current.sessionId === id
+              ? { ...current, projections: result.projections }
+              : current
+          )
+          await applyServerProjectionSet(id, specs, false)
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(errorMessage(err))
+          setPhase("error")
+        }
+      } finally {
+        selectionRunning = false
+        if (!cancelled && selectionRequested) void runProjectionSelections()
+      }
+    }
+
+    setProjectionRef.current = (spec: string) => {
+      selectionRequested = spec
+      void runProjectionSelections()
     }
 
     const requestHostResync = () => {
@@ -442,7 +542,7 @@ export function useReplaySession(
       resumeRequested = false
       buffering = true
       publishDeliveryState("resyncing")
-      void attachSession(id, rawId, REPLAY_SPECS)
+      void attachSession(id, rawId)
         .then(async (outcome) => {
           if (!outcome.attached) {
             throw new Error("The replay session is no longer active")
@@ -451,7 +551,12 @@ export function useReplaySession(
           seedClock(outcome.session.clock)
           if (outcome.session.cursor) seedCursor(outcome.session.cursor)
           await hydrateStatus(id, outcome.session)
-          await resumeProjectionStream(id)
+          const serverSpecs = projectionSpecs(outcome.session.projections)
+          if (sameSpecs(serverSpecs, activeProjections)) {
+            await resumeProjectionStream(id)
+          } else {
+            await applyServerProjectionSet(id, serverSpecs, false)
+          }
           if (!cancelled) drainBuffer()
         })
         .catch((err) => {
@@ -493,6 +598,7 @@ export function useReplaySession(
         }
         sessionIdRef.current = result.sessionId
         resumeCandidate = result.sessionId
+        replaceAccumulators(projectionSpecs(result.projections))
         storeSession(result.sessionId, rawId)
         setOpen(result)
         if (attached) {
@@ -506,7 +612,7 @@ export function useReplaySession(
         await hydrateStatus(result.sessionId, attached)
         if (cancelled || result.sessionId !== sessionIdRef.current) return
         drainBuffer()
-        await waitForProjectionSnapshots(projections)
+        await waitForProjectionSnapshots(activeProjections)
         established = true
         if (closed || cancelled) return
         setPhase("live")
@@ -529,6 +635,7 @@ export function useReplaySession(
       if (demandTimer) clearInterval(demandTimer)
       if (ackTimer) clearTimeout(ackTimer)
       flushAcks()
+      setProjectionRef.current = () => undefined
       const id = sessionIdRef.current
       sessionIdRef.current = null
       const closeId = id ?? resumeCandidate
@@ -537,7 +644,7 @@ export function useReplaySession(
         void closeSession(closeId).catch(() => undefined)
       }
     }
-  }, [rawId, routedSessionId, projections, projectionsBySpec])
+  }, [rawId, routedSessionId])
 
   const controls = useMemo<ReplayControls>(
     () => ({
@@ -557,6 +664,7 @@ export function useReplaySession(
         const id = sessionIdRef.current
         if (id) void seekSession(id, sessionNs).catch(logControlError("seek"))
       },
+      setProjection: (spec) => setProjectionRef.current(spec),
     }),
     []
   )
@@ -571,6 +679,7 @@ export function useReplaySession(
     cursor,
     deliveryState,
     projections,
+    selectedProjection: projections[0]?.spec ?? DEFAULT_REPLAY_SPEC,
     controls,
   }
 }
@@ -654,19 +763,12 @@ function loadStoredSession(rawId: string): string | null {
       !("sessionId" in parsed) ||
       typeof parsed.sessionId !== "string" ||
       !("rawId" in parsed) ||
-      typeof parsed.rawId !== "string" ||
-      !("projections" in parsed) ||
-      !Array.isArray(parsed.projections) ||
-      !parsed.projections.every((spec) => typeof spec === "string")
+      typeof parsed.rawId !== "string"
     ) {
       window.sessionStorage.removeItem(RESUME_STORAGE_KEY)
       return null
     }
-    if (
-      parsed.rawId !== rawId ||
-      parsed.projections.length !== REPLAY_SPECS.length ||
-      parsed.projections.some((spec, index) => spec !== REPLAY_SPECS[index])
-    ) {
+    if (parsed.rawId !== rawId) {
       window.sessionStorage.removeItem(RESUME_STORAGE_KEY)
       return null
     }
@@ -680,7 +782,6 @@ function storeSession(sessionId: string, rawId: string): void {
   const stored: StoredReplaySession = {
     sessionId,
     rawId,
-    projections: REPLAY_SPECS.slice(),
   }
   try {
     window.sessionStorage.setItem(RESUME_STORAGE_KEY, JSON.stringify(stored))
@@ -716,4 +817,40 @@ function isOlderCursor(next: Cursor, current: Cursor | null): boolean {
   if (next.epoch !== current.epoch) return next.epoch < current.epoch
   if (next.feedSeq !== current.feedSeq) return next.feedSeq < current.feedSeq
   return next.batchIdx < current.batchIdx
+}
+
+function createAccumulators(specs: string[]): BarsAccumulator[] {
+  if (specs.length === 0) {
+    throw new Error("Replay session has no public bars projection")
+  }
+  const client = getBarsProjectionClient()
+  return specs.map((spec) => {
+    if (!spec.startsWith("bars:")) {
+      throw new Error(`Unsupported replay projection ${spec}`)
+    }
+    return client.createAccumulator(spec)
+  })
+}
+
+function indexAccumulators(
+  accumulators: BarsAccumulator[]
+): Map<string, BarsAccumulator> {
+  return new Map(
+    accumulators.map((accumulator) => [accumulator.spec, accumulator])
+  )
+}
+
+function projectionSpecs(projections: Array<{ spec: string }>): string[] {
+  const specs = projections.map((projection) => projection.spec)
+  if (new Set(specs).size !== specs.length) {
+    throw new Error("Replay session returned duplicate projections")
+  }
+  return specs
+}
+
+function sameSpecs(specs: string[], accumulators: BarsAccumulator[]): boolean {
+  return (
+    specs.length === accumulators.length &&
+    specs.every((spec, index) => spec === accumulators[index]?.spec)
+  )
 }

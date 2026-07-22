@@ -1,5 +1,10 @@
 # Ledger Feed System Implementation Spec
 
+> Superseded behavior (2026-07-21): explicit seek now uses hold/reset/release
+> and always starts a zero-origin epoch. See
+> `ledger_zero_origin_rebuild_implementation_spec.md`; this document remains
+> the historical feed baseline.
+
 ## Purpose
 
 Run the ES replay feed as a live emitter: a session clock in a cache cell,

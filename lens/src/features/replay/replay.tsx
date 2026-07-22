@@ -36,14 +36,6 @@ interface ReplayProps {
 // EST vs EDT, and a raw with no market day has no session to be wrong about.
 const MODULE_LOAD_MS = Date.now()
 
-// The interval drawn on the chart. Replay requests only this projection until
-// an interval picker returns; keeping an unused 1s projection warm made reload
-// hydration transfer an entire day of headless bars through the mobile bridge.
-const ACTIVE_BAR_SPEC = "bars:1m"
-
-// The interval suffix shown beside the chart clock (e.g. "1m").
-const INTERVAL_LABEL = ACTIVE_BAR_SPEC.slice(ACTIVE_BAR_SPEC.indexOf(":") + 1)
-
 export function Replay({
   resumeSessionId,
   rawId,
@@ -62,6 +54,7 @@ export function Replay({
     clockReceivedAt,
     cursor,
     deliveryState,
+    selectedProjection,
   } = session
   const { projections, controls } = session
   const openSessionId = open?.sessionId ?? null
@@ -155,15 +148,17 @@ export function Replay({
     return etOffsetSeconds(atMs)
   }, [open])
 
-  // Drawable = a registry hit; the bars kind additionally collapses to the
-  // single drawn interval. The layers drive the chart's series outside React.
+  // Drawable = a registry hit. The current session exposes one public bars
+  // projection, replaced in place when the selected interval changes.
   const layers = useMemo(
     () =>
       projections
         .filter((accumulator) => {
           const kind = kindOf(accumulator.spec)
           if (!(kind in CHART_LAYERS)) return false
-          return kind === "bars" ? accumulator.spec === ACTIVE_BAR_SPEC : true
+          return kind === "bars"
+            ? accumulator.spec === selectedProjection
+            : true
         })
         .map((accumulator) =>
           CHART_LAYERS[kindOf(accumulator.spec)]({
@@ -175,7 +170,7 @@ export function Replay({
             viewport,
           })
         ),
-    [colors, offsetSeconds, projections, ui, viewport]
+    [colors, offsetSeconds, projections, selectedProjection, ui, viewport]
   )
 
   // Open failure (object gone, feed build error): toast and fall back to days.
@@ -201,7 +196,7 @@ export function Replay({
           />
           <ChartReadout
             ui={ui}
-            title={`${symbol} · ${INTERVAL_LABEL}`}
+            title={`${symbol} · ${projectionLabel(selectedProjection)}`}
             clock={clock}
             clockReceivedAt={clockReceivedAt}
           />
@@ -226,16 +221,23 @@ export function Replay({
         marketDay={open?.marketDay ?? marketDay}
         symbol={symbol}
         deliveryState={deliveryState}
+        selectedProjection={selectedProjection}
         disabled={phase !== "live"}
         onExit={exitReplay}
         onPlay={controls.play}
         onPause={controls.pause}
         onSpeed={controls.setSpeed}
+        onProjection={controls.setProjection}
         onSeek={controls.seek}
         onScrub={handleScrub}
       />
     </div>
   )
+}
+
+function projectionLabel(spec: string): string {
+  const separator = spec.indexOf(":")
+  return separator === -1 ? spec : spec.slice(separator + 1)
 }
 
 // The terminal "session ended" banner. Floats over the chart (positioned by the

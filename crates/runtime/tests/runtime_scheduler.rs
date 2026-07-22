@@ -813,6 +813,53 @@ async fn duplicate_task_registration_is_rejected() {
     assert_eq!(err, RuntimeError::DuplicateComponent(task_id));
 }
 
+#[tokio::test]
+async fn removed_task_leaves_no_queue_or_dependency_edges_and_can_be_reinstalled() {
+    let cache = Cache::new();
+    let source = source_cell(&cache);
+    let id = task_id("task.copy");
+    let first_output = task_cell(&cache, "task.copy.first", &id);
+    let second_output = task_cell(&cache, "task.copy.second", &id);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut runtime = Runtime::new(cache.clone());
+    runtime
+        .register_task(CopyTask::new(
+            id.clone(),
+            source.key().clone(),
+            source.clone(),
+            first_output,
+            "old",
+            log.clone(),
+        ))
+        .await
+        .unwrap();
+    runtime.queue_task(&id).unwrap();
+
+    assert!(runtime.remove_task(&id).unwrap());
+    assert!(runtime.is_idle());
+    runtime.submit_external_writes(external_set(feed_owner(), &source, 1));
+    runtime.run_until_idle(10).await.unwrap();
+    assert!(log_snapshot(&log).is_empty());
+
+    runtime
+        .register_task(CopyTask::new(
+            id.clone(),
+            source.key().clone(),
+            source.clone(),
+            second_output,
+            "new",
+            log.clone(),
+        ))
+        .await
+        .unwrap();
+    runtime.submit_external_writes(external_set(feed_owner(), &source, 2));
+    runtime.run_until_idle(10).await.unwrap();
+    assert_eq!(log_snapshot(&log), vec!["new"]);
+    assert!(runtime.remove_task(&id).unwrap());
+    assert!(!runtime.contains_task(&id));
+    assert!(!runtime.remove_task(&id).unwrap());
+}
+
 #[test]
 fn queue_task_rejects_unknown_component_id() {
     let cache = Cache::new();

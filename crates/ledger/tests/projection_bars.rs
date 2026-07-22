@@ -196,7 +196,7 @@ async fn one_minute_graph_matches_direct_raw_event_reference_before_and_after_re
 
     let backward_cursor = running
         .seek_and_wait(65_000_000_000, |cursor| {
-            cursor.epoch == 1 && cursor.batch_idx == 4
+            cursor.epoch == 2 && cursor.batch_idx == 4
         })
         .await;
     running.wait_caught_up(&backward_cursor).await;
@@ -328,7 +328,9 @@ async fn chunked_feed_and_one_batch_steps_converge_to_same_bars_and_cursor() {
     stepped.wait_caught_up(&stepped_cursor).await;
     let stepped_snapshot = stepped.snapshot();
 
-    assert_eq!(stepped_cursor, chunked_cursor);
+    assert_eq!(stepped_cursor.batch_idx, chunked_cursor.batch_idx);
+    assert_eq!(stepped_cursor.feed_seq, chunked_cursor.feed_seq);
+    assert_eq!(stepped_cursor.ended, chunked_cursor.ended);
     assert!(!stepped_cursor.catching_up);
     assert_eq!(stepped_snapshot, chunked_snapshot);
 
@@ -351,7 +353,7 @@ async fn backward_seek_rebuilds_and_following_forward_seek_reproduces_bars() {
     let pre_regression = running.snapshot();
 
     let cursor = running
-        .seek_and_wait(175, |cursor| cursor.epoch == 1 && cursor.batch_idx == 2)
+        .seek_and_wait(175, |cursor| cursor.epoch == 2 && cursor.batch_idx == 2)
         .await;
     let status = running.wait_caught_up(&cursor).await;
     let (truncated_bars, truncated_live) = running.snapshot();
@@ -380,7 +382,7 @@ async fn rebuild_over_multiple_chunks_matches_fresh_fold_to_same_target() {
     rebuilt.wait_caught_up(&end_cursor).await;
     let cursor = rebuilt
         .seek_and_wait(target as u64, |cursor| {
-            cursor.epoch == 1 && cursor.batch_idx == target
+            cursor.epoch == 2 && cursor.batch_idx == target
         })
         .await;
     let status = rebuilt.wait_caught_up(&cursor).await;
@@ -412,7 +414,7 @@ async fn epoch_change_mid_rebuild_restarts_and_keeps_newest_epoch() {
     running.wait_caught_up(&end_cursor).await;
     running
         .seek_and_wait(target as u64, |cursor| {
-            cursor.epoch == 1 && cursor.batch_idx == target
+            cursor.epoch == 2 && cursor.batch_idx == target
         })
         .await;
     wait_for_bars_status(
@@ -420,14 +422,14 @@ async fn epoch_change_mid_rebuild_restarts_and_keeps_newest_epoch() {
         &mut running.bars_watch,
         &running.bars,
         |status| {
-            status.epoch == 1 && status.processed_batches > 0 && status.processed_batches < target
+            status.epoch == 2 && status.processed_batches > 0 && status.processed_batches < target
         },
     )
     .await;
 
     let cursor = running
         .seek_and_wait(final_target as u64, |cursor| {
-            cursor.epoch == 2 && cursor.batch_idx == final_target
+            cursor.epoch == 3 && cursor.batch_idx == final_target
         })
         .await;
     let status = running.wait_caught_up(&cursor).await;
@@ -441,7 +443,7 @@ async fn epoch_change_mid_rebuild_restarts_and_keeps_newest_epoch() {
         .await;
     fresh.wait_caught_up(&fresh_cursor).await;
 
-    assert_eq!(status.epoch, 2);
+    assert_eq!(status.epoch, 3);
     assert_eq!(status.processed_batches, final_target);
     assert_eq!(newest_snapshot, fresh.snapshot());
 

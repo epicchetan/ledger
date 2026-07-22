@@ -1,9 +1,10 @@
-use std::{ops::Range, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use cache::ValueKey;
 use runtime::{ComponentDescriptor, ComponentError, ProcessContext, ProcessPrepareContext};
 use store::{RemoteStore, Store, StoreObjectId};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::clock::{ClockMode, ClockState};
 use crate::feed::es_replay::{
@@ -14,6 +15,63 @@ use crate::market::{EsMboBatchSpan, EsMboEventStore, UnixNanos};
 use crate::LedgerError;
 
 const CATCHUP_CHUNK_BATCHES: usize = 1024;
+const CONTROL_BUFFER: usize = 8;
+
+#[derive(Clone)]
+pub struct EsReplayFeedHandle {
+    commands: mpsc::Sender<EsReplayFeedCommand>,
+}
+
+impl EsReplayFeedHandle {
+    pub async fn hold(&self) -> Result<(), LedgerError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(EsReplayFeedCommand::Hold { reply })
+            .await
+            .map_err(|_| LedgerError::FeedControl("feed process stopped".to_string()))?;
+        response
+            .await
+            .map_err(|_| LedgerError::FeedControl("feed process stopped".to_string()))?
+            .map_err(LedgerError::FeedControl)
+    }
+
+    pub async fn reset(&self) -> Result<u64, LedgerError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(EsReplayFeedCommand::Reset { reply })
+            .await
+            .map_err(|_| LedgerError::FeedControl("feed process stopped".to_string()))?;
+        response
+            .await
+            .map_err(|_| LedgerError::FeedControl("feed process stopped".to_string()))?
+            .map_err(LedgerError::FeedControl)
+    }
+
+    pub async fn release(&self, epoch: u64) -> Result<(), LedgerError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(EsReplayFeedCommand::Release { epoch, reply })
+            .await
+            .map_err(|_| LedgerError::FeedControl("feed process stopped".to_string()))?;
+        response
+            .await
+            .map_err(|_| LedgerError::FeedControl("feed process stopped".to_string()))?
+            .map_err(LedgerError::FeedControl)
+    }
+}
+
+enum EsReplayFeedCommand {
+    Hold {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    Reset {
+        reply: oneshot::Sender<Result<u64, String>>,
+    },
+    Release {
+        epoch: u64,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+}
 
 pub struct EsReplayFeed<S>
 where
@@ -26,6 +84,8 @@ where
     cells: EsReplayCells,
     artifact: Option<EsReplayArtifact>,
     event_store: Option<EsMboEventStore>,
+    commands: mpsc::Receiver<EsReplayFeedCommand>,
+    command_guard: mpsc::Sender<EsReplayFeedCommand>,
 }
 
 impl<S> EsReplayFeed<S>
@@ -38,15 +98,30 @@ where
         clock_key: ValueKey<ClockState>,
         cells: EsReplayCells,
     ) -> Self {
-        Self {
-            descriptor: ComponentDescriptor::process(es_replay_component_id()),
-            raw_object_id,
-            store,
-            clock_key,
-            cells,
-            artifact: None,
-            event_store: None,
-        }
+        Self::with_control(raw_object_id, store, clock_key, cells).0
+    }
+
+    pub fn with_control(
+        raw_object_id: StoreObjectId,
+        store: Arc<Store<S>>,
+        clock_key: ValueKey<ClockState>,
+        cells: EsReplayCells,
+    ) -> (Self, EsReplayFeedHandle) {
+        let (commands, command_rx) = mpsc::channel(CONTROL_BUFFER);
+        (
+            Self {
+                descriptor: ComponentDescriptor::process(es_replay_component_id()),
+                raw_object_id,
+                store,
+                clock_key,
+                cells,
+                artifact: None,
+                event_store: None,
+                commands: command_rx,
+                command_guard: commands.clone(),
+            },
+            EsReplayFeedHandle { commands },
+        )
     }
 }
 
@@ -81,6 +156,8 @@ where
             cells,
             artifact,
             event_store,
+            mut commands,
+            command_guard: _command_guard,
             ..
         } = *self;
         let artifact = artifact.ok_or_else(|| {
@@ -94,7 +171,9 @@ where
         let artifact_object_id = Some(artifact.descriptor.id.to_string());
         let mut shutdown = ctx.shutdown().clone();
         let mut clock_watch = ctx.cache().watch_key(clock_key.key())?;
+        let mut cursor_watch = ctx.cache().watch_key(cells.cursor.key())?;
         let mut state = FeedState::new(&event_store);
+        let mut held = false;
 
         let initial_clock = clock_or_initial(&ctx, &clock_key)?;
         publish_cursor_status(
@@ -113,27 +192,55 @@ where
                 return Ok(());
             }
 
-            let clock = clock_or_initial(&ctx, &clock_key)?;
-            let now = clock.now_ns();
-
-            if state.regressed(now) {
-                let removed = state.regress(now, &event_store);
-                let cursor = state.cursor(&event_store);
-                let status = status(
+            if let Ok(command) = commands.try_recv() {
+                if let Some(revision) = handle_control(
+                    command,
+                    &mut held,
+                    &mut state,
+                    &ctx,
+                    &cells,
                     &raw_object_id,
                     artifact_object_id.as_deref(),
-                    cursor.clone(),
-                    clock.snapshot(),
-                );
-                let mut batch = ctx.batch();
-                batch
-                    .remove_array_range(&cells.batches, removed)
-                    .set_value(&cells.cursor, cursor)
-                    .set_value(&cells.status, status);
-                ctx.submit(batch).await?;
-                published_clock_revision = clock.revision;
+                    &event_store,
+                    &clock_key,
+                    &mut cursor_watch,
+                )
+                .await?
+                {
+                    published_clock_revision = revision;
+                }
                 continue;
             }
+
+            if held {
+                tokio::select! {
+                    command = commands.recv() => {
+                        if let Some(command) = command {
+                            if let Some(revision) = handle_control(
+                                command,
+                                &mut held,
+                                &mut state,
+                                &ctx,
+                                &cells,
+                                &raw_object_id,
+                                artifact_object_id.as_deref(),
+                                &event_store,
+                                &clock_key,
+                                &mut cursor_watch,
+                            ).await? {
+                                published_clock_revision = revision;
+                            }
+                        }
+                    }
+                    changed = shutdown.changed() => {
+                        changed?;
+                    }
+                }
+                continue;
+            }
+
+            let clock = clock_or_initial(&ctx, &clock_key)?;
+            let now = clock.now_ns();
 
             let chunk = state.build_due_chunk(now, &event_store);
             if !chunk.is_empty() {
@@ -186,6 +293,24 @@ where
                     changed = shutdown.changed() => {
                         changed?;
                     }
+                    command = commands.recv() => {
+                        if let Some(command) = command {
+                            if let Some(revision) = handle_control(
+                                command,
+                                &mut held,
+                                &mut state,
+                                &ctx,
+                                &cells,
+                                &raw_object_id,
+                                artifact_object_id.as_deref(),
+                                &event_store,
+                                &clock_key,
+                                &mut cursor_watch,
+                            ).await? {
+                                published_clock_revision = revision;
+                            }
+                        }
+                    }
                 }
                 continue;
             }
@@ -204,7 +329,100 @@ where
                 changed = shutdown.changed() => {
                     changed?;
                 }
+                command = commands.recv() => {
+                    if let Some(command) = command {
+                        if let Some(revision) = handle_control(
+                            command,
+                            &mut held,
+                            &mut state,
+                            &ctx,
+                            &cells,
+                            &raw_object_id,
+                            artifact_object_id.as_deref(),
+                            &event_store,
+                            &clock_key,
+                            &mut cursor_watch,
+                        ).await? {
+                            published_clock_revision = revision;
+                        }
+                    }
+                }
             }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_control(
+    command: EsReplayFeedCommand,
+    held: &mut bool,
+    state: &mut FeedState,
+    ctx: &ProcessContext,
+    cells: &EsReplayCells,
+    raw_object_id: &StoreObjectId,
+    artifact_object_id: Option<&str>,
+    event_store: &EsMboEventStore,
+    clock_key: &ValueKey<ClockState>,
+    cursor_watch: &mut cache::CellWatch,
+) -> Result<Option<u64>, ComponentError> {
+    match command {
+        EsReplayFeedCommand::Hold { reply } => {
+            *held = true;
+            let _ = reply.send(Ok(()));
+            Ok(None)
+        }
+        EsReplayFeedCommand::Reset { reply } => {
+            if !*held {
+                let _ = reply.send(Err("reset requires a held feed".to_string()));
+                return Ok(None);
+            }
+            let clock = clock_or_initial(ctx, clock_key)?;
+            state.reset(clock.now_ns(), event_store);
+            let epoch = state.epoch;
+            let cursor = state.cursor(event_store);
+            let feed_status = status(
+                raw_object_id,
+                artifact_object_id,
+                cursor.clone(),
+                clock.snapshot(),
+            );
+            let mut batch = ctx.batch();
+            batch
+                .replace_array(&cells.batches, Vec::new())
+                .set_value(&cells.cursor, cursor)
+                .set_value(&cells.status, feed_status);
+            if let Err(error) = ctx.submit(batch).await {
+                let _ = reply.send(Err(error.to_string()));
+                return Err(error);
+            }
+
+            loop {
+                if ctx
+                    .read_value(&cells.cursor)?
+                    .is_some_and(|cursor| cursor.epoch >= epoch && cursor.batch_idx == 0)
+                {
+                    break;
+                }
+                cursor_watch.changed().await?;
+            }
+            let _ = reply.send(Ok(epoch));
+            Ok(Some(clock.revision))
+        }
+        EsReplayFeedCommand::Release { epoch, reply } => {
+            if !*held {
+                let _ = reply.send(Err("release requires a held feed".to_string()));
+                return Ok(None);
+            }
+            if state.epoch != epoch {
+                let _ = reply.send(Err(format!(
+                    "release epoch {epoch} does not match active epoch {}",
+                    state.epoch
+                )));
+                return Ok(None);
+            }
+            *held = false;
+            let _ = reply.send(Ok(()));
+            Ok(None)
         }
     }
 }
@@ -253,26 +471,15 @@ impl FeedState {
         self.next_idx == event_store.batches.len()
     }
 
-    fn regressed(&self, now: UnixNanos) -> bool {
-        self.last_emitted_ts
-            .map(|last_emitted| now < last_emitted)
-            .unwrap_or(false)
-    }
-
-    fn regress(&mut self, now: UnixNanos, event_store: &EsMboEventStore) -> Range<usize> {
-        // All of this feed's emits are FIFO-ordered ahead of this write on the
-        // single external-write channel, so at apply time the cache batches
-        // array is exactly event_store.batches[0..self.next_idx]. The cut can
-        // therefore be computed from the immutable event store.
-        let cut =
-            event_store.batches[..self.next_idx].partition_point(|span| span.ts_event_ns <= now);
-        let removed = cut..self.next_idx;
-        self.next_idx = cut;
-        self.last_emitted_ts = (cut > 0).then(|| event_store.batches[cut - 1].ts_event_ns);
+    fn reset(&mut self, now: UnixNanos, event_store: &EsMboEventStore) {
+        self.next_idx = 0;
+        self.feed_seq = 0;
+        self.last_emitted_ts = None;
         self.epoch = self.epoch.saturating_add(1);
-        self.catching_up = false;
-
-        removed
+        self.catching_up = event_store
+            .batches
+            .first()
+            .is_some_and(|batch| batch.ts_event_ns <= now);
     }
 
     fn build_due_chunk(
@@ -443,19 +650,19 @@ mod tests {
     }
 
     #[test]
-    fn regress_computes_truncation_from_event_store_prefix() {
+    fn reset_clears_to_zero_and_marks_due_prefix() {
         let emitted = CATCHUP_CHUNK_BATCHES + 3;
         let event_store = event_store(emitted + 1);
         let mut state = FeedState::new(&event_store);
         state.advance_by(emitted, true, &event_store);
 
-        let removed = state.regress(10, &event_store);
+        state.reset(10, &event_store);
 
-        assert_eq!(removed, 10..emitted);
-        assert_eq!(state.next_idx, 10);
-        assert_eq!(state.last_emitted_ts, Some(10));
+        assert_eq!(state.next_idx, 0);
+        assert_eq!(state.feed_seq, 0);
+        assert_eq!(state.last_emitted_ts, None);
         assert_eq!(state.epoch, 1);
-        assert!(!state.catching_up);
+        assert!(state.catching_up);
     }
 
     fn event_store(count: usize) -> EsMboEventStore {

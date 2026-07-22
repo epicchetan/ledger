@@ -1,5 +1,6 @@
 use std::{
-    collections::HashMap,
+    any::Any,
+    collections::{HashMap, HashSet},
     panic::{catch_unwind, AssertUnwindSafe},
     time::Instant,
 };
@@ -116,6 +117,26 @@ impl RuntimeWorker {
                     Ok(queued)
                 }
                 .await;
+                let _ = reply.send(result);
+            }
+            RuntimeCommand::RemoveTask { id, reply } => {
+                let result = if self.processes.contains_key(&id) {
+                    Err(RuntimeError::WrongComponentKind {
+                        id,
+                        expected: ComponentKind::Task,
+                        found: ComponentKind::Process,
+                    })
+                } else {
+                    self.runtime.remove_task(&id)
+                };
+                let _ = reply.send(result);
+            }
+            RuntimeCommand::ReconcileTasks {
+                remove,
+                mutation,
+                reply,
+            } => {
+                let result = self.reconcile_tasks(remove, mutation).await;
                 let _ = reply.send(result);
             }
             RuntimeCommand::StopProcess { id, reply } => {
@@ -238,6 +259,55 @@ impl RuntimeWorker {
             | ComponentStatus::Queued
             | ComponentStatus::Failed(_) => Ok(false),
         }
+    }
+
+    async fn reconcile_tasks(
+        &mut self,
+        remove: Vec<ComponentId>,
+        mutation: RuntimeGraphMutation,
+    ) -> Result<Box<dyn Any + Send>, RuntimeError> {
+        for id in &remove {
+            if self.processes.contains_key(id) {
+                return Err(RuntimeError::WrongComponentKind {
+                    id: id.clone(),
+                    expected: ComponentKind::Task,
+                    found: ComponentKind::Process,
+                });
+            }
+            if !self.runtime.contains_task(id) {
+                return Err(RuntimeError::MissingComponent(id.clone()));
+            }
+        }
+        let schema = crate::CacheSchema::new(self.runtime.cache_owner());
+        let (value, tasks) = mutation(&schema)?;
+        let removing = remove.iter().cloned().collect::<HashSet<_>>();
+        let mut installing = HashSet::new();
+        for task in &tasks {
+            let descriptor = task.descriptor();
+            let id = descriptor.component.id.clone();
+            if descriptor.component.kind != ComponentKind::Task {
+                return Err(RuntimeError::WrongComponentKind {
+                    id,
+                    expected: ComponentKind::Task,
+                    found: descriptor.component.kind,
+                });
+            }
+            if self.processes.contains_key(&id)
+                || (self.runtime.contains_task(&id) && !removing.contains(&id))
+                || !installing.insert(id.clone())
+            {
+                return Err(RuntimeError::DuplicateComponent(id));
+            }
+        }
+
+        schema.commit()?;
+        for id in &remove {
+            self.runtime.remove_task(id)?;
+        }
+        for task in tasks {
+            self.install_task(task).await?;
+        }
+        Ok(value)
     }
 
     fn component_status(&self, id: &ComponentId) -> Result<ComponentStatus, RuntimeError> {
@@ -503,6 +573,15 @@ pub(crate) enum RuntimeCommand {
         id: ComponentId,
         reply: oneshot::Sender<Result<bool, RuntimeError>>,
     },
+    RemoveTask {
+        id: ComponentId,
+        reply: oneshot::Sender<Result<bool, RuntimeError>>,
+    },
+    ReconcileTasks {
+        remove: Vec<ComponentId>,
+        mutation: RuntimeGraphMutation,
+        reply: oneshot::Sender<Result<Box<dyn Any + Send>, RuntimeError>>,
+    },
     StopProcess {
         id: ComponentId,
         reply: oneshot::Sender<Result<bool, RuntimeError>>,
@@ -524,6 +603,13 @@ pub(crate) enum RuntimeCommand {
 }
 
 type ComponentListing = Vec<(ComponentId, ComponentKind, ComponentStatus)>;
+type RuntimeGraphMutation = Box<
+    dyn for<'a> FnOnce(
+            &crate::CacheSchema<'a>,
+        )
+            -> Result<(Box<dyn Any + Send>, Vec<Box<dyn RuntimeTask>>), RuntimeError>
+        + Send,
+>;
 
 enum RuntimeEvent {
     ProcessPrepared {

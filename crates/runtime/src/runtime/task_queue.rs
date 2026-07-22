@@ -25,6 +25,12 @@ impl TaskQueue {
         self.states.insert(id, TaskQueueState::Ready);
     }
 
+    pub(crate) fn remove_task(&mut self, id: &ComponentId) -> bool {
+        let existed = self.states.remove(id).is_some();
+        self.order.retain(|queued| queued != id);
+        existed
+    }
+
     pub(crate) fn enqueue_once(&mut self, id: ComponentId, wake: TaskWake) -> bool {
         match self.states.get_mut(&id) {
             Some(TaskQueueState::Ready) => {

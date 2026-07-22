@@ -41,4 +41,7 @@ pub enum LedgerError {
 
     #[error("invalid clock speed `{0}`")]
     InvalidClockSpeed(f64),
+
+    #[error("ES replay feed control failed: {0}")]
+    FeedControl(String),
 }

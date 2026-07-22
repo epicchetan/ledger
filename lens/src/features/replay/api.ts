@@ -7,13 +7,13 @@ import {
 import { parseProjectionFrame } from "@/features/replay/projection-client"
 
 import type {
-  BarsFrame,
   BarsPosition,
   BarsProjectionFrame,
   Clock,
   Cursor,
   ProjectionSubscribeRequest,
   ProjectionSubscribeResult,
+  ProjectionUnsubscribeResult,
   ProjectionWatermark,
   SessionAttachResult,
   SessionClockEvent,
@@ -22,6 +22,7 @@ import type {
   SessionCursorEvent,
   SessionOkResult,
   SessionOpenResult,
+  SessionSetProjectionsResult,
   SessionStatus,
 } from "@/features/replay/types"
 
@@ -36,17 +37,26 @@ export async function openSession(
 }
 
 // Reattach by the exact server-issued id persisted across a webview reload.
-// A stale id/raw/spec identity returns { attached: false }; real RPC failures
-// reject and must not be treated as permission to replace the active session.
+// The server's mutable projection set is authoritative; a stale id/raw
+// identity returns { attached: false } while real RPC failures reject.
 export async function attachSession(
   sessionId: string,
-  rawId: string,
-  projections: string[]
+  rawId: string
 ): Promise<SessionAttachResult> {
   return rpc.subscribe<SessionAttachResult>(
     "remux/ledger/session/attach",
-    { sessionId, rawId, projections },
+    { sessionId, rawId },
     { resourceKey: `ledger:session:${sessionId}` }
+  )
+}
+
+export async function setSessionProjections(
+  sessionId: string,
+  projections: string[]
+): Promise<SessionSetProjectionsResult> {
+  return rpc.command<SessionSetProjectionsResult>(
+    "remux/ledger/session/projections/set",
+    { sessionId, projections }
   )
 }
 
@@ -69,7 +79,9 @@ export async function fetchSessionStatus(
 }
 
 export async function playSession(sessionId: string): Promise<SessionOkResult> {
-  return rpc.command<SessionOkResult>("remux/ledger/session/play", { sessionId })
+  return rpc.command<SessionOkResult>("remux/ledger/session/play", {
+    sessionId,
+  })
 }
 
 export async function pauseSession(
@@ -100,24 +112,6 @@ export async function seekSession(
   })
 }
 
-// Pull backfill: the accumulator calls this to re-sync a spec after a dropped
-// notification. The result is a BarsFrame identical in shape to the stream.
-export async function fetchSessionBars(
-  sessionId: string,
-  spec: string,
-  from?: number
-): Promise<BarsFrame> {
-  return rpc.query<BarsFrame>(
-    "remux/ledger/session/bars",
-    {
-      sessionId,
-      spec,
-      ...(from === undefined ? {} : { from }),
-    },
-    { resourceKey: `ledger:bars:${sessionId}:${spec}:${from ?? "latest"}` }
-  )
-}
-
 export async function subscribeSessionProjections(
   sessionId: string,
   consumerInstanceId: string,
@@ -127,6 +121,16 @@ export async function subscribeSessionProjections(
     "remux/ledger/session/projections/subscribe",
     { sessionId, consumerInstanceId, projections },
     { resourceKey: `ledger:projections:${sessionId}:${consumerInstanceId}` }
+  )
+}
+
+export async function unsubscribeSessionProjections(
+  sessionId: string,
+  subscriptionId: string
+): Promise<ProjectionUnsubscribeResult> {
+  return rpc.command<ProjectionUnsubscribeResult>(
+    "remux/ledger/session/projections/unsubscribe",
+    { sessionId, subscriptionId }
   )
 }
 
@@ -235,7 +239,8 @@ function parseProjectionWatermarkEvent(
     return null
   }
   if (!isRecord(message.params)) return null
-  const { subscriptionId, sessionGeneration, feed, projections } = message.params
+  const { subscriptionId, sessionGeneration, feed, projections } =
+    message.params
   if (
     typeof subscriptionId !== "string" ||
     !isNumber(sessionGeneration) ||
@@ -247,7 +252,8 @@ function parseProjectionWatermarkEvent(
   if (feed !== null && !parsedFeed) return null
   const parsedProjections: ProjectionWatermark["projections"] = []
   for (const projection of projections) {
-    if (!isRecord(projection) || typeof projection.spec !== "string") return null
+    if (!isRecord(projection) || typeof projection.spec !== "string")
+      return null
     const head = parsePosition(projection.head)
     if (!head) return null
     parsedProjections.push({ spec: projection.spec, head })

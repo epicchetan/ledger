@@ -32,6 +32,13 @@ pub struct CacheReadView<'a> {
     cache: &'a Cache,
 }
 
+/// Staged cache-registry changes committed atomically by the Runtime owner.
+/// Payload mutation remains outside this schema-only transaction.
+pub struct CacheSchemaBatch {
+    removals: Vec<(CellOwner, Key)>,
+    additions: HashMap<Key, Arc<Cell>>,
+}
+
 struct CacheInner {
     cells: RwLock<HashMap<Key, Arc<Cell>>>,
 }
@@ -60,6 +67,52 @@ impl Cache {
 
     pub fn read_view(&self) -> CacheReadView<'_> {
         CacheReadView { cache: self }
+    }
+
+    pub fn schema_batch(&self) -> CacheSchemaBatch {
+        CacheSchemaBatch {
+            removals: Vec::new(),
+            additions: HashMap::new(),
+        }
+    }
+
+    /// Validate and publish a complete schema replacement under one registry
+    /// write lock. No reader or watcher can observe a partially changed key
+    /// set, and validation failure leaves the registry untouched.
+    pub fn commit_schema_batch(
+        &self,
+        batch: CacheSchemaBatch,
+    ) -> Result<Vec<CellDescriptor>, CacheError> {
+        let mut cells = self
+            .inner
+            .cells
+            .write()
+            .map_err(|_| CacheError::RegistryLockPoisoned)?;
+        let mut removed_keys = Vec::with_capacity(batch.removals.len());
+        let mut removed_descriptors = Vec::with_capacity(batch.removals.len());
+        for (owner, key) in &batch.removals {
+            let cell = cells
+                .get(key)
+                .ok_or_else(|| CacheError::MissingCell(key.clone()))?;
+            self.ensure_owner(cell, owner, key)?;
+            if !removed_keys.contains(key) {
+                removed_keys.push(key.clone());
+                removed_descriptors.push(cell.descriptor.clone());
+            }
+        }
+        for key in batch.additions.keys() {
+            if cells.contains_key(key) && !removed_keys.contains(key) {
+                return Err(CacheError::DuplicateCell(key.clone()));
+            }
+        }
+
+        for key in removed_keys {
+            cells.remove(&key);
+        }
+        for (key, cell) in batch.additions {
+            cells.insert(key, cell);
+        }
+        Ok(removed_descriptors)
     }
 
     pub fn register_value<T>(
@@ -111,6 +164,43 @@ impl Cache {
     pub fn watch_key(&self, key: &Key) -> Result<CellWatch, CacheError> {
         let cell = self.lookup_cell(key)?;
         Ok(CellWatch::new(key.clone(), cell.generation.subscribe()))
+    }
+
+    /// Remove registered cells owned by `owner` as one registry mutation.
+    ///
+    /// Every key and owner is validated before anything is removed. Existing
+    /// watches close when the removed cells' senders are dropped, and the keys
+    /// may be registered again afterward.
+    pub fn unregister_owned(
+        &self,
+        owner: &CellOwner,
+        keys: &[Key],
+    ) -> Result<Vec<CellDescriptor>, CacheError> {
+        let mut cells = self
+            .inner
+            .cells
+            .write()
+            .map_err(|_| CacheError::RegistryLockPoisoned)?;
+        let mut unique = Vec::new();
+        for key in keys {
+            if unique.contains(key) {
+                continue;
+            }
+            let cell = cells
+                .get(key)
+                .ok_or_else(|| CacheError::MissingCell(key.clone()))?;
+            self.ensure_owner(cell, owner, key)?;
+            unique.push(key.clone());
+        }
+
+        let mut removed = Vec::with_capacity(unique.len());
+        for key in unique {
+            let cell = cells
+                .remove(&key)
+                .expect("unregister keys were validated before mutation");
+            removed.push(cell.descriptor.clone());
+        }
+        Ok(removed)
     }
 
     pub fn read_value<T>(&self, key: &ValueKey<T>) -> Result<Option<T>, CacheError>
@@ -460,6 +550,93 @@ impl Cache {
         // woken watcher can never read pre-write state.
         cell.generation.send_modify(|generation| *generation += 1);
         Ok(result)
+    }
+}
+
+impl CacheSchemaBatch {
+    pub fn register_value<T>(
+        &mut self,
+        descriptor: CellDescriptor,
+        initial: Option<T>,
+    ) -> Result<ValueKey<T>, CacheError>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        ensure_descriptor_kind(&descriptor, CellKind::Value)?;
+        let key = descriptor.key.clone();
+        let cell = Arc::new(Cell {
+            descriptor,
+            generation: watch::Sender::new(0),
+            storage: RwLock::new(Box::new(ValueStorage { value: initial })),
+        });
+        self.insert_addition(key.clone(), cell)?;
+        Ok(ValueKey::new(key))
+    }
+
+    pub fn register_array<T>(
+        &mut self,
+        descriptor: CellDescriptor,
+        initial: Vec<T>,
+    ) -> Result<ArrayKey<T>, CacheError>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        ensure_descriptor_kind(&descriptor, CellKind::Array)?;
+        let key = descriptor.key.clone();
+        let cell = Arc::new(Cell {
+            descriptor,
+            generation: watch::Sender::new(0),
+            storage: RwLock::new(Box::new(ArrayStorage { items: initial })),
+        });
+        self.insert_addition(key.clone(), cell)?;
+        Ok(ArrayKey::new(key))
+    }
+
+    pub fn unregister_owned(
+        &mut self,
+        cache: &Cache,
+        owner: &CellOwner,
+        keys: &[Key],
+    ) -> Result<Vec<CellDescriptor>, CacheError> {
+        let mut descriptors = Vec::new();
+        for key in keys {
+            let descriptor = cache.describe(key)?;
+            if &descriptor.owner != owner {
+                return Err(CacheError::OwnerMismatch {
+                    key: key.clone(),
+                    writer: owner.clone(),
+                    owner: descriptor.owner,
+                });
+            }
+            if !self.removals.iter().any(|(_, existing)| existing == key) {
+                self.removals.push((owner.clone(), key.clone()));
+                descriptors.push(descriptor);
+            }
+        }
+        Ok(descriptors)
+    }
+
+    fn insert_addition(&mut self, key: Key, cell: Arc<Cell>) -> Result<(), CacheError> {
+        if self.additions.contains_key(&key) {
+            return Err(CacheError::DuplicateCell(key));
+        }
+        self.additions.insert(key, cell);
+        Ok(())
+    }
+}
+
+fn ensure_descriptor_kind(
+    descriptor: &CellDescriptor,
+    expected: CellKind,
+) -> Result<(), CacheError> {
+    if descriptor.kind == expected {
+        Ok(())
+    } else {
+        Err(CacheError::WrongCellKind {
+            key: descriptor.key.clone(),
+            expected,
+            found: descriptor.kind,
+        })
     }
 }
 

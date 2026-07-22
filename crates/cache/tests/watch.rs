@@ -264,3 +264,21 @@ async fn changed_after_cache_dropped_errors() {
         }
     );
 }
+
+#[tokio::test]
+async fn unregistering_cell_closes_existing_watch() {
+    let (cache, owner, status_key) = status_cache();
+    let mut watch = cache.watch_key(status_key.key()).unwrap();
+
+    cache
+        .unregister_owned(&owner, &[status_key.key().clone()])
+        .unwrap();
+    let error = timeout(WAKE, watch.changed()).await.unwrap().unwrap_err();
+
+    assert_eq!(
+        error,
+        CacheError::WatchClosed {
+            key: status_key.key().clone(),
+        }
+    );
+}

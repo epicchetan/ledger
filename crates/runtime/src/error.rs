@@ -68,4 +68,7 @@ pub enum RuntimeError {
 
     #[error("run limit exceeded after {max_steps} steps")]
     RunLimitExceeded { max_steps: usize },
+
+    #[error("runtime graph reconciliation failed: {0}")]
+    GraphReconciliation(String),
 }

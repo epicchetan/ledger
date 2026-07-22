@@ -5,7 +5,8 @@ use crate::session::{
     SessionRegistry, SESSION_ATTACH_METHOD, SESSION_BARS_METHOD, SESSION_CLOSE_METHOD,
     SESSION_OPEN_METHOD, SESSION_PAUSE_METHOD, SESSION_PLAY_METHOD, SESSION_PROJECTIONS_ACK_METHOD,
     SESSION_PROJECTIONS_DEMAND_METHOD, SESSION_PROJECTIONS_RESYNC_METHOD,
-    SESSION_PROJECTIONS_SUBSCRIBE_METHOD, SESSION_SEEK_METHOD, SESSION_SPEED_METHOD,
+    SESSION_PROJECTIONS_SET_METHOD, SESSION_PROJECTIONS_SUBSCRIBE_METHOD,
+    SESSION_PROJECTIONS_UNSUBSCRIBE_METHOD, SESSION_SEEK_METHOD, SESSION_SPEED_METHOD,
     SESSION_STATUS_METHOD,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -84,8 +85,12 @@ impl<S: RemoteStore + 'static> LedgerRemux<S> {
             SESSION_SPEED_METHOD => self.sessions.speed(request.params).await,
             SESSION_SEEK_METHOD => self.sessions.seek(request.params).await,
             SESSION_BARS_METHOD => self.sessions.bars(request.params).await,
+            SESSION_PROJECTIONS_SET_METHOD => self.sessions.set_projections(request.params).await,
             SESSION_PROJECTIONS_SUBSCRIBE_METHOD => {
                 self.sessions.subscribe_projections(request.params).await
+            }
+            SESSION_PROJECTIONS_UNSUBSCRIBE_METHOD => {
+                self.sessions.unsubscribe_projections(request.params).await
             }
             SESSION_PROJECTIONS_ACK_METHOD => {
                 self.sessions.acknowledge_projections(request.params).await

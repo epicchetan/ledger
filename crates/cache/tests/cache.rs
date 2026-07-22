@@ -180,6 +180,126 @@ fn describe_missing_key_errors() {
 }
 
 #[test]
+fn unregister_owned_is_atomic_owner_checked_and_allows_key_reuse() {
+    let cache = Cache::new();
+    let owner = feed_owner();
+    let status = cache
+        .register_value::<Status>(status_descriptor(owner.clone()), None)
+        .unwrap();
+    let batches = cache
+        .register_array::<Batch>(batches_descriptor(owner.clone()), Vec::new())
+        .unwrap();
+
+    let error = cache
+        .unregister_owned(
+            &other_owner(),
+            &[status.key().clone(), batches.key().clone()],
+        )
+        .unwrap_err();
+    assert!(matches!(error, CacheError::OwnerMismatch { .. }));
+    assert!(cache.describe(status.key()).is_ok());
+    assert!(cache.describe(batches.key()).is_ok());
+
+    let removed = cache
+        .unregister_owned(&owner, &[status.key().clone(), batches.key().clone()])
+        .unwrap();
+    assert_eq!(removed.len(), 2);
+    assert_eq!(
+        cache.describe(status.key()).unwrap_err(),
+        CacheError::MissingCell(status.key().clone())
+    );
+    cache
+        .register_value::<Status>(status_descriptor(owner), None)
+        .unwrap();
+}
+
+#[test]
+fn schema_batch_validation_failure_publishes_no_partial_additions() {
+    let cache = Cache::new();
+    let owner = feed_owner();
+    let existing = cache
+        .register_value::<Status>(
+            status_descriptor(owner.clone()),
+            Some(Status { playing: true }),
+        )
+        .unwrap();
+    let new_key = key("feed.databento.es_mbo.staged");
+    let mut batch = cache.schema_batch();
+    let staged = batch
+        .register_array::<Batch>(
+            descriptor(new_key.as_str(), owner.clone(), CellKind::Array, false),
+            vec![Batch { seq: 1 }],
+        )
+        .unwrap();
+    batch
+        .register_value::<Status>(status_descriptor(owner), None)
+        .unwrap();
+
+    assert_eq!(
+        cache.commit_schema_batch(batch).unwrap_err(),
+        CacheError::DuplicateCell(existing.key().clone())
+    );
+    assert_eq!(
+        cache.read_value(&existing).unwrap(),
+        Some(Status { playing: true })
+    );
+    assert_eq!(
+        cache.read_array(&staged).unwrap_err(),
+        CacheError::MissingCell(new_key)
+    );
+}
+
+#[tokio::test]
+async fn schema_batch_replaces_multiple_owned_cells_as_one_registry_commit() {
+    let cache = Cache::new();
+    let owner = feed_owner();
+    let old_status = cache
+        .register_value::<Status>(status_descriptor(owner.clone()), None)
+        .unwrap();
+    let old_batches = cache
+        .register_array::<Batch>(batches_descriptor(owner.clone()), Vec::new())
+        .unwrap();
+    let mut status_watch = cache.watch_key(old_status.key()).unwrap();
+    let mut batches_watch = cache.watch_key(old_batches.key()).unwrap();
+    let mut batch = cache.schema_batch();
+    batch
+        .unregister_owned(
+            &cache,
+            &owner,
+            &[old_status.key().clone(), old_batches.key().clone()],
+        )
+        .unwrap();
+    let new_status = batch
+        .register_value(
+            status_descriptor(owner.clone()),
+            Some(Status { playing: true }),
+        )
+        .unwrap();
+    let new_batches = batch
+        .register_array(batches_descriptor(owner), vec![Batch { seq: 7 }])
+        .unwrap();
+
+    let removed = cache.commit_schema_batch(batch).unwrap();
+    assert_eq!(removed.len(), 2);
+    assert_eq!(
+        cache.read_value(&new_status).unwrap(),
+        Some(Status { playing: true })
+    );
+    assert_eq!(
+        cache.read_array(&new_batches).unwrap(),
+        vec![Batch { seq: 7 }]
+    );
+    assert!(matches!(
+        status_watch.changed().await,
+        Err(CacheError::WatchClosed { .. })
+    ));
+    assert!(matches!(
+        batches_watch.changed().await,
+        Err(CacheError::WatchClosed { .. })
+    ));
+}
+
+#[test]
 fn owner_can_set_owned_value() {
     let (cache, owner, status_key) = status_cache();
 

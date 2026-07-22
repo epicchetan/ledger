@@ -3,20 +3,43 @@ use std::sync::Arc;
 
 use cache::{Cache, CacheReader, CellDescriptor, CellKind, CellOwner, Key, ValueKey};
 use runtime::{
-    ExternalWriteBatch, ExternalWriteSink, RuntimeHandle, RuntimeProcess, RuntimeTask,
+    ComponentId, ExternalWriteBatch, ExternalWriteSink, RuntimeHandle, RuntimeProcess, RuntimeTask,
     RuntimeWorker,
 };
 use store::{RemoteStore, Store, StoreObjectId};
 use tokio::task::JoinHandle;
 
 use crate::clock::{ClockSnapshot, ClockState};
-use crate::feed::es_replay::{EsReplayCells, EsReplayFeed};
+use crate::feed::es_replay::{EsReplayCells, EsReplayFeed, EsReplayFeedHandle};
 use crate::projection::{
-    install_projection_node, next_session_generation, public_projection_outputs,
-    start_projection_delivery, ProjectionDeliveryEvent, ProjectionDeliveryHandle,
-    ProjectionDeliverySource, ProjectionPlan, ProjectionSpec, SessionProjectionOutput,
+    delivery_sources_for_outputs, install_projection_node, next_session_generation,
+    public_projection_outputs, start_projection_delivery, ProjectionDeliveryEvent,
+    ProjectionDeliveryHandle, ProjectionDeliverySource, ProjectionNodeSpec, ProjectionOutput,
+    ProjectionPlan, ProjectionSpec, SessionProjectionOutput,
 };
 use crate::LedgerError;
+
+#[derive(Clone)]
+struct InstalledGraphNode {
+    node: ProjectionNodeSpec,
+    component_id: ComponentId,
+    owned_keys: Vec<Key>,
+    output: ProjectionOutput,
+}
+
+#[derive(Clone, Default)]
+struct InstalledProjectionGraph {
+    public_specs: Vec<String>,
+    nodes: Vec<InstalledGraphNode>,
+    public_outputs: Vec<SessionProjectionOutput>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SetProjectionsResult {
+    pub changed: bool,
+    pub epoch: u64,
+    pub projections: Vec<SessionProjectionOutput>,
+}
 
 pub struct LedgerSessionBuilder<S>
 where
@@ -29,7 +52,10 @@ where
     feeds: Vec<Box<dyn RuntimeProcess>>,
     delivery_sources: Vec<Box<dyn ProjectionDeliverySource>>,
     delivery_feed: Option<EsReplayCells>,
+    replay_feed: Option<EsReplayFeedHandle>,
     projection_specs: Vec<String>,
+    projection_nodes: Vec<InstalledGraphNode>,
+    projection_outputs: Vec<SessionProjectionOutput>,
     projections_installed: bool,
 }
 
@@ -57,7 +83,10 @@ where
             feeds: Vec::new(),
             delivery_sources: Vec::new(),
             delivery_feed: None,
+            replay_feed: None,
             projection_specs: Vec::new(),
+            projection_nodes: Vec::new(),
+            projection_outputs: Vec::new(),
             projections_installed: false,
         })
     }
@@ -73,7 +102,7 @@ where
         raw_object_id: StoreObjectId,
     ) -> Result<EsReplayCells, LedgerError> {
         let cells = EsReplayCells::register(&self.cache)?;
-        let feed = EsReplayFeed::new(
+        let (feed, handle) = EsReplayFeed::with_control(
             raw_object_id,
             self.store.clone(),
             self.clock_key.clone(),
@@ -81,6 +110,7 @@ where
         );
         self.feeds.push(Box::new(feed));
         self.delivery_feed = Some(cells.clone());
+        self.replay_feed = Some(handle);
         Ok(cells)
     }
 
@@ -101,7 +131,13 @@ where
         let plan = ProjectionPlan::resolve(requested)?;
         let mut outputs = HashMap::new();
         for node in plan.nodes() {
-            let installed = install_projection_node(&self.cache, feed, node, &outputs)?;
+            let installed = install_projection_node(&self.cache, feed, node, &outputs, 0)?;
+            let graph_node = InstalledGraphNode {
+                node: installed.node.clone(),
+                component_id: installed.task.descriptor().component.id.clone(),
+                owned_keys: installed.output.owned_keys(),
+                output: installed.output.clone(),
+            };
             let prior = outputs.insert(installed.node.clone(), installed.output);
             if prior.is_some() {
                 return Err(LedgerError::ProjectionPlan(format!(
@@ -113,6 +149,7 @@ where
             if let Some(delivery) = installed.delivery {
                 self.delivery_sources.push(delivery);
             }
+            self.projection_nodes.push(graph_node);
         }
 
         let public = public_projection_outputs(&plan, &outputs)?;
@@ -120,11 +157,18 @@ where
             .iter()
             .map(|output| output.canonical_spec().to_string())
             .collect();
+        self.projection_outputs = public.clone();
         self.projections_installed = true;
         Ok(public)
     }
 
     pub async fn start(self) -> Result<LedgerSessionHandle, LedgerError> {
+        let graph = InstalledProjectionGraph {
+            public_specs: self.projection_specs.clone(),
+            nodes: self.projection_nodes.clone(),
+            public_outputs: self.projection_outputs.clone(),
+        };
+        let feed_cells = self.delivery_feed.clone();
         let (worker, runtime) = RuntimeWorker::new(self.cache);
         let worker = tokio::spawn(worker.run());
         let session_owner = session_owner()?;
@@ -143,17 +187,16 @@ where
 
         let session_generation = next_session_generation();
         let (delivery, delivery_events, delivery_worker) = match self.delivery_feed {
-            Some(feed) if !self.delivery_sources.is_empty() => {
+            Some(feed) => {
                 let (handle, events, worker) = start_projection_delivery(
                     runtime.clone(),
                     session_generation,
-                    self.clock_key.clone(),
                     feed,
                     self.delivery_sources,
                 );
                 (Some(handle), Some(events), Some(worker))
             }
-            Some(_) | None => (None, None, None),
+            None => (None, None, None),
         };
 
         Ok(LedgerSessionHandle {
@@ -165,7 +208,9 @@ where
             delivery,
             delivery_events: std::sync::Mutex::new(delivery_events),
             delivery_worker,
-            projection_specs: self.projection_specs,
+            replay_feed: self.replay_feed,
+            feed_cells,
+            graph: std::sync::RwLock::new(graph),
             session_generation,
             control: tokio::sync::Mutex::new(()),
         })
@@ -181,7 +226,9 @@ pub struct LedgerSessionHandle {
     delivery: Option<ProjectionDeliveryHandle>,
     delivery_events: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ProjectionDeliveryEvent>>>,
     delivery_worker: Option<JoinHandle<Result<(), crate::projection::ProjectionDeliveryError>>>,
-    projection_specs: Vec<String>,
+    replay_feed: Option<EsReplayFeedHandle>,
+    feed_cells: Option<EsReplayCells>,
+    graph: std::sync::RwLock<InstalledProjectionGraph>,
     session_generation: u64,
     control: tokio::sync::Mutex<()>,
 }
@@ -205,6 +252,22 @@ impl LedgerSessionHandle {
 
     pub fn projection_delivery(&self) -> Option<&ProjectionDeliveryHandle> {
         self.delivery.as_ref()
+    }
+
+    pub fn projection_specs(&self) -> Vec<String> {
+        self.graph
+            .read()
+            .expect("projection graph lock poisoned")
+            .public_specs
+            .clone()
+    }
+
+    pub fn projection_outputs(&self) -> Vec<SessionProjectionOutput> {
+        self.graph
+            .read()
+            .expect("projection graph lock poisoned")
+            .public_outputs
+            .clone()
     }
 
     pub fn take_projection_events(
@@ -239,18 +302,151 @@ impl LedgerSessionHandle {
     pub async fn seek_to(&self, session_ns: u64) -> Result<(), LedgerError> {
         let _control = self.control.lock().await;
         let next = self.current_clock()?.seek_to(session_ns);
-        if let Some(delivery) = &self.delivery {
-            delivery
-                .begin_seek(next.revision, session_ns, self.projection_specs.clone())
-                .await?;
-        }
-        if let Err(error) = self.write_clock(next.clone()).await {
-            if let Some(delivery) = &self.delivery {
-                let _ = delivery.cancel_seek(next.revision).await;
-            }
-            return Err(error);
-        }
+        self.rebuild_locked(next, None).await?;
         Ok(())
+    }
+
+    pub async fn set_projections(
+        &self,
+        requested: Vec<ProjectionSpec>,
+    ) -> Result<SetProjectionsResult, LedgerError> {
+        let plan = ProjectionPlan::resolve(&requested)?;
+        let _control = self.control.lock().await;
+        let mut wanted = requested
+            .iter()
+            .map(ProjectionSpec::canonical)
+            .collect::<Vec<_>>();
+        let current = self.projection_specs();
+        let mut have = current.clone();
+        wanted.sort();
+        have.sort();
+        if wanted == have {
+            return Ok(SetProjectionsResult {
+                changed: false,
+                epoch: self.current_epoch()?,
+                projections: self.projection_outputs(),
+            });
+        }
+        let clock = self.current_clock()?;
+        let next = clock.seek_to(clock.now_ns());
+        let epoch = self.rebuild_locked(next, Some(plan)).await?;
+        Ok(SetProjectionsResult {
+            changed: true,
+            epoch,
+            projections: self.projection_outputs(),
+        })
+    }
+
+    async fn rebuild_locked(
+        &self,
+        next_clock: ClockState,
+        desired_plan: Option<ProjectionPlan>,
+    ) -> Result<u64, LedgerError> {
+        let feed = self
+            .replay_feed
+            .as_ref()
+            .ok_or_else(|| LedgerError::FeedControl("session has no replay feed".to_string()))?;
+        feed.hold().await?;
+        self.write_clock(next_clock).await?;
+        let epoch = feed.reset().await?;
+        self.runtime.drain(usize::MAX).await?;
+
+        if let Some(plan) = desired_plan {
+            let delivery = self.delivery.as_ref().ok_or_else(|| {
+                LedgerError::ProjectionPlan(
+                    "projection delivery is unavailable for graph reconciliation".to_string(),
+                )
+            })?;
+            delivery.suspend_sources().await?;
+            let current = self
+                .graph
+                .read()
+                .map_err(|_| LedgerError::ProjectionPlan("graph lock poisoned".to_string()))?
+                .clone();
+            let desired_nodes = plan.nodes().to_vec();
+            let retained = current
+                .nodes
+                .iter()
+                .filter(|node| desired_nodes.contains(&node.node))
+                .cloned()
+                .map(|node| (node.node.clone(), node))
+                .collect::<HashMap<_, _>>();
+            let mut obsolete = current
+                .nodes
+                .iter()
+                .filter(|node| !desired_nodes.contains(&node.node))
+                .cloned()
+                .collect::<Vec<_>>();
+            obsolete.reverse();
+            let remove = obsolete
+                .iter()
+                .map(|node| node.component_id.clone())
+                .collect::<Vec<_>>();
+            let feed_cells = self.feed_cells.clone().ok_or_else(|| {
+                LedgerError::ProjectionPlan("session feed cells are unavailable".to_string())
+            })?;
+            let graph = self
+                .runtime
+                .reconcile_tasks(remove, move |schema| {
+                    for node in &obsolete {
+                        schema.unregister_owned(&node.component_id.owner(), &node.owned_keys)?;
+                    }
+
+                    let mut outputs = retained
+                        .iter()
+                        .map(|(node, installed)| (node.clone(), installed.output.clone()))
+                        .collect::<HashMap<_, _>>();
+                    let mut nodes = Vec::with_capacity(plan.nodes().len());
+                    let mut tasks = Vec::new();
+                    for node in plan.nodes() {
+                        if let Some(installed) = retained.get(node) {
+                            nodes.push(installed.clone());
+                            continue;
+                        }
+                        let installed =
+                            install_projection_node(schema, &feed_cells, node, &outputs, epoch)
+                                .map_err(|error| {
+                                    runtime::RuntimeError::GraphReconciliation(error.to_string())
+                                })?;
+                        let graph_node = InstalledGraphNode {
+                            node: installed.node.clone(),
+                            component_id: installed.task.descriptor().component.id.clone(),
+                            owned_keys: installed.output.owned_keys(),
+                            output: installed.output.clone(),
+                        };
+                        outputs.insert(installed.node, installed.output);
+                        tasks.push(installed.task);
+                        nodes.push(graph_node);
+                    }
+                    let public_outputs =
+                        public_projection_outputs(&plan, &outputs).map_err(|error| {
+                            runtime::RuntimeError::GraphReconciliation(error.to_string())
+                        })?;
+                    let public_specs = public_outputs
+                        .iter()
+                        .map(|output| output.canonical_spec().to_string())
+                        .collect();
+                    Ok((
+                        InstalledProjectionGraph {
+                            public_specs,
+                            nodes,
+                            public_outputs,
+                        },
+                        tasks,
+                    ))
+                })
+                .await?;
+            let sources = delivery_sources_for_outputs(&graph.public_outputs);
+            delivery.replace_sources(sources).await?;
+            *self
+                .graph
+                .write()
+                .map_err(|_| LedgerError::ProjectionPlan("graph lock poisoned".to_string()))? =
+                graph;
+        }
+
+        feed.release(epoch).await?;
+        Ok(epoch)
     }
 
     pub async fn shutdown(self) -> Result<(), LedgerError> {
@@ -298,6 +494,18 @@ impl LedgerSessionHandle {
             .cache()
             .read_value(&self.clock_key)?
             .unwrap_or_else(ClockState::initial))
+    }
+
+    fn current_epoch(&self) -> Result<u64, LedgerError> {
+        let Some(feed) = &self.feed_cells else {
+            return Ok(0);
+        };
+        Ok(self
+            .runtime
+            .cache()
+            .read_value(&feed.cursor)?
+            .map(|cursor| cursor.epoch)
+            .unwrap_or(0))
     }
 
     async fn write_clock(&self, next: ClockState) -> Result<(), LedgerError> {

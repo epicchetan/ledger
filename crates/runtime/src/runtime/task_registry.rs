@@ -45,6 +45,10 @@ impl TaskRegistry {
             .ok_or_else(|| RuntimeError::MissingComponent(id.clone()))
     }
 
+    pub(crate) fn remove(&mut self, id: &ComponentId) -> Option<Box<dyn RuntimeTask>> {
+        self.tasks.remove(id)
+    }
+
     pub(crate) fn put(&mut self, id: ComponentId, task: Box<dyn RuntimeTask>) {
         self.tasks.insert(id, task);
     }

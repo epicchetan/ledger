@@ -17,7 +17,7 @@ use support::{fabricate_prepared_day, store_fixture, trade, StoreFixture};
 const WAKE: Duration = Duration::from_secs(2);
 
 #[tokio::test]
-async fn bars_delivery_snapshots_seeks_once_and_resumes_from_validated_head() {
+async fn bars_delivery_invalidates_old_epoch_and_resumes_from_validated_head() {
     let mut running = start_session().await;
     let session = &running.session;
     let events = &mut running.events;
@@ -45,11 +45,11 @@ async fn bars_delivery_snapshots_seeks_once_and_resumes_from_validated_head() {
         .unwrap();
 
     session.seek_to(350).await.unwrap();
-    let seek_final = next_frame(events, &first.subscription_id).await;
-    assert_eq!(seek_final.reason, ProjectionFrameReason::SeekFinal);
-    assert_eq!(seek_final.operation, ProjectionFrameOperation::Append);
-    assert_eq!(bars_len(&seek_final.payload), 3);
-    let head = seek_final.head.clone();
+    let rebuilt = next_frame(events, &first.subscription_id).await;
+    assert_eq!(rebuilt.reason, ProjectionFrameReason::Cadence);
+    assert_eq!(rebuilt.operation, ProjectionFrameOperation::Snapshot);
+    assert_eq!(bars_len(&rebuilt.payload), 3);
+    let head = rebuilt.head.clone();
     delivery
         .acknowledge(
             first.subscription_id.clone(),
@@ -82,9 +82,8 @@ async fn bars_delivery_snapshots_seeks_once_and_resumes_from_validated_head() {
         .unwrap_err();
     assert!(regressed.to_string().contains("invalid acknowledgment"));
     let metrics = delivery.metrics();
-    assert_eq!(metrics.atomic_collects, 2);
-    assert_eq!(metrics.frames_admitted, 2);
-    assert_eq!(metrics.seek_barriers_completed, 1);
+    assert!(metrics.atomic_collects >= 2);
+    assert!(metrics.frames_admitted >= 2);
 
     let resumed = delivery
         .subscribe(subscription("consumer-b", Some(head.clone()), vec![1]))
@@ -95,6 +94,32 @@ async fn bars_delivery_snapshots_seeks_once_and_resumes_from_validated_head() {
     assert_eq!(suffix.head, head);
     assert_eq!(suffix.operation, ProjectionFrameOperation::Append);
     assert_eq!(bars_len(&suffix.payload), 0);
+
+    running.session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn same_position_seek_starts_another_zero_origin_epoch() {
+    let mut running = start_session().await;
+    let delivery = running.session.projection_delivery().unwrap().clone();
+    let subscribed = delivery
+        .subscribe(subscription("consumer-same-position", None, vec![1]))
+        .await
+        .unwrap();
+    let _ = next_frame(&mut running.events, &subscribed.subscription_id).await;
+
+    running.session.seek_to(350).await.unwrap();
+    let first = next_frame(&mut running.events, &subscribed.subscription_id).await;
+    running.session.seek_to(350).await.unwrap();
+    let second = next_frame(&mut running.events, &subscribed.subscription_id).await;
+
+    assert_eq!(
+        position_epoch(&second.head),
+        position_epoch(&first.head) + 1
+    );
+    assert_eq!(second.operation, ProjectionFrameOperation::Snapshot);
+    assert!(second.base.is_none());
+    assert_eq!(bars_len(&second.payload), 3);
 
     running.session.shutdown().await.unwrap();
 }
@@ -165,14 +190,115 @@ async fn one_and_five_minute_sources_deliver_independent_frames_from_one_session
     let final_frames = next_frames(&mut events, &subscribed.subscription_id, 2).await;
     assert_eq!(
         final_frames["bars:1m"].reason,
-        ProjectionFrameReason::SeekFinal
+        ProjectionFrameReason::Cadence
     );
     assert_eq!(
         final_frames["bars:5m"].reason,
-        ProjectionFrameReason::SeekFinal
+        ProjectionFrameReason::Cadence
+    );
+    assert_eq!(
+        final_frames["bars:1m"].operation,
+        ProjectionFrameOperation::Snapshot
+    );
+    assert_eq!(
+        final_frames["bars:5m"].operation,
+        ProjectionFrameOperation::Snapshot
     );
     assert_eq!(bars_len(&final_frames["bars:1m"].payload), 2);
     assert_eq!(bars_len(&final_frames["bars:5m"].payload), 1);
+
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn projection_set_rebuilds_in_place_and_reuses_removed_source_keys() {
+    let mut running = start_session().await;
+    let session = &running.session;
+    let events = &mut running.events;
+    let delivery = session.projection_delivery().unwrap().clone();
+    session.seek_to(350).await.unwrap();
+
+    let changed = session
+        .set_projections(vec![ProjectionSpec::Bars(BarsParams { interval_ns: 200 })])
+        .await
+        .unwrap();
+    assert!(changed.changed);
+    assert_eq!(changed.projections[0].canonical_spec(), "bars:200ns");
+    assert_eq!(session.projection_specs(), vec!["bars:200ns"]);
+
+    let subscribed = delivery
+        .subscribe(ProjectionSubscriptionRequest {
+            consumer_instance_id: "consumer-replaced".to_string(),
+            projections: vec![ProjectionSubscriptionProjectionRequest {
+                spec: "bars:200ns".to_string(),
+                schema_versions: vec![1],
+                requested_max_fps: Some(20),
+                have: None,
+            }],
+        })
+        .await
+        .unwrap();
+    let frame = next_frame(events, &subscribed.subscription_id).await;
+    assert_eq!(frame.operation, ProjectionFrameOperation::Snapshot);
+    assert_eq!(bars_len(&frame.payload), 1);
+    assert_eq!(position_epoch(&frame.head), changed.epoch);
+
+    let unchanged = session
+        .set_projections(vec![ProjectionSpec::Bars(BarsParams { interval_ns: 200 })])
+        .await
+        .unwrap();
+    assert!(!unchanged.changed);
+    assert_eq!(unchanged.epoch, changed.epoch);
+
+    let restored = session
+        .set_projections(vec![ProjectionSpec::Bars(BarsParams { interval_ns: 100 })])
+        .await
+        .unwrap();
+    assert!(restored.changed);
+    assert!(restored.epoch > changed.epoch);
+    assert_eq!(session.projection_specs(), vec!["bars:100ns"]);
+    assert!(delivery
+        .unsubscribe(subscribed.subscription_id)
+        .await
+        .unwrap());
+
+    let restored_subscription = delivery
+        .subscribe(subscription("consumer-restored", None, vec![1]))
+        .await
+        .unwrap();
+    let restored_frame = next_frame(events, &restored_subscription.subscription_id).await;
+    assert_eq!(restored_frame.operation, ProjectionFrameOperation::Snapshot);
+    assert_eq!(bars_len(&restored_frame.payload), 3);
+    assert_eq!(position_epoch(&restored_frame.head), restored.epoch);
+
+    running.session.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn session_with_an_empty_initial_graph_can_install_its_first_projection() {
+    let fixture = store_fixture();
+    let (raw_id, _) =
+        fabricate_prepared_day(&fixture.store, vec![trade(10, 1, 100, 1, None)]).await;
+    let mut builder = LedgerSessionBuilder::new(fixture.store.clone()).unwrap();
+    let feed = builder.es_replay(raw_id).unwrap();
+    builder.projections(&feed, &[]).unwrap();
+    let session = builder.start().await.unwrap();
+    let mut events = session.take_projection_events().unwrap();
+
+    let changed = session
+        .set_projections(vec![ProjectionSpec::Bars(BarsParams { interval_ns: 100 })])
+        .await
+        .unwrap();
+    assert!(changed.changed);
+    assert_eq!(session.projection_specs(), vec!["bars:100ns"]);
+    let delivery = session.projection_delivery().unwrap();
+    let subscribed = delivery
+        .subscribe(subscription("consumer-first", None, vec![1]))
+        .await
+        .unwrap();
+    let frame = next_frame(&mut events, &subscribed.subscription_id).await;
+    assert_eq!(frame.operation, ProjectionFrameOperation::Snapshot);
+    assert_eq!(position_epoch(&frame.head), changed.epoch);
 
     session.shutdown().await.unwrap();
 }
@@ -253,7 +379,7 @@ async fn invalid_positions_and_schemas_cannot_corrupt_delivery_state() {
 }
 
 #[tokio::test]
-async fn inactive_consumer_skips_seek_final_and_resumes_from_its_sent_head() {
+async fn inactive_consumer_skips_rebuild_frames_and_resumes_with_a_snapshot() {
     let mut running = start_session().await;
     let session = &running.session;
     let events = &mut running.events;
@@ -277,7 +403,6 @@ async fn inactive_consumer_skips_seek_final_and_resumes_from_its_sent_head() {
         .unwrap();
 
     session.seek_to(350).await.unwrap();
-    wait_for_seek_barrier(&delivery, 1).await;
     assert_no_frame(events, &subscribed.subscription_id).await;
 
     let feed_status = session
@@ -310,8 +435,9 @@ async fn inactive_consumer_skips_seek_final_and_resumes_from_its_sent_head() {
         .unwrap();
     let resumed = next_frame(events, &subscribed.subscription_id).await;
     assert_eq!(resumed.reason, ProjectionFrameReason::Cadence);
-    assert_eq!(resumed.base, Some(initial_head));
-    assert_eq!(resumed.operation, ProjectionFrameOperation::Append);
+    assert_ne!(resumed.head, initial_head);
+    assert_eq!(resumed.base, None);
+    assert_eq!(resumed.operation, ProjectionFrameOperation::Snapshot);
     assert_eq!(bars_len(&resumed.payload), 3);
 
     running.session.shutdown().await.unwrap();
@@ -489,21 +615,14 @@ async fn assert_no_frame(
     );
 }
 
-async fn wait_for_seek_barrier(
-    delivery: &ledger::projection::ProjectionDeliveryHandle,
-    completed: u64,
-) {
-    tokio::time::timeout(WAKE, async {
-        while delivery.metrics().seek_barriers_completed < completed {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("seek barrier should complete");
-}
-
 fn bars_len(payload: &ProjectionFramePayload) -> usize {
     match payload {
         ProjectionFramePayload::Bars(payload) => payload.bars.len(),
+    }
+}
+
+fn position_epoch(position: &ProjectionPosition) -> u64 {
+    match position {
+        ProjectionPosition::Bars(position) => position.epoch,
     }
 }

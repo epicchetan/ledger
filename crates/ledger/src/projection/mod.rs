@@ -4,13 +4,80 @@ mod trade_prints;
 
 use std::collections::{HashMap, HashSet};
 
-use runtime::RuntimeTask;
+use cache::{ArrayKey, CellDescriptor, Key, ValueKey};
+use runtime::{CacheSchema, RuntimeTask};
 
 use crate::feed::es_replay::EsReplayCells;
 use crate::LedgerError;
 
 pub use bars::*;
 pub use delivery::*;
+
+pub(crate) trait ProjectionCellRegistrar {
+    fn register_value<T>(
+        &self,
+        descriptor: CellDescriptor,
+        initial: Option<T>,
+    ) -> Result<ValueKey<T>, LedgerError>
+    where
+        T: Clone + Send + Sync + 'static;
+
+    fn register_array<T>(
+        &self,
+        descriptor: CellDescriptor,
+        initial: Vec<T>,
+    ) -> Result<ArrayKey<T>, LedgerError>
+    where
+        T: Clone + Send + Sync + 'static;
+}
+
+impl ProjectionCellRegistrar for cache::Cache {
+    fn register_value<T>(
+        &self,
+        descriptor: CellDescriptor,
+        initial: Option<T>,
+    ) -> Result<ValueKey<T>, LedgerError>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        Ok(cache::Cache::register_value(self, descriptor, initial)?)
+    }
+
+    fn register_array<T>(
+        &self,
+        descriptor: CellDescriptor,
+        initial: Vec<T>,
+    ) -> Result<ArrayKey<T>, LedgerError>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        Ok(cache::Cache::register_array(self, descriptor, initial)?)
+    }
+}
+
+impl ProjectionCellRegistrar for CacheSchema<'_> {
+    fn register_value<T>(
+        &self,
+        descriptor: CellDescriptor,
+        initial: Option<T>,
+    ) -> Result<ValueKey<T>, LedgerError>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        Ok(CacheSchema::register_value(self, descriptor, initial)?)
+    }
+
+    fn register_array<T>(
+        &self,
+        descriptor: CellDescriptor,
+        initial: Vec<T>,
+    ) -> Result<ArrayKey<T>, LedgerError>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        Ok(CacheSchema::register_array(self, descriptor, initial)?)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ProjectionSpec {
@@ -214,6 +281,19 @@ impl ProjectionOutput {
             }),
         }
     }
+
+    pub(crate) fn owned_keys(&self) -> Vec<Key> {
+        match self {
+            Self::TradePrints(cells) => {
+                vec![cells.prints.key().clone(), cells.status.key().clone()]
+            }
+            Self::Bars(cells) => vec![
+                cells.bars.key().clone(),
+                cells.live.key().clone(),
+                cells.status.key().clone(),
+            ],
+        }
+    }
 }
 
 pub(crate) struct InstalledProjectionNode {
@@ -255,14 +335,15 @@ impl SessionProjectionOutput {
 }
 
 pub(crate) fn install_projection_node(
-    cache: &cache::Cache,
+    registrar: &impl ProjectionCellRegistrar,
     feed: &EsReplayCells,
     node: &ProjectionNodeSpec,
     outputs: &HashMap<ProjectionNodeSpec, ProjectionOutput>,
+    epoch: u64,
 ) -> Result<InstalledProjectionNode, LedgerError> {
     match node {
         ProjectionNodeSpec::CanonicalTradePrints => {
-            trade_prints::install_trade_prints_projection(cache, feed.clone())
+            trade_prints::install_trade_prints_projection(registrar, feed.clone(), epoch)
         }
         ProjectionNodeSpec::Bars(params) => {
             let dependency_node = ProjectionNodeSpec::CanonicalTradePrints;
@@ -273,9 +354,31 @@ pub(crate) fn install_projection_node(
                         node: node.canonical_key(),
                         expected: "canonical trade-print",
                     })?;
-            bars::install_bars_projection(cache, dependency.trade_prints(node)?.clone(), *params)
+            bars::install_bars_projection(
+                registrar,
+                dependency.trade_prints(node)?.clone(),
+                *params,
+                epoch,
+            )
         }
     }
+}
+
+pub(crate) fn delivery_sources_for_outputs(
+    outputs: &[SessionProjectionOutput],
+) -> Vec<Box<dyn ProjectionDeliverySource>> {
+    outputs
+        .iter()
+        .map(|output| match output {
+            SessionProjectionOutput::Bars {
+                canonical_spec,
+                cells,
+            } => Box::new(BarsDeliverySource::new(
+                canonical_spec.clone(),
+                cells.clone(),
+            )) as Box<dyn ProjectionDeliverySource>,
+        })
+        .collect()
 }
 
 pub(crate) fn public_projection_outputs(

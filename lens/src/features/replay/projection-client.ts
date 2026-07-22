@@ -24,7 +24,10 @@ const barsProjectionClient: ProjectionClient<
 }
 
 const projectionClients = new Map<string, ProjectionClient<unknown, unknown>>([
-  [clientKey(barsProjectionClient.kind, barsProjectionClient.schemaVersion), barsProjectionClient],
+  [
+    clientKey(barsProjectionClient.kind, barsProjectionClient.schemaVersion),
+    barsProjectionClient,
+  ],
 ])
 
 export function getProjectionClient(
@@ -38,7 +41,9 @@ export function getBarsProjectionClient(): typeof barsProjectionClient {
   return barsProjectionClient
 }
 
-export function parseProjectionFrame(value: unknown): BarsProjectionFrame | null {
+export function parseProjectionFrame(
+  value: unknown
+): BarsProjectionFrame | null {
   if (!isRecord(value)) return null
   const { kind, schemaVersion } = value
   if (typeof kind !== "string" || !isInteger(schemaVersion)) return null
@@ -80,12 +85,7 @@ function parseBarsProjectionFrame(value: unknown): BarsProjectionFrame | null {
   ) {
     return null
   }
-  if (
-    reason !== "initial" &&
-    reason !== "cadence" &&
-    reason !== "resync" &&
-    reason !== "seekFinal"
-  ) {
+  if (reason !== "initial" && reason !== "cadence" && reason !== "resync") {
     return null
   }
   const parsedBase = base === null ? null : parsePosition(base)
@@ -122,7 +122,9 @@ function parsePosition(value: unknown): BarsPosition | null {
   return { epoch, projectionRevision, processedBatches, completedBars }
 }
 
-function parseBarsPayload(value: unknown): BarsProjectionFrame["payload"] | null {
+function parseBarsPayload(
+  value: unknown
+): BarsProjectionFrame["payload"] | null {
   if (!isRecord(value) || !Array.isArray(value.bars)) return null
   const bars: Bar[] = []
   for (const valueBar of value.bars) {

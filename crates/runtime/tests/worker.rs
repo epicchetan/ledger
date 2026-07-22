@@ -753,3 +753,97 @@ async fn snapshot_requests_are_rejected_after_shutdown() {
     assert_eq!(error, runtime::RuntimeError::SnapshotIngressClosed);
     assert_eq!(handle.snapshot_metrics().rejected, 1);
 }
+
+#[tokio::test]
+async fn failed_schema_reconciliation_publishes_none_of_its_staged_cells() {
+    let cache = Cache::new();
+    let owner = CellOwner::new("projection.atomic").unwrap();
+    let first_key = key("projection.atomic.first");
+    let (worker, handle) = RuntimeWorker::new(cache);
+    let worker_join = tokio::spawn(worker.run());
+
+    let error = handle
+        .reconcile_tasks::<(), _>(Vec::new(), move |schema| {
+            schema.register_value::<i32>(
+                descriptor(first_key.as_str(), owner.clone(), CellKind::Value),
+                Some(1),
+            )?;
+            schema.register_value::<i32>(
+                descriptor("projection.atomic.invalid", owner, CellKind::Array),
+                Some(2),
+            )?;
+            Ok(((), Vec::new()))
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, runtime::RuntimeError::Cache(_)));
+    assert_eq!(
+        handle
+            .cache()
+            .describe(&key("projection.atomic.first"))
+            .unwrap_err(),
+        cache::CacheError::MissingCell(key("projection.atomic.first"))
+    );
+
+    handle.shutdown().await.unwrap();
+    worker_join.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_queued_during_schema_reconciliation_observes_complete_new_schema() {
+    let cache = Cache::new();
+    let owner = CellOwner::new("projection.atomic").unwrap();
+    let first_key = key("projection.atomic.first");
+    let second_key = key("projection.atomic.second");
+    let (worker, handle) = RuntimeWorker::new(cache);
+    let worker_join = tokio::spawn(worker.run());
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+    let reconciliation = {
+        let handle = handle.clone();
+        let owner = owner.clone();
+        let first_key = first_key.clone();
+        let second_key = second_key.clone();
+        tokio::spawn(async move {
+            handle
+                .reconcile_tasks::<(), _>(Vec::new(), move |schema| {
+                    schema.register_value::<i32>(
+                        descriptor(first_key.as_str(), owner.clone(), CellKind::Value),
+                        Some(1),
+                    )?;
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    schema.register_value::<i32>(
+                        descriptor(second_key.as_str(), owner, CellKind::Value),
+                        Some(2),
+                    )?;
+                    Ok(((), Vec::new()))
+                })
+                .await
+        })
+    };
+    tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+        .await
+        .unwrap();
+    let snapshot = {
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            handle
+                .snapshot(move |view| {
+                    Ok((
+                        view.describe(&first_key).is_ok(),
+                        view.describe(&second_key).is_ok(),
+                    ))
+                })
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    release_tx.send(()).unwrap();
+
+    reconciliation.await.unwrap().unwrap();
+    assert_eq!(snapshot.await.unwrap().unwrap(), (true, true));
+    handle.shutdown().await.unwrap();
+    worker_join.await.unwrap().unwrap();
+}

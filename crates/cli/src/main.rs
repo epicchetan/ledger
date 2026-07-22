@@ -785,10 +785,7 @@ struct SessionDeliverySummary {
     frames_admitted: u64,
     snapshot_frames: u64,
     suffix_frames: u64,
-    frames_suppressed_during_seek: u64,
     outbound_backpressure: u64,
-    seek_barriers_completed: u64,
-    total_seek_barrier_ns: u64,
 }
 
 struct DeliveryProbe {
@@ -807,10 +804,7 @@ impl DeliveryProbe {
             frames_admitted: metrics.frames_admitted,
             snapshot_frames: metrics.snapshot_frames,
             suffix_frames: metrics.suffix_frames,
-            frames_suppressed_during_seek: metrics.frames_suppressed_during_seek,
             outbound_backpressure: metrics.outbound_backpressure,
-            seek_barriers_completed: metrics.seek_barriers_completed,
-            total_seek_barrier_ns: metrics.total_seek_barrier_ns,
         })
     }
 }

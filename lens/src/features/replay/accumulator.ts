@@ -79,7 +79,7 @@ export class BarsAccumulator {
         ? {
             kind: "duplicate",
             head: frame.head,
-            immediateAck: frame.reason === "seekFinal",
+            immediateAck: frame.reason === "resync",
           }
         : { kind: "rejected" }
     }
@@ -124,8 +124,7 @@ export class BarsAccumulator {
     return {
       kind: duplicate ? "duplicate" : "applied",
       head: frame.head,
-      immediateAck:
-        snapshot || frame.reason === "seekFinal" || frame.reason === "resync",
+      immediateAck: snapshot || frame.reason === "resync",
     }
   }
 

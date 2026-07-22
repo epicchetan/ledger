@@ -6,6 +6,10 @@ Date: 2026-07-10
 
 Baseline: `a8e030a` (`Add replay chart and reload-safe session resume`)
 
+> Superseded behavior (2026-07-21): delivery no longer owns seek barriers,
+> suppression, or `seekFinal`; epoch-invalidated snapshots arrive at ordinary
+> cadence. See `ledger_zero_origin_rebuild_implementation_spec.md`.
+
 ## 1. Purpose
 
 Build the missing boundary between Ledger's exact projection state and the

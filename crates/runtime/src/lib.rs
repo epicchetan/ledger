@@ -10,6 +10,7 @@ mod error;
 mod handle;
 mod process;
 mod runtime;
+mod schema;
 mod snapshot;
 mod task;
 mod worker;
@@ -24,6 +25,7 @@ pub use process::{ProcessContext, ProcessPrepareContext, RuntimeProcess, Shutdow
 pub use runtime::{
     ExternalWriteBatch, ExternalWriteReceiver, ExternalWriteSink, RunStats, Runtime, RuntimeStep,
 };
+pub use schema::CacheSchema;
 pub use snapshot::SnapshotMetricsSnapshot;
 pub use task::{RuntimeTask, TaskContext, TaskOutcome, TaskPrepareContext, TaskWake};
 pub use worker::RuntimeWorker;

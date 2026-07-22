@@ -60,13 +60,21 @@ pub struct BarsCells {
 
 impl BarsCells {
     pub fn register(cache: &Cache, params: BarsParams) -> Result<Self, LedgerError> {
+        Self::register_with(cache, params, 0)
+    }
+
+    pub(crate) fn register_with(
+        registrar: &impl super::ProjectionCellRegistrar,
+        params: BarsParams,
+        epoch: u64,
+    ) -> Result<Self, LedgerError> {
         validate_params(params)?;
         let spec = canonical_spec(params);
         let component_id = projection_component_id(&spec)?;
         let owner = component_id.owner();
         let prefix = component_id.as_str();
 
-        let bars = cache.register_array::<Bar>(
+        let bars = registrar.register_array::<Bar>(
             descriptor(
                 &format!("{prefix}.bars"),
                 owner.clone(),
@@ -75,7 +83,7 @@ impl BarsCells {
             )?,
             Vec::new(),
         )?;
-        let live = cache.register_value::<Bar>(
+        let live = registrar.register_value::<Bar>(
             descriptor(
                 &format!("{prefix}.live"),
                 owner.clone(),
@@ -84,9 +92,9 @@ impl BarsCells {
             )?,
             None,
         )?;
-        let status = cache.register_value::<BarsStatus>(
+        let status = registrar.register_value::<BarsStatus>(
             descriptor(&format!("{prefix}.status"), owner, CellKind::Value, true)?,
-            None,
+            Some(empty_status(spec, epoch)),
         )?;
 
         Ok(Self { bars, live, status })
@@ -115,10 +123,11 @@ enum Fold {
 }
 
 impl BarsTask {
-    pub(crate) fn new(
+    pub(crate) fn new_at_epoch(
         source: super::trade_prints::TradePrintCells,
         params: BarsParams,
         cells: BarsCells,
+        epoch: u64,
     ) -> Result<Self, LedgerError> {
         validate_params(params)?;
         let spec = canonical_spec(params);
@@ -130,7 +139,7 @@ impl BarsTask {
             spec,
             source,
             cells,
-            epoch: 0,
+            epoch,
             processed_prints: 0,
             processed_batches: 0,
             completed_bars: 0,
@@ -240,12 +249,13 @@ impl BarsTask {
 }
 
 pub(crate) fn install_bars_projection(
-    cache: &Cache,
+    registrar: &impl super::ProjectionCellRegistrar,
     source: super::trade_prints::TradePrintCells,
     params: BarsParams,
+    epoch: u64,
 ) -> Result<super::InstalledProjectionNode, LedgerError> {
-    let cells = BarsCells::register(cache, params)?;
-    let task = BarsTask::new(source, params, cells.clone())?;
+    let cells = BarsCells::register_with(registrar, params, epoch)?;
+    let task = BarsTask::new_at_epoch(source, params, cells.clone(), epoch)?;
     let spec = super::ProjectionSpec::Bars(params).canonical();
     let delivery = super::BarsDeliverySource::new(spec, cells.clone());
     Ok(super::InstalledProjectionNode {
@@ -299,15 +309,18 @@ impl RuntimeTask for BarsTask {
         if source_status.print_count > self.processed_prints
             || source_status.processed_batches > self.processed_batches
         {
-            let new_prints = ctx.read_array_range(
-                &self.source.prints,
-                self.processed_prints..source_status.print_count,
-            )?;
+            let chunk_end = source_status
+                .print_count
+                .min(self.processed_prints + REBUILD_CHUNK_PRINTS);
+            let new_prints =
+                ctx.read_array_range(&self.source.prints, self.processed_prints..chunk_end)?;
             let previous_live = self.live.clone();
             let mut completed = Vec::new();
             self.fold_prints(&new_prints, &mut completed);
-            self.processed_prints = source_status.print_count;
-            self.processed_batches = source_status.processed_batches;
+            self.processed_prints = chunk_end;
+            if chunk_end == source_status.print_count {
+                self.processed_batches = source_status.processed_batches;
+            }
             self.completed_bars += completed.len();
             self.revision = self.revision.saturating_add(1);
 
@@ -324,10 +337,25 @@ impl RuntimeTask for BarsTask {
             }
             batch.set_value(&self.cells.status, self.status_snapshot());
             ctx.submit(batch).await?;
-            return Ok(TaskOutcome::Idle);
+            return Ok(if chunk_end < source_status.print_count {
+                TaskOutcome::WakeAgain
+            } else {
+                TaskOutcome::Idle
+            });
         }
 
         Ok(TaskOutcome::Idle)
+    }
+}
+
+fn empty_status(spec: String, epoch: u64) -> BarsStatus {
+    BarsStatus {
+        spec,
+        epoch,
+        processed_batches: 0,
+        completed_bars: 0,
+        revision: 0,
+        last_ts_event_ns: None,
     }
 }
 

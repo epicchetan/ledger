@@ -131,6 +131,54 @@ impl RuntimeHandle {
         rx.await.map_err(|_| RuntimeError::RuntimeStopped)?
     }
 
+    pub async fn remove_task(&self, id: &ComponentId) -> Result<bool, RuntimeError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(RuntimeCommand::RemoveTask {
+                id: id.clone(),
+                reply,
+            })
+            .await
+            .map_err(|_| RuntimeError::RuntimeCommandClosed)?;
+        rx.await.map_err(|_| RuntimeError::RuntimeStopped)?
+    }
+
+    /// Reconcile tasks and their cache schema in one Runtime owner command.
+    /// Snapshot requests cannot run between task removal, schema mutation and
+    /// task installation.
+    pub async fn reconcile_tasks<R, F>(
+        &self,
+        remove: Vec<ComponentId>,
+        mutation: F,
+    ) -> Result<R, RuntimeError>
+    where
+        R: Send + 'static,
+        F: for<'a> FnOnce(
+                &crate::CacheSchema<'a>,
+            ) -> Result<(R, Vec<Box<dyn RuntimeTask>>), RuntimeError>
+            + Send
+            + 'static,
+    {
+        let (reply, rx) = oneshot::channel();
+        let mutation = Box::new(move |schema: &crate::CacheSchema<'_>| {
+            let (value, tasks) = mutation(schema)?;
+            Ok((Box::new(value) as Box<dyn Any + Send>, tasks))
+        });
+        self.commands
+            .send(RuntimeCommand::ReconcileTasks {
+                remove,
+                mutation,
+                reply,
+            })
+            .await
+            .map_err(|_| RuntimeError::RuntimeCommandClosed)?;
+        let value = rx.await.map_err(|_| RuntimeError::RuntimeStopped)??;
+        value
+            .downcast::<R>()
+            .map(|value| *value)
+            .map_err(|_| RuntimeError::SnapshotTypeMismatch)
+    }
+
     pub async fn stop_process(&self, id: &ComponentId) -> Result<bool, RuntimeError> {
         let (reply, rx) = oneshot::channel();
         self.commands

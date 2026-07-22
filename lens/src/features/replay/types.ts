@@ -20,9 +20,8 @@ export interface Cursor {
   tsEventNs: string | null
   nextTsEventNs: string | null
   ended: boolean
-  // True while the feed is emitting a backlog of already-due batches (post-seek
-  // catch-up): projection output is converging, not current. Authoritative
-  // "syncing" signal — no lag inference needed while this is set.
+  // True while the feed is emitting an already-due prefix after a rebuild.
+  // This is diagnostic server state, not viewer loading state.
   catchingUp: boolean
 }
 
@@ -49,17 +48,6 @@ export interface Bar {
   lastTsEventNs: string
 }
 
-export interface BarsFrame {
-  sessionId: string
-  spec: string
-  epoch: number
-  from: number
-  bars: Bar[]
-  total: number
-  live: Bar | null
-  status: BarsStatus
-}
-
 export interface BarsPosition {
   epoch: number
   projectionRevision: number
@@ -67,8 +55,12 @@ export interface BarsPosition {
   completedBars: number
 }
 
-export type ProjectionFrameOperation = "snapshot" | "append" | "replace" | "patch"
-export type ProjectionFrameReason = "initial" | "cadence" | "resync" | "seekFinal"
+export type ProjectionFrameOperation =
+  | "snapshot"
+  | "append"
+  | "replace"
+  | "patch"
+export type ProjectionFrameReason = "initial" | "cadence" | "resync"
 
 export interface BarsProjectionPayload {
   bars: Bar[]
@@ -123,6 +115,10 @@ export interface ProjectionSubscribeResult {
   }>
 }
 
+export interface ProjectionUnsubscribeResult {
+  unsubscribed: boolean
+}
+
 export type ProjectionDeliveryState =
   | "current"
   | "projection_catching_up"
@@ -144,6 +140,13 @@ export interface SessionOpenResult {
   marketDay: string | null
   sessionStartNs: string | null
   sessionEndNs: string | null
+}
+
+export interface SessionSetProjectionsResult {
+  sessionId: string
+  epoch: number
+  projections: SessionProjection[]
+  changed: boolean
 }
 
 // The open-shaped identity of an already-running session, plus its current

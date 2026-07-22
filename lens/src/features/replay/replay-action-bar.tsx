@@ -16,7 +16,7 @@ import {
   Play,
   RefreshCw,
 } from "lucide-react"
-import { useEffect, useMemo, useState } from "react"
+import { useMemo, useState } from "react"
 
 import { JumpToLatestAction } from "@/features/replay/chart/overlays"
 import type { ReplayChartUiStore } from "@/features/replay/chart/ui-store"
@@ -34,7 +34,7 @@ import {
 
 // The wire takes any positive float; these are the surfaced presets.
 const SPEED_PRESETS = [1, 2, 5, 10, 25, 100]
-const VIEWER_LAG_SUSTAIN_MS = 500
+const BAR_INTERVALS = ["bars:1m", "bars:5m", "bars:15m", "bars:1h"] as const
 
 interface ReplayActionBarProps {
   ui: ReplayChartUiStore
@@ -47,11 +47,13 @@ interface ReplayActionBarProps {
   marketDay: string
   symbol: string
   deliveryState: ProjectionDeliveryState
+  selectedProjection: string
   disabled: boolean
   onExit: () => void
   onPlay: () => void
   onPause: () => void
   onSpeed: (speed: number) => void
+  onProjection: (spec: string) => void
   onSeek: (sessionNs: string) => void
   onScrub: (sessionMs: number | null) => void
 }
@@ -76,11 +78,13 @@ export function ReplayActionBar({
   marketDay,
   symbol,
   deliveryState,
+  selectedProjection,
   disabled,
   onExit,
   onPlay,
   onPause,
   onSpeed,
+  onProjection,
   onSeek,
   onScrub,
 }: ReplayActionBarProps) {
@@ -188,12 +192,36 @@ export function ReplayActionBar({
               />
             </ActionMenu>
             <JumpToLatestAction ui={ui} viewport={viewport} />
+            <ActionMenu
+              align="end"
+              className="ml-auto"
+              panelClassName="!w-auto !min-w-28"
+              label="Bar interval"
+              disabled={disabled}
+              icon={
+                <span className="font-mono text-xs font-semibold tabular-nums">
+                  {projectionLabel(selectedProjection)}
+                </span>
+              }
+            >
+              {BAR_INTERVALS.map((spec) => (
+                <ActionMenuItem
+                  key={spec}
+                  icon={
+                    selectedProjection === spec ? (
+                      <Check aria-hidden="true" />
+                    ) : null
+                  }
+                  label={projectionLabel(spec)}
+                  onSelect={() => onProjection(spec)}
+                />
+              ))}
+            </ActionMenu>
             {/* Speed panel: the default 232px width dwarfs the short preset
             labels; !important because viewer-kit's stylesheet is unlayered
             and would otherwise win over the utility. */}
             <ActionMenu
               align="end"
-              className="ml-auto"
               panelClassName="!w-auto !min-w-24"
               label="Playback speed"
               disabled={disabled}
@@ -287,19 +315,12 @@ function TransportStatus({
 }
 
 function useDeliveryActivity(state: ProjectionDeliveryState): string | null {
-  const sustainedViewerLag = useSustained(
-    state === "viewer_lagging",
-    VIEWER_LAG_SUSTAIN_MS
-  )
   switch (state) {
     case "current":
-      return null
     case "projection_catching_up":
-      return "processing"
     case "delivery_pending":
-      return "loading chart"
     case "viewer_lagging":
-      return sustainedViewerLag ? "catching up" : null
+      return null
     case "resyncing":
       return "resyncing"
     case "disconnected_unknown":
@@ -307,22 +328,9 @@ function useDeliveryActivity(state: ProjectionDeliveryState): string | null {
   }
 }
 
-// Viewer delivery can trail a sampled server head briefly even during healthy
-// bounded-FPS playback. Surface it only when sustained; authoritative server
-// catch-up, resync, and connection states remain immediate.
-function useSustained(active: boolean, durationMs: number): boolean {
-  const [elapsed, setElapsed] = useState(false)
-  const [tracked, setTracked] = useState(active)
-  if (active !== tracked) {
-    setTracked(active)
-    if (!active) setElapsed(false)
-  }
-  useEffect(() => {
-    if (!active) return
-    const id = window.setTimeout(() => setElapsed(true), durationMs)
-    return () => window.clearTimeout(id)
-  }, [active, durationMs])
-  return active && elapsed
+function projectionLabel(spec: string): string {
+  const separator = spec.indexOf(":")
+  return separator === -1 ? spec : spec.slice(separator + 1)
 }
 
 function formatSpeed(speed: number): string {

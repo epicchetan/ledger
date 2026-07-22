@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use cache::{ArrayKey, Cache, CellDescriptor, CellKind, CellOwner, Key, ValueKey};
+#[cfg(test)]
+use cache::Cache;
+use cache::{ArrayKey, CellDescriptor, CellKind, CellOwner, Key, ValueKey};
 use runtime::{ComponentError, ComponentId, RuntimeTask, TaskContext, TaskDescriptor, TaskOutcome};
 
 use crate::feed::es_replay::{EsMboFeedBatch, EsReplayCells};
@@ -25,9 +27,17 @@ pub(crate) struct TradePrintCells {
 }
 
 impl TradePrintCells {
+    #[cfg(test)]
     fn register(cache: &Cache) -> Result<Self, LedgerError> {
+        Self::register_with(cache, 0)
+    }
+
+    fn register_with(
+        registrar: &impl super::ProjectionCellRegistrar,
+        epoch: u64,
+    ) -> Result<Self, LedgerError> {
         let owner = CellOwner::new(COMPONENT_ID)?;
-        let prints = cache.register_array::<TradePrint>(
+        let prints = registrar.register_array::<TradePrint>(
             descriptor(
                 "projection.trade_prints.prints",
                 owner.clone(),
@@ -35,9 +45,9 @@ impl TradePrintCells {
             )?,
             Vec::new(),
         )?;
-        let status = cache.register_value::<TradePrintStatus>(
+        let status = registrar.register_value::<TradePrintStatus>(
             descriptor("projection.trade_prints.status", owner, CellKind::Value)?,
-            None,
+            Some(empty_status(epoch)),
         )?;
         Ok(Self { prints, status })
     }
@@ -61,7 +71,16 @@ enum Fold {
 }
 
 impl CanonicalTradePrintsTask {
+    #[cfg(test)]
     fn new(feed: EsReplayCells, cells: TradePrintCells) -> Result<Self, LedgerError> {
+        Self::new_at_epoch(feed, cells, 0)
+    }
+
+    fn new_at_epoch(
+        feed: EsReplayCells,
+        cells: TradePrintCells,
+        epoch: u64,
+    ) -> Result<Self, LedgerError> {
         let component_id = ComponentId::new(COMPONENT_ID)
             .map_err(|error| LedgerError::ProjectionPlan(error.to_string()))?;
         let descriptor = TaskDescriptor::new(component_id, vec![feed.batches.key().clone()]);
@@ -69,7 +88,7 @@ impl CanonicalTradePrintsTask {
             descriptor,
             feed,
             cells,
-            epoch: 0,
+            epoch,
             processed_batches: 0,
             print_count: 0,
             revision: 0,
@@ -145,17 +164,28 @@ impl CanonicalTradePrintsTask {
 }
 
 pub(crate) fn install_trade_prints_projection(
-    cache: &Cache,
+    registrar: &impl super::ProjectionCellRegistrar,
     feed: EsReplayCells,
+    epoch: u64,
 ) -> Result<super::InstalledProjectionNode, LedgerError> {
-    let cells = TradePrintCells::register(cache)?;
-    let task = CanonicalTradePrintsTask::new(feed, cells.clone())?;
+    let cells = TradePrintCells::register_with(registrar, epoch)?;
+    let task = CanonicalTradePrintsTask::new_at_epoch(feed, cells.clone(), epoch)?;
     Ok(super::InstalledProjectionNode {
         node: super::ProjectionNodeSpec::CanonicalTradePrints,
         output: super::ProjectionOutput::TradePrints(cells),
         task: Box::new(task),
         delivery: None,
     })
+}
+
+fn empty_status(epoch: u64) -> TradePrintStatus {
+    TradePrintStatus {
+        epoch,
+        processed_batches: 0,
+        print_count: 0,
+        revision: 0,
+        last_ts_event_ns: None,
+    }
 }
 
 #[async_trait]
