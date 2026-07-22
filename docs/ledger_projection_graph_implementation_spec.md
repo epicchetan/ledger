@@ -11,6 +11,10 @@ Baseline: `531997e` (`Publish immutable viewer bundle`)
 > this document remain the baseline. See
 > `ledger_zero_origin_rebuild_implementation_spec.md`.
 
+> Follow-on behavior (2026-07-22): `ProjectionSpec::Bars` now supports time and
+> canonical-print-count bases while retaining this graph/dependency model. See
+> `ledger_tick_bars_implementation_spec.md`.
+
 ## 1. Purpose
 
 Formalize Ledger projections and their dependencies without introducing a

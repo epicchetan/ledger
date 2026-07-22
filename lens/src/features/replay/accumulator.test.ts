@@ -45,12 +45,27 @@ describe("BarsAccumulator rebuild lineage", () => {
       parseProjectionFrame({ ...frame(1, 0, [BAR]), reason: "seekFinal" })
     ).toBeNull()
   })
+
+  it("applies tick bars through the unchanged bars v1 client", () => {
+    const accumulator = new BarsAccumulator("bars:100t")
+    accumulator.beginSubscription("subscription-1", 7, false)
+    const tickBar = { ...BAR, intervalStartNs: "10", tradeCount: 100 }
+    const tickFrame = frame(1, 0, [tickBar], "bars:100t")
+
+    expect(parseProjectionFrame(tickFrame)).toEqual(tickFrame)
+    expect(accumulator.apply(tickFrame)).toMatchObject({ kind: "applied" })
+    expect(accumulator.getSnapshot()).toMatchObject({
+      spec: "bars:100t",
+      bars: [tickBar],
+    })
+  })
 })
 
 function frame(
   frameSequence: number,
   epoch: number,
-  bars: Bar[]
+  bars: Bar[],
+  spec = "bars:1m"
 ): BarsProjectionFrame {
   const head = {
     epoch,
@@ -61,7 +76,7 @@ function frame(
   return {
     subscriptionId: "subscription-1",
     sessionGeneration: 7,
-    spec: "bars:1m",
+    spec,
     kind: "bars",
     schemaVersion: 1,
     frameSequence,
@@ -73,7 +88,7 @@ function frame(
       bars,
       live: null,
       status: {
-        spec: "bars:1m",
+        spec,
         epoch,
         processedBatches: bars.length,
         completedBars: bars.length,

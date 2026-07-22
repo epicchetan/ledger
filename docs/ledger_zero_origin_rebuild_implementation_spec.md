@@ -6,6 +6,11 @@ Date: 2026-07-21
 
 Baseline: `9ff865b` (`Implement projection graph and delivery recovery`)
 
+> Follow-on behavior (2026-07-22): the mutable rebuild path now supports
+> tick-count bars through `bars:<n>t` without a new runtime or delivery schema.
+> The tick-bar exclusions below describe this phase's original boundary. See
+> `ledger_tick_bars_implementation_spec.md`.
+
 ## 1. Purpose
 
 Unify explicit seek and projection-set changes behind one deterministic Ledger

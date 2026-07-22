@@ -2477,7 +2477,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn projection_set_rebuilds_current_graph_and_unsubscribe_is_idempotent() {
+    async fn projection_set_rebuilds_time_to_tick_and_attach_preserves_session_state() {
         let mut fixture = remux_fixture();
         let raw_id = fabricate_prepared_day(&fixture.store, sample_events())
             .await
@@ -2491,6 +2491,7 @@ mod tests {
         .unwrap();
         let session_id = opened["sessionId"].as_str().unwrap().to_string();
         seek(&fixture.methods, &session_id, 3_500_000_000).await;
+        set_speed(&fixture.methods, &session_id, 5.0).await;
 
         let old_subscription = call(
             &fixture.methods,
@@ -2517,19 +2518,19 @@ mod tests {
         let changed = call(
             &fixture.methods,
             SESSION_PROJECTIONS_SET_METHOD,
-            json!({ "sessionId": session_id, "projections": ["bars:2s"] }),
+            json!({ "sessionId": session_id, "projections": ["bars:2t"] }),
         )
         .await
         .unwrap();
         assert_eq!(changed["sessionId"], session_id);
         assert_eq!(changed["changed"], true);
         assert_eq!(changed["epoch"], 2);
-        assert_eq!(changed["projections"][0]["spec"], "bars:2s");
+        assert_eq!(changed["projections"][0]["spec"], "bars:2t");
 
         let unchanged = call(
             &fixture.methods,
             SESSION_PROJECTIONS_SET_METHOD,
-            json!({ "sessionId": session_id, "projections": ["bars:02s"] }),
+            json!({ "sessionId": session_id, "projections": ["bars:02t"] }),
         )
         .await
         .unwrap();
@@ -2541,7 +2542,7 @@ mod tests {
             SESSION_PROJECTIONS_SET_METHOD,
             json!({
                 "sessionId": session_id,
-                "projections": ["bars:2s", "bars:02s"]
+                "projections": ["bars:2t", "bars:02t"]
             }),
         )
         .await
@@ -2560,7 +2561,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(attached["attached"], true);
-        assert_eq!(attached["session"]["projections"][0]["spec"], "bars:2s");
+        assert_eq!(attached["session"]["sessionId"], session_id);
+        assert_eq!(attached["session"]["projections"][0]["spec"], "bars:2t");
+        assert_eq!(attached["session"]["clock"]["mode"], "paused");
+        assert_eq!(attached["session"]["clock"]["speed"], 5.0);
 
         let old_pull = call(
             &fixture.methods,
@@ -2572,7 +2576,7 @@ mod tests {
         assert!(old_pull.message.contains("unknown projection spec"));
         let status = status(&fixture.methods, &session_id).await;
         assert_eq!(status["projections"].as_array().unwrap().len(), 1);
-        assert_eq!(status["projections"][0]["spec"], "bars:2s");
+        assert_eq!(status["projections"][0]["spec"], "bars:2t");
 
         let unsubscribed = call(
             &fixture.methods,
@@ -2621,7 +2625,7 @@ mod tests {
                 "sessionId": session_id,
                 "consumerInstanceId": "projection-change-new",
                 "projections": [{
-                    "spec": "bars:2s",
+                    "spec": "bars:2t",
                     "schemaVersions": [1],
                     "requestedMaxFps": 20,
                     "have": null
@@ -2637,13 +2641,16 @@ mod tests {
             SESSION_PROJECTION_FRAME_NOTIFICATION,
             |params| {
                 params["subscriptionId"].as_str() == Some(new_subscription_id)
-                    && params["spec"].as_str() == Some("bars:2s")
+                    && params["spec"].as_str() == Some("bars:2t")
                     && params["operation"].as_str() == Some("snapshot")
             },
         )
         .await;
         assert_eq!(frame["head"]["epoch"], changed["epoch"]);
-        assert_eq!(frame["head"]["completedBars"], 1);
+        assert_eq!(frame["head"]["completedBars"], 2);
+        assert_eq!(frame["payload"]["bars"][0]["tradeCount"], 2);
+        assert_eq!(frame["payload"]["bars"][1]["tradeCount"], 2);
+        assert_eq!(frame["payload"]["live"]["tradeCount"], 1);
     }
 
     #[tokio::test]

@@ -139,12 +139,8 @@ async fn one_and_five_minute_sources_deliver_independent_frames_from_one_session
         .projections(
             &feed,
             &[
-                ProjectionSpec::Bars(BarsParams {
-                    interval_ns: 60_000_000_000,
-                }),
-                ProjectionSpec::Bars(BarsParams {
-                    interval_ns: 5 * 60_000_000_000,
-                }),
+                ProjectionSpec::Bars(BarsParams::time(60_000_000_000)),
+                ProjectionSpec::Bars(BarsParams::time(5 * 60_000_000_000)),
             ],
         )
         .unwrap();
@@ -211,7 +207,7 @@ async fn one_and_five_minute_sources_deliver_independent_frames_from_one_session
 }
 
 #[tokio::test]
-async fn projection_set_rebuilds_in_place_and_reuses_removed_source_keys() {
+async fn time_tick_time_rebuilds_in_place_and_reuses_removed_source_keys() {
     let mut running = start_session().await;
     let session = &running.session;
     let events = &mut running.events;
@@ -219,18 +215,18 @@ async fn projection_set_rebuilds_in_place_and_reuses_removed_source_keys() {
     session.seek_to(350).await.unwrap();
 
     let changed = session
-        .set_projections(vec![ProjectionSpec::Bars(BarsParams { interval_ns: 200 })])
+        .set_projections(vec![ProjectionSpec::Bars(BarsParams::ticks(2))])
         .await
         .unwrap();
     assert!(changed.changed);
-    assert_eq!(changed.projections[0].canonical_spec(), "bars:200ns");
-    assert_eq!(session.projection_specs(), vec!["bars:200ns"]);
+    assert_eq!(changed.projections[0].canonical_spec(), "bars:2t");
+    assert_eq!(session.projection_specs(), vec!["bars:2t"]);
 
     let subscribed = delivery
         .subscribe(ProjectionSubscriptionRequest {
             consumer_instance_id: "consumer-replaced".to_string(),
             projections: vec![ProjectionSubscriptionProjectionRequest {
-                spec: "bars:200ns".to_string(),
+                spec: "bars:2t".to_string(),
                 schema_versions: vec![1],
                 requested_max_fps: Some(20),
                 have: None,
@@ -240,18 +236,18 @@ async fn projection_set_rebuilds_in_place_and_reuses_removed_source_keys() {
         .unwrap();
     let frame = next_frame(events, &subscribed.subscription_id).await;
     assert_eq!(frame.operation, ProjectionFrameOperation::Snapshot);
-    assert_eq!(bars_len(&frame.payload), 1);
+    assert_eq!(bars_len(&frame.payload), 2);
     assert_eq!(position_epoch(&frame.head), changed.epoch);
 
     let unchanged = session
-        .set_projections(vec![ProjectionSpec::Bars(BarsParams { interval_ns: 200 })])
+        .set_projections(vec![ProjectionSpec::Bars(BarsParams::ticks(2))])
         .await
         .unwrap();
     assert!(!unchanged.changed);
     assert_eq!(unchanged.epoch, changed.epoch);
 
     let restored = session
-        .set_projections(vec![ProjectionSpec::Bars(BarsParams { interval_ns: 100 })])
+        .set_projections(vec![ProjectionSpec::Bars(BarsParams::time(100))])
         .await
         .unwrap();
     assert!(restored.changed);
@@ -286,7 +282,7 @@ async fn session_with_an_empty_initial_graph_can_install_its_first_projection() 
     let mut events = session.take_projection_events().unwrap();
 
     let changed = session
-        .set_projections(vec![ProjectionSpec::Bars(BarsParams { interval_ns: 100 })])
+        .set_projections(vec![ProjectionSpec::Bars(BarsParams::time(100))])
         .await
         .unwrap();
     assert!(changed.changed);
@@ -510,10 +506,7 @@ async fn start_session() -> RunningDeliverySession {
     let mut builder = LedgerSessionBuilder::new(fixture.store.clone()).unwrap();
     let feed = builder.es_replay(raw_id).unwrap();
     builder
-        .projections(
-            &feed,
-            &[ProjectionSpec::Bars(BarsParams { interval_ns: 100 })],
-        )
+        .projections(&feed, &[ProjectionSpec::Bars(BarsParams::time(100))])
         .unwrap();
     let session = builder.start().await.unwrap();
     let events = session

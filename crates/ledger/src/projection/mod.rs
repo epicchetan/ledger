@@ -109,7 +109,7 @@ impl ProjectionSpec {
         let digits = &interval[..digit_end];
         let unit = &interval[digit_end..];
         if unit.len() != 1 {
-            return Err(invalid_spec(spec, "interval unit must be s, m, or h"));
+            return Err(invalid_spec(spec, "bar unit must be s, m, h, or t"));
         }
 
         let value = digits
@@ -122,17 +122,21 @@ impl ProjectionSpec {
             ));
         }
 
+        if unit == "t" {
+            return Ok(Self::Bars(BarsParams::ticks(value)));
+        }
+
         let unit_ns = match unit {
             "s" => bars::SECOND_NS,
             "m" => bars::MINUTE_NS,
             "h" => bars::HOUR_NS,
-            _ => return Err(invalid_spec(spec, "interval unit must be s, m, or h")),
+            _ => return Err(invalid_spec(spec, "bar unit must be s, m, h, or t")),
         };
         let interval_ns = value
             .checked_mul(unit_ns)
             .ok_or_else(|| invalid_spec(spec, "interval is too large"))?;
 
-        Ok(Self::Bars(BarsParams { interval_ns }))
+        Ok(Self::Bars(BarsParams::time(interval_ns)))
     }
 
     /// Canonical form, e.g. "bars:1m". Parsing the canonical form yields
@@ -410,7 +414,7 @@ mod tests {
     use super::*;
 
     fn bars(interval_ns: u64) -> ProjectionSpec {
-        ProjectionSpec::Bars(BarsParams { interval_ns })
+        ProjectionSpec::Bars(BarsParams::time(interval_ns))
     }
 
     #[test]
@@ -426,12 +430,25 @@ mod tests {
             plan.nodes(),
             &[
                 ProjectionNodeSpec::CanonicalTradePrints,
-                ProjectionNodeSpec::Bars(BarsParams {
-                    interval_ns: MINUTE_NS,
-                }),
-                ProjectionNodeSpec::Bars(BarsParams {
-                    interval_ns: 5 * MINUTE_NS,
-                }),
+                ProjectionNodeSpec::Bars(BarsParams::time(MINUTE_NS)),
+                ProjectionNodeSpec::Bars(BarsParams::time(5 * MINUTE_NS)),
+            ]
+        );
+    }
+
+    #[test]
+    fn time_and_tick_bars_share_one_trade_print_dependency() {
+        let plan = ProjectionPlan::resolve(&[
+            bars(MINUTE_NS),
+            ProjectionSpec::Bars(BarsParams::ticks(500)),
+        ])
+        .unwrap();
+        assert_eq!(
+            plan.nodes(),
+            &[
+                ProjectionNodeSpec::CanonicalTradePrints,
+                ProjectionNodeSpec::Bars(BarsParams::time(MINUTE_NS)),
+                ProjectionNodeSpec::Bars(BarsParams::ticks(500)),
             ]
         );
     }

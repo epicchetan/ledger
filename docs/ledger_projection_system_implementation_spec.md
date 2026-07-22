@@ -1,5 +1,9 @@
 # Ledger Projection System Implementation Spec
 
+> Follow-on behavior (2026-07-22): bars now aggregate by time or canonical
+> print count through the formal projection graph. See
+> `ledger_tick_bars_implementation_spec.md`.
+
 ## Purpose
 
 Introduce projections: typed, session-scoped computations that fold feed

@@ -17,6 +17,7 @@ import {
   type ReplayViewportSnapshot,
 } from "@/features/replay/chart/viewport-store"
 import { ReplayActionBar } from "@/features/replay/replay-action-bar"
+import { projectionLabel } from "@/features/replay/projection-spec"
 import { REPLAY_RESOURCE_KIND, replayResourceId } from "@/features/replay/route"
 import type { SessionClosedReason } from "@/features/replay/types"
 import { useReplaySession } from "@/features/replay/use-replay-session"
@@ -233,11 +234,6 @@ export function Replay({
       />
     </div>
   )
-}
-
-function projectionLabel(spec: string): string {
-  const separator = spec.indexOf(":")
-  return separator === -1 ? spec : spec.slice(separator + 1)
 }
 
 // The terminal "session ended" banner. Floats over the chart (positioned by the

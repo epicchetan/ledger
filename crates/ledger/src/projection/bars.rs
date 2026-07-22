@@ -13,13 +13,36 @@ const REBUILD_CHUNK_PRINTS: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BarsParams {
-    /// Bar interval in nanoseconds. Always > 0.
-    pub interval_ns: u64,
+    pub basis: BarsBasis,
+}
+
+impl BarsParams {
+    pub const fn time(interval_ns: u64) -> Self {
+        Self {
+            basis: BarsBasis::Time { interval_ns },
+        }
+    }
+
+    pub const fn ticks(prints_per_bar: u64) -> Self {
+        Self {
+            basis: BarsBasis::Ticks { prints_per_bar },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BarsBasis {
+    /// Time bucket width in nanoseconds. Always > 0 after validation.
+    Time { interval_ns: u64 },
+    /// Number of canonical trade prints in each completed bar. Always > 0
+    /// after validation. Print size contributes volume, not tick count.
+    Ticks { prints_per_bar: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bar {
-    /// Bucket start: ts_event_ns - (ts_event_ns % interval_ns).
+    /// Projection-defined time anchor. Time bars use their aligned bucket
+    /// start; tick bars use the timestamp of their first canonical print.
     pub interval_start_ns: UnixNanos,
     pub open: PriceTicks,
     pub high: PriceTicks,
@@ -177,7 +200,17 @@ impl BarsTask {
     }
 
     fn fold_print(&mut self, print: TradePrint, completed: &mut Vec<Bar>) {
-        let bucket = print.ts_event_ns - (print.ts_event_ns % self.params.interval_ns);
+        match self.params.basis {
+            BarsBasis::Time { interval_ns } => self.fold_time_print(print, interval_ns, completed),
+            BarsBasis::Ticks { prints_per_bar } => {
+                self.fold_tick_print(print, prints_per_bar, completed)
+            }
+        }
+        self.last_print_ts = Some(print.ts_event_ns);
+    }
+
+    fn fold_time_print(&mut self, print: TradePrint, interval_ns: u64, completed: &mut Vec<Bar>) {
+        let bucket = print.ts_event_ns - (print.ts_event_ns % interval_ns);
         match self.live.take() {
             None => {
                 self.live = Some(new_bar(print, bucket));
@@ -195,7 +228,26 @@ impl BarsTask {
                 self.live = Some(bar);
             }
         }
-        self.last_print_ts = Some(print.ts_event_ns);
+    }
+
+    fn fold_tick_print(
+        &mut self,
+        print: TradePrint,
+        prints_per_bar: u64,
+        completed: &mut Vec<Bar>,
+    ) {
+        let bar = match self.live.take() {
+            Some(mut bar) => {
+                fold_print_into_bar(&mut bar, print);
+                bar
+            }
+            None => new_bar(print, print.ts_event_ns),
+        };
+        if bar.trade_count == prints_per_bar {
+            completed.push(bar);
+        } else {
+            self.live = Some(bar);
+        }
     }
 
     async fn run_rebuild_step(
@@ -360,23 +412,36 @@ fn empty_status(spec: String, epoch: u64) -> BarsStatus {
 }
 
 pub fn canonical_spec(params: BarsParams) -> String {
-    if params.interval_ns.is_multiple_of(HOUR_NS) {
-        format!("bars:{}h", params.interval_ns / HOUR_NS)
-    } else if params.interval_ns.is_multiple_of(MINUTE_NS) {
-        format!("bars:{}m", params.interval_ns / MINUTE_NS)
-    } else if params.interval_ns.is_multiple_of(SECOND_NS) {
-        format!("bars:{}s", params.interval_ns / SECOND_NS)
-    } else {
-        format!("bars:{}ns", params.interval_ns)
+    match params.basis {
+        BarsBasis::Time { interval_ns } if interval_ns.is_multiple_of(HOUR_NS) => {
+            format!("bars:{}h", interval_ns / HOUR_NS)
+        }
+        BarsBasis::Time { interval_ns } if interval_ns.is_multiple_of(MINUTE_NS) => {
+            format!("bars:{}m", interval_ns / MINUTE_NS)
+        }
+        BarsBasis::Time { interval_ns } if interval_ns.is_multiple_of(SECOND_NS) => {
+            format!("bars:{}s", interval_ns / SECOND_NS)
+        }
+        BarsBasis::Time { interval_ns } => format!("bars:{interval_ns}ns"),
+        BarsBasis::Ticks { prints_per_bar } => format!("bars:{prints_per_bar}t"),
     }
 }
 
 fn validate_params(params: BarsParams) -> Result<(), LedgerError> {
-    if params.interval_ns == 0 {
-        return Err(LedgerError::InvalidProjectionSpec {
-            spec: "bars:0ns".to_string(),
-            reason: "interval value must be greater than zero".to_string(),
-        });
+    match params.basis {
+        BarsBasis::Time { interval_ns: 0 } => {
+            return Err(LedgerError::InvalidProjectionSpec {
+                spec: "bars:0ns".to_string(),
+                reason: "interval value must be greater than zero".to_string(),
+            });
+        }
+        BarsBasis::Ticks { prints_per_bar: 0 } => {
+            return Err(LedgerError::InvalidProjectionSpec {
+                spec: "bars:0t".to_string(),
+                reason: "tick count must be greater than zero".to_string(),
+            });
+        }
+        BarsBasis::Time { .. } | BarsBasis::Ticks { .. } => {}
     }
     Ok(())
 }

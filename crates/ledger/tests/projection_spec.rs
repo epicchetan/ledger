@@ -1,7 +1,7 @@
 mod support;
 
 use ledger::market::{canonical_trade_print, BookAction, BookSide, PriceTicks, TradePrint};
-use ledger::projection::{BarsParams, ProjectionSpec};
+use ledger::projection::{BarsBasis, BarsParams, ProjectionSpec};
 use ledger::LedgerError;
 
 use support::{event, trade};
@@ -10,27 +10,35 @@ use support::{event, trade};
 fn parse_accepts_bars_intervals() {
     assert_eq!(
         ProjectionSpec::parse("bars:1s").unwrap(),
-        ProjectionSpec::Bars(BarsParams {
-            interval_ns: 1_000_000_000
-        })
+        ProjectionSpec::Bars(BarsParams::time(1_000_000_000))
     );
     assert_eq!(
         ProjectionSpec::parse("bars:5m").unwrap(),
-        ProjectionSpec::Bars(BarsParams {
-            interval_ns: 5 * 60 * 1_000_000_000
-        })
+        ProjectionSpec::Bars(BarsParams::time(5 * 60 * 1_000_000_000))
     );
     assert_eq!(
         ProjectionSpec::parse("bars:2h").unwrap(),
-        ProjectionSpec::Bars(BarsParams {
-            interval_ns: 2 * 60 * 60 * 1_000_000_000
-        })
+        ProjectionSpec::Bars(BarsParams::time(2 * 60 * 60 * 1_000_000_000))
     );
     assert_eq!(
         ProjectionSpec::parse("bars:90s").unwrap(),
+        ProjectionSpec::Bars(BarsParams::time(90 * 1_000_000_000))
+    );
+}
+
+#[test]
+fn parse_accepts_and_canonicalizes_tick_bars() {
+    assert_eq!(
+        ProjectionSpec::parse("bars:100t").unwrap(),
         ProjectionSpec::Bars(BarsParams {
-            interval_ns: 90 * 1_000_000_000
+            basis: BarsBasis::Ticks {
+                prints_per_bar: 100,
+            },
         })
+    );
+    assert_eq!(
+        ProjectionSpec::parse("bars:0500t").unwrap().canonical(),
+        "bars:500t"
     );
 }
 
@@ -53,7 +61,17 @@ fn parse_canonicalizes_equal_intervals() {
 #[test]
 fn parse_rejects_invalid_projection_specs() {
     for spec in [
-        "bars", "bars:", "bars:0s", "bars:1x", "bars:m", "foo:1m", "BARS:1M",
+        "bars",
+        "bars:",
+        "bars:0s",
+        "bars:0t",
+        "bars:-1t",
+        "bars:1.5t",
+        "bars:t",
+        "bars:1x",
+        "bars:m",
+        "foo:1m",
+        "BARS:1M",
     ] {
         assert!(
             matches!(

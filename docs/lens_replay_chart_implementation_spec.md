@@ -4,6 +4,10 @@
 > bars spec and offers 1m/5m/15m/1h replacement without full bars hydration.
 > See `ledger_zero_origin_rebuild_implementation_spec.md`.
 
+> Follow-on behavior (2026-07-22): the selector now has Bars/Ticks columns,
+> tick specs reuse bars:v1 accumulators, and the chart disambiguates colliding
+> event-time anchors. See `ledger_tick_bars_implementation_spec.md`.
+
 Implements the chart phase of `docs/lens_replay_view_design.md`: the
 `lightweight-charts` surface, the layer registry, the bars base layer
 (candles + volume, live bar, epoch reset), and spec tabs. Pure lens work on

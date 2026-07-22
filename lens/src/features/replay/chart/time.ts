@@ -4,10 +4,31 @@
 // standard lightweight-charts timezone approach — so labels read as ET and
 // agree with the action bar's clock readout.
 
-// Interval starts are whole seconds; BigInt division is exact and avoids the
-// 2^53 hazard of the raw ns value.
+// Session/time-bucket boundaries use whole seconds here; BigInt division is
+// exact and avoids the 2^53 hazard of the raw ns value. Event-anchored tick
+// bars use nextBarChartTime below so sub-second ordering is retained.
 export function nsToSeconds(ns: string): number {
   return Number(BigInt(ns) / 1_000_000_000n)
+}
+
+// Candlestick time keys must be strictly increasing. Tick bars can share an
+// anchor second (or even an exact event timestamp), so retain microsecond
+// precision and deterministically advance collisions. The epsilon is display
+// only; exact nanosecond timestamps remain on the Bar payload.
+const CHART_TIME_EPSILON_SECONDS = 0.000001
+
+export function nextBarChartTime(
+  anchorNs: string,
+  previous: number | null,
+  offsetSeconds: number
+): number {
+  const ns = BigInt(anchorNs)
+  const wholeSeconds = ns / 1_000_000_000n
+  const microseconds = (ns % 1_000_000_000n) / 1_000n
+  const anchored =
+    Number(wholeSeconds) + Number(microseconds) / 1_000_000 + offsetSeconds
+  if (previous === null || anchored > previous) return anchored
+  return previous + CHART_TIME_EPSILON_SECONDS
 }
 
 // ET's UTC offset at a given instant, in seconds (−18000 EST / −14400 EDT).

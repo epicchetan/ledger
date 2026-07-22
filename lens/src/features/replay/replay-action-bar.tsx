@@ -27,6 +27,12 @@ import type {
   ProjectionDeliveryState,
 } from "@/features/replay/types"
 import {
+  projectionLabel,
+  projectionMenuLabel,
+  TICK_BAR_SPECS,
+  TIME_BAR_SPECS,
+} from "@/features/replay/projection-spec"
+import {
   formatEtTime,
   nsToMs,
   useSessionNowMs,
@@ -34,7 +40,6 @@ import {
 
 // The wire takes any positive float; these are the surfaced presets.
 const SPEED_PRESETS = [1, 2, 5, 10, 25, 100]
-const BAR_INTERVALS = ["bars:1m", "bars:5m", "bars:15m", "bars:1h"] as const
 
 interface ReplayActionBarProps {
   ui: ReplayChartUiStore
@@ -194,9 +199,10 @@ export function ReplayActionBar({
             <JumpToLatestAction ui={ui} viewport={viewport} />
             <ActionMenu
               align="end"
-              className="ml-auto"
-              panelClassName="!w-auto !min-w-28"
-              label="Bar interval"
+              className="lens-action-value-menu ml-auto"
+              panelClassName="!w-56"
+              triggerClassName="lens-action-value-trigger"
+              label="Bar type and interval"
               disabled={disabled}
               icon={
                 <span className="font-mono text-xs font-semibold tabular-nums">
@@ -204,25 +210,31 @@ export function ReplayActionBar({
                 </span>
               }
             >
-              {BAR_INTERVALS.map((spec) => (
-                <ActionMenuItem
-                  key={spec}
-                  icon={
-                    selectedProjection === spec ? (
-                      <Check aria-hidden="true" />
-                    ) : null
-                  }
-                  label={projectionLabel(spec)}
-                  onSelect={() => onProjection(spec)}
+              <div className="grid grid-cols-2 gap-1">
+                <ProjectionMenuColumn
+                  heading="Bars"
+                  ariaLabel="Time bars"
+                  specs={TIME_BAR_SPECS}
+                  selectedProjection={selectedProjection}
+                  onProjection={onProjection}
                 />
-              ))}
+                <ProjectionMenuColumn
+                  heading="Ticks"
+                  ariaLabel="Tick bars"
+                  specs={TICK_BAR_SPECS}
+                  selectedProjection={selectedProjection}
+                  onProjection={onProjection}
+                />
+              </div>
             </ActionMenu>
             {/* Speed panel: the default 232px width dwarfs the short preset
             labels; !important because viewer-kit's stylesheet is unlayered
             and would otherwise win over the utility. */}
             <ActionMenu
               align="end"
+              className="lens-action-value-menu"
               panelClassName="!w-auto !min-w-24"
+              triggerClassName="lens-action-value-trigger"
               label="Playback speed"
               disabled={disabled}
               icon={
@@ -265,6 +277,42 @@ export function ReplayActionBar({
         </div>
       }
     />
+  )
+}
+
+function ProjectionMenuColumn({
+  heading,
+  ariaLabel,
+  specs,
+  selectedProjection,
+  onProjection,
+}: {
+  heading: string
+  ariaLabel: string
+  specs: readonly string[]
+  selectedProjection: string
+  onProjection: (spec: string) => void
+}) {
+  return (
+    <div
+      className="grid min-w-0 content-start gap-0.5"
+      role="group"
+      aria-label={ariaLabel}
+    >
+      <div className="px-2 py-1 text-[10px] font-semibold tracking-wider text-muted-foreground uppercase">
+        {heading}
+      </div>
+      {specs.map((spec) => (
+        <ActionMenuItem
+          key={spec}
+          icon={
+            selectedProjection === spec ? <Check aria-hidden="true" /> : null
+          }
+          label={projectionMenuLabel(spec)}
+          onSelect={() => onProjection(spec)}
+        />
+      ))}
+    </div>
   )
 }
 
@@ -326,11 +374,6 @@ function useDeliveryActivity(state: ProjectionDeliveryState): string | null {
     case "disconnected_unknown":
       return "reconnecting"
   }
-}
-
-function projectionLabel(spec: string): string {
-  const separator = spec.indexOf(":")
-  return separator === -1 ? spec : spec.slice(separator + 1)
 }
 
 function formatSpeed(speed: number): string {

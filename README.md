@@ -314,6 +314,7 @@ Lens Charts tab over Session WebSocket
 owner-executed atomic multi-cell snapshots
 projection-owned bounded-FPS delivery independent of replay computation
 validated viewer base/head acknowledgments and targeted Remux streams
+mutable time- and tick-bar projections over shared canonical trade prints
 local ReplayDataset cache
 study graph vision and phased implementation plan
 ```
@@ -348,6 +349,7 @@ Detailed planning:
 
 ```text
 docs/vision.md
+docs/ledger_tick_bars_implementation_spec.md
 docs/ledger_zero_origin_rebuild_implementation_spec.md
 docs/atomic_snapshot_projection_delivery_implementation_spec.md
 docs/ledger_projection_system_implementation_spec.md

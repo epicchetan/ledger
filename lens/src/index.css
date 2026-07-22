@@ -82,3 +82,24 @@
 .lens-action-bar .remux-extension-action-group-right:empty {
   display: none;
 }
+
+/* Viewer-kit action buttons are square by default. Icon buttons keep that
+ * 39px width, but value-bearing menu triggers must use their full label width
+ * plus a stable inset. max-content is intentional: fit-content can still
+ * shrink during the action row's intrinsic flex/grid sizing pass. */
+.lens-action-bar .remux-extension-action-button {
+  flex: 0 0 auto;
+}
+
+.lens-action-value-menu {
+  width: max-content;
+  min-width: 39px;
+  flex: 0 0 auto;
+}
+
+.remux-extension-action-button.lens-action-value-trigger {
+  width: max-content;
+  min-width: 39px;
+  padding-inline: 12px;
+  white-space: nowrap;
+}

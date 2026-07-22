@@ -14,7 +14,10 @@ import type {
   LayerContext,
   LayerFactory,
 } from "@/features/replay/chart/layers"
-import { intervalSecondsOf, nsToSeconds } from "@/features/replay/chart/time"
+import {
+  intervalSecondsOf,
+  nextBarChartTime,
+} from "@/features/replay/chart/time"
 import {
   centeredTimeViewport,
   defaultTimeViewport,
@@ -23,6 +26,7 @@ import {
   timeRangeForViewport,
 } from "@/features/replay/chart/viewport-policy"
 import type { TimeViewport } from "@/features/replay/chart/viewport-store"
+import { isTickBarsSpec } from "@/features/replay/projection-spec"
 import { TICK_SIZE, type Bar } from "@/features/replay/types"
 
 // Above this many appended bars in one publish, a single setData of the caches
@@ -74,10 +78,12 @@ class BarsLayer implements ChartLayer {
       priceLineStyle: LineStyle.Dashed,
       priceLineColor: colors.priceLine,
     })
-    // The 1s tab shows seconds on the axis; 1m and coarser don't.
+    // Tick bars are event-anchored and can begin at any second; the 1s time
+    // interval also needs seconds, while 1m and coarser time bars do not.
     chart.timeScale().applyOptions({
       timeVisible: true,
-      secondsVisible: (intervalSecondsOf(spec) ?? 60) < 60,
+      secondsVisible:
+        isTickBarsSpec(spec) || (intervalSecondsOf(spec) ?? 60) < 60,
     })
     chart.timeScale().subscribeVisibleLogicalRangeChange(this.onRangeChange)
 
@@ -162,11 +168,14 @@ class BarsLayer implements ChartLayer {
       this.append(snap)
     }
 
-    // Live bar last, always: same interval start ⇒ same time key ⇒ the forming
-    // candle is replaced in place. Never cached — a setData that dropped it is
-    // repaired within this same publish.
+    // Live bar last, always. Its display key is derived against the same
+    // completed tail on every update, so the forming candle is replaced in
+    // place even when its event anchor collides with the previous tick bar.
+    // Never cached — a setData that dropped it is repaired in this publish.
     if (snap.live) {
-      this.candles.update(this.toCandle(snap.live))
+      this.candles.update(
+        this.toCandle(snap.live, this.lastCompletedChartTime())
+      )
     }
   }
 
@@ -177,7 +186,13 @@ class BarsLayer implements ChartLayer {
     const previousEpoch = this.epoch
     this.epoch = snap.epoch
     this.sourceBars = snap.bars
-    this.candleData = snap.bars.map((bar) => this.toCandle(bar))
+    this.candleData = []
+    let previousTime: number | null = null
+    for (const bar of snap.bars) {
+      const candle = this.toCandle(bar, previousTime)
+      this.candleData.push(candle)
+      previousTime = candle.time as number
+    }
     this.candles.setData(this.candleData)
     if (recenter) {
       const n = snap.bars.length + (snap.live ? 1 : 0)
@@ -198,9 +213,11 @@ class BarsLayer implements ChartLayer {
     const k = snap.bars.length - prevCount
 
     const perBar = k <= APPEND_UPDATE_MAX
+    let previousTime = this.lastCompletedChartTime()
     for (let i = prevCount; i < snap.bars.length; i++) {
-      const candle = this.toCandle(snap.bars[i])
+      const candle = this.toCandle(snap.bars[i], previousTime)
       this.candleData.push(candle)
+      previousTime = candle.time as number
       if (perBar) {
         this.candles.update(candle)
       }
@@ -338,14 +355,17 @@ class BarsLayer implements ChartLayer {
     })
   }
 
-  private timeOf(bar: Bar): UTCTimestamp {
-    return (nsToSeconds(bar.intervalStartNs) +
-      this.ctx.offsetSeconds) as UTCTimestamp
+  private lastCompletedChartTime(): number | null {
+    return (this.candleData.at(-1)?.time as number | undefined) ?? null
   }
 
-  private toCandle(bar: Bar): CandlestickData {
+  private toCandle(bar: Bar, previousTime: number | null): CandlestickData {
     return {
-      time: this.timeOf(bar),
+      time: nextBarChartTime(
+        bar.intervalStartNs,
+        previousTime,
+        this.ctx.offsetSeconds
+      ) as UTCTimestamp,
       open: bar.open * TICK_SIZE,
       high: bar.high * TICK_SIZE,
       low: bar.low * TICK_SIZE,

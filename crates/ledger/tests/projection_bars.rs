@@ -125,6 +125,79 @@ async fn bars_aggregate_ohlc_volume_delta_and_counts_across_bucket_boundaries() 
 }
 
 #[tokio::test]
+async fn tick_bars_complete_on_canonical_print_count_boundaries() {
+    let events = generated_trades(101);
+    let mut running =
+        RunningBarsSession::start_with_params(events.clone(), BarsParams::ticks(100)).await;
+
+    let cursor = running
+        .seek_and_wait(99, |cursor| cursor.batch_idx == 99)
+        .await;
+    running.wait_caught_up(&cursor).await;
+    let (bars, live) = running.snapshot();
+    assert!(bars.is_empty());
+    assert_eq!(live.unwrap().trade_count, 99);
+
+    let cursor = running
+        .seek_and_wait(100, |cursor| cursor.batch_idx == 100)
+        .await;
+    let status = running.wait_caught_up(&cursor).await;
+    let (bars, live) = running.snapshot();
+    assert_eq!(status.completed_bars, 1);
+    assert_eq!(bars, reference_tick_bars(&events[..100], 100).0);
+    assert_eq!(bars[0].interval_start_ns, 1);
+    assert_eq!(bars[0].trade_count, 100);
+    assert!(live.is_none());
+
+    let cursor = running.seek_and_wait(101, |cursor| cursor.ended).await;
+    running.wait_caught_up(&cursor).await;
+    assert_eq!(running.snapshot(), reference_tick_bars(&events, 100));
+    assert_eq!(running.snapshot().1.unwrap().trade_count, 1);
+
+    running.shutdown().await;
+}
+
+#[tokio::test]
+async fn tick_count_uses_prints_while_size_still_drives_volume() {
+    let events = vec![
+        action_event(5, 1, BookAction::Add),
+        trade(10, 2, 100, 40, Some(BookSide::Bid)),
+        action_event(15, 3, BookAction::Fill),
+        trade(20, 4, 105, 60, Some(BookSide::Ask)),
+        trade(30, 5, 99, 7, None),
+    ];
+    let mut running = RunningBarsSession::start_with_params(events, BarsParams::ticks(2)).await;
+
+    let cursor = running.seek_and_wait(30, |cursor| cursor.ended).await;
+    running.wait_caught_up(&cursor).await;
+    let (bars, live) = running.snapshot();
+
+    assert_eq!(bars.len(), 1);
+    assert_eq!(
+        bars[0],
+        Bar {
+            interval_start_ns: 10,
+            open: PriceTicks(100),
+            high: PriceTicks(105),
+            low: PriceTicks(100),
+            close: PriceTicks(105),
+            volume: 100,
+            buy_volume: 40,
+            sell_volume: 60,
+            trade_count: 2,
+            first_ts_event_ns: 10,
+            last_ts_event_ns: 20,
+        }
+    );
+    let live = live.unwrap();
+    assert_eq!(live.interval_start_ns, 30);
+    assert_eq!(live.trade_count, 1);
+    assert_eq!(live.volume, 7);
+
+    running.shutdown().await;
+}
+
+#[tokio::test]
 async fn non_print_events_and_fill_contribute_nothing() {
     let mut running = RunningBarsSession::start(vec![
         action_event(10, 1, BookAction::Add),
@@ -180,19 +253,15 @@ async fn one_minute_graph_matches_direct_raw_event_reference_before_and_after_re
         action_event(70_000_000_000, 5, BookAction::Fill),
         trade(301_000_000_000, 6, 18_010, 7, Some(BookSide::Bid)),
     ];
-    let params = BarsParams {
-        interval_ns: 60_000_000_000,
-    };
+    let interval_ns = 60_000_000_000;
+    let params = BarsParams::time(interval_ns);
     let mut running = RunningBarsSession::start_with_params(events.clone(), params).await;
 
     let end_cursor = running
         .seek_and_wait(301_000_000_000, |cursor| cursor.ended)
         .await;
     running.wait_caught_up(&end_cursor).await;
-    assert_eq!(
-        running.snapshot(),
-        reference_bars(&events, params.interval_ns)
-    );
+    assert_eq!(running.snapshot(), reference_bars(&events, interval_ns));
 
     let backward_cursor = running
         .seek_and_wait(65_000_000_000, |cursor| {
@@ -202,17 +271,14 @@ async fn one_minute_graph_matches_direct_raw_event_reference_before_and_after_re
     running.wait_caught_up(&backward_cursor).await;
     assert_eq!(
         running.snapshot(),
-        reference_bars(&events[..4], params.interval_ns)
+        reference_bars(&events[..4], interval_ns)
     );
 
     let end_cursor = running
         .seek_and_wait(301_000_000_000, |cursor| cursor.ended)
         .await;
     running.wait_caught_up(&end_cursor).await;
-    assert_eq!(
-        running.snapshot(),
-        reference_bars(&events, params.interval_ns)
-    );
+    assert_eq!(running.snapshot(), reference_bars(&events, interval_ns));
 
     running.shutdown().await;
 }
@@ -402,6 +468,38 @@ async fn rebuild_over_multiple_chunks_matches_fresh_fold_to_same_target() {
 }
 
 #[tokio::test]
+async fn tick_bar_grouping_is_independent_of_runtime_rebuild_chunks() {
+    let target = TEST_REBUILD_CHUNK_BATCHES * 2 + 25;
+    let events = generated_trades(target + 100);
+    let params = BarsParams::ticks(100);
+    let mut rebuilt = RunningBarsSession::start_with_params(events.clone(), params).await;
+
+    let end_cursor = rebuilt
+        .seek_and_wait(events.len() as u64, |cursor| cursor.ended)
+        .await;
+    rebuilt.wait_caught_up(&end_cursor).await;
+    let cursor = rebuilt
+        .seek_and_wait(target as u64, |cursor| {
+            cursor.epoch == 2 && cursor.batch_idx == target
+        })
+        .await;
+    rebuilt.wait_caught_up(&cursor).await;
+
+    let expected = reference_tick_bars(&events[..target], 100);
+    assert_eq!(rebuilt.snapshot(), expected);
+
+    let mut fresh = RunningBarsSession::start_with_params(events, params).await;
+    let fresh_cursor = fresh
+        .seek_and_wait(target as u64, |cursor| cursor.batch_idx == target)
+        .await;
+    fresh.wait_caught_up(&fresh_cursor).await;
+    assert_eq!(rebuilt.snapshot(), fresh.snapshot());
+
+    rebuilt.shutdown().await;
+    fresh.shutdown().await;
+}
+
+#[tokio::test]
 async fn epoch_change_mid_rebuild_restarts_and_keeps_newest_epoch() {
     let target = TEST_REBUILD_CHUNK_BATCHES * 8 + 25;
     let final_target = 50usize;
@@ -452,7 +550,7 @@ async fn epoch_change_mid_rebuild_restarts_and_keeps_newest_epoch() {
 }
 
 #[tokio::test]
-async fn one_and_five_minute_bars_share_one_canonical_stream_and_both_catch_up() {
+async fn time_and_tick_bars_share_one_canonical_stream_and_all_catch_up() {
     let events = vec![
         trade(100, 1, 100, 1, Some(BookSide::Bid)),
         trade(61_000_000_000, 3, 102, 3, Some(BookSide::Bid)),
@@ -466,22 +564,21 @@ async fn one_and_five_minute_bars_share_one_canonical_stream_and_both_catch_up()
         .projections(
             &feed,
             &[
-                ProjectionSpec::Bars(BarsParams {
-                    interval_ns: 60_000_000_000,
-                }),
-                ProjectionSpec::Bars(BarsParams {
-                    interval_ns: 5 * 60_000_000_000,
-                }),
+                ProjectionSpec::Bars(BarsParams::time(60_000_000_000)),
+                ProjectionSpec::Bars(BarsParams::time(5 * 60_000_000_000)),
+                ProjectionSpec::Bars(BarsParams::ticks(2)),
             ],
         )
         .unwrap()
         .into_iter();
     let one_minute = projections.next().unwrap().into_bars().1;
     let five_minute = projections.next().unwrap().into_bars().1;
+    let two_tick = projections.next().unwrap().into_bars().1;
     let session = timeout(WAKE, builder.start()).await.unwrap().unwrap();
     let mut cursor_watch = session.cache().watch_key(feed.cursor.key()).unwrap();
     let mut one_minute_watch = session.cache().watch_key(one_minute.status.key()).unwrap();
     let mut five_minute_watch = session.cache().watch_key(five_minute.status.key()).unwrap();
+    let mut two_tick_watch = session.cache().watch_key(two_tick.status.key()).unwrap();
     wait_for_cursor(session.cache(), &mut cursor_watch, &feed, |cursor| {
         cursor.feed_seq == 0
     })
@@ -501,9 +598,12 @@ async fn one_and_five_minute_bars_share_one_canonical_stream_and_both_catch_up()
         &cursor,
     )
     .await;
+    let two_tick_status =
+        wait_for_catch_up(session.cache(), &mut two_tick_watch, &two_tick, &cursor).await;
 
     assert_eq!(one_minute_status.processed_batches, cursor.batch_idx);
     assert_eq!(five_minute_status.processed_batches, cursor.batch_idx);
+    assert_eq!(two_tick_status.processed_batches, cursor.batch_idx);
     assert_eq!(
         session.cache().read_array(&one_minute.bars).unwrap().len(),
         2
@@ -512,6 +612,7 @@ async fn one_and_five_minute_bars_share_one_canonical_stream_and_both_catch_up()
         session.cache().read_array(&five_minute.bars).unwrap().len(),
         1
     );
+    assert_eq!(session.cache().read_array(&two_tick.bars).unwrap().len(), 1);
     assert!(session
         .cache()
         .read_value(&one_minute.live)
@@ -520,6 +621,11 @@ async fn one_and_five_minute_bars_share_one_canonical_stream_and_both_catch_up()
     assert!(session
         .cache()
         .read_value(&five_minute.live)
+        .unwrap()
+        .is_some());
+    assert!(session
+        .cache()
+        .read_value(&two_tick.live)
         .unwrap()
         .is_some());
     let trade_prints = session
@@ -552,12 +658,8 @@ async fn registering_same_canonical_spec_twice_errors() {
         .projections(
             &feed,
             &[
-                ProjectionSpec::Bars(BarsParams {
-                    interval_ns: 60_000_000_000,
-                }),
-                ProjectionSpec::Bars(BarsParams {
-                    interval_ns: 60 * 1_000_000_000,
-                }),
+                ProjectionSpec::Bars(BarsParams::time(60_000_000_000)),
+                ProjectionSpec::Bars(BarsParams::time(60 * 1_000_000_000)),
             ],
         )
         .unwrap_err();
@@ -606,7 +708,7 @@ struct RunningBarsSession {
 
 impl RunningBarsSession {
     async fn start(events: Vec<EsMboEvent>) -> Self {
-        Self::start_with_params(events, BarsParams { interval_ns: 100 }).await
+        Self::start_with_params(events, BarsParams::time(100)).await
     }
 
     async fn start_with_params(events: Vec<EsMboEvent>, params: BarsParams) -> Self {
@@ -795,6 +897,26 @@ fn reference_bars(events: &[EsMboEvent], interval_ns: u64) -> (Vec<Bar>, Option<
                 reference_fold_print(&mut bar, print);
                 live = Some(bar);
             }
+        }
+    }
+    (completed, live)
+}
+
+fn reference_tick_bars(events: &[EsMboEvent], prints_per_bar: u64) -> (Vec<Bar>, Option<Bar>) {
+    let mut completed = Vec::new();
+    let mut live: Option<Bar> = None;
+    for print in events.iter().filter_map(canonical_trade_print) {
+        let bar = match live.take() {
+            Some(mut bar) => {
+                reference_fold_print(&mut bar, print);
+                bar
+            }
+            None => reference_new_bar(print, print.ts_event_ns),
+        };
+        if bar.trade_count == prints_per_bar {
+            completed.push(bar);
+        } else {
+            live = Some(bar);
         }
     }
     (completed, live)
